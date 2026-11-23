@@ -12,7 +12,7 @@ import YSwift
 // MARK: Aliases
 
 /// Document alias scope. Only `.user` is supported — app-scoped aliases were
-/// removed in #1168 (they conferred no access and named a document every caller
+/// removed (they conferred no access and named a document every caller
 /// had to already be permitted to open).
 public enum DocumentAliasScope: String, Codable, Sendable {
     case user
@@ -77,7 +77,8 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
     /// `modifiedAt` field when `lastModified` is absent, so the typed
     /// surface matches the JS client's `lastModified` either way.
     public let lastModified: String
-    public let permission: DocumentPermission
+    /// The caller's level. A level this client does not know is `.unknown`.
+    public let permission: DocumentAccessLevel
     public let grantedAt: String?
     public let tags: [String]?
     /// Optional reference to a Blob owned by this document.
@@ -96,9 +97,11 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
     /// `documents.getLinkAccess(documentId:)` — the document GET is gated on
     /// content access and would fail.
     public let linkAccess: DocumentLinkAccessLevel?
-    /// `2` for a large document, `1` for an ordinary one, `nil` when the
-    /// server did not say (#3436) — which is every document described before
-    /// large documents existed, so absent decodes rather than throwing.
+    /// `3` for a record-log document, `1` for an ordinary one, `nil` when the
+    /// server did not say — which is every document described before formats
+    /// existed, so absent decodes rather than throwing. `2` names a large
+    /// document, which is no longer served: opening one throws
+    /// `.documentFormatUnsupported`.
     public let documentFormat: Int?
 
     private enum CodingKeys: String, CodingKey {
@@ -118,54 +121,44 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
         createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
         lastModified = try c.decodeIfPresent(String.self, forKey: .lastModified)
             ?? c.decodeIfPresent(String.self, forKey: .modifiedAt) ?? ""
-        permission = try c.decodeIfPresent(DocumentPermission.self, forKey: .permission) ?? .reader
+        permission = try c.decodeIfPresent(DocumentAccessLevel.self, forKey: .permission) ?? .reader
         grantedAt = try c.decodeIfPresent(String.self, forKey: .grantedAt)
         tags = try c.decodeIfPresent([String].self, forKey: .tags)
         thumbnailBlobId = try c.decodeIfPresent(String.self, forKey: .thumbnailBlobId)
         metadata = try c.decodeIfPresent(JSONValue.self, forKey: .metadata)
         documentFormat = try c.decodeIfPresent(Int.self, forKey: .documentFormat)
-        accessSource = try c.decodeIfPresent(DocumentAccessSource.self, forKey: .accessSource)
+        accessSource = DocumentAccessSource.lenient(c, forKey: .accessSource)
         linkAccess = try c.decodeIfPresent(DocumentLinkAccessLevel.self, forKey: .linkAccess)
     }
 }
 
-/// A page of documents with an optional pagination cursor. Decodes from
-/// either an `items` or legacy `documents` envelope key.
+/// A page of documents: `{ items, hasMore, nextCursor? }`. Pass `nextCursor`
+/// back as `cursor` to fetch the next page.
 public struct DocumentListPage: Decodable, Sendable, Equatable {
     public let items: [DocumentInfo]
-    /// Continuation token for the next page (#1316).
+    /// Continuation token for the next page.
     public let nextCursor: String?
-    /// True when a next page exists (#1316).
+    /// True when a next page exists.
     public let hasMore: Bool
-    /// Deprecated alias of `nextCursor` kept for one deprecation window
-    /// (#1316, #1982). Computed from `nextCursor` so the type's own
-    /// initializers never reference the deprecated declaration.
-    @available(*, deprecated, message: "Use nextCursor.")
-    public var cursor: String? { nextCursor }
 
     private enum CodingKeys: String, CodingKey {
-        case items, documents, cursor, nextCursor, hasMore
+        case items, nextCursor, hasMore
     }
 
     public init(
         items: [DocumentInfo],
-        cursor: String? = nil,
         nextCursor: String? = nil,
         hasMore: Bool? = nil
     ) {
         self.items = items
-        let next = nextCursor ?? cursor
-        self.nextCursor = next
-        self.hasMore = hasMore ?? (next != nil)
+        self.nextCursor = nextCursor
+        self.hasMore = hasMore ?? (nextCursor != nil)
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        items = try c.decodeIfPresent([DocumentInfo].self, forKey: .items)
-            ?? c.decodeIfPresent([DocumentInfo].self, forKey: .documents) ?? []
-        // #1316: prefer `nextCursor`; `cursor` is the deprecated alias.
+        items = try c.decodeIfPresent([DocumentInfo].self, forKey: .items) ?? []
         let next = try c.decodeIfPresent(String.self, forKey: .nextCursor)
-            ?? c.decodeIfPresent(String.self, forKey: .cursor)
         nextCursor = next
         hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (next != nil)
     }
@@ -175,7 +168,7 @@ public struct DocumentListPage: Decodable, Sendable, Equatable {
 
 /// The one holder that carries a live `YDocument` across an isolation
 /// boundary, and the one place the safety argument for doing so is written
-/// down (#1992, Phase C).
+/// down (Phase C).
 ///
 /// `YDocument` (from the `YSwift` fork) is a reference type wrapping yrs FFI
 /// state and is not `Sendable`. Rather than let each type that needs to hand a
@@ -184,7 +177,7 @@ public struct DocumentListPage: Decodable, Sendable, Equatable {
 /// unverifiable) arguments appear — every such type wraps the document in this
 /// value and becomes plainly `Sendable` itself. `OpenDocumentResult` below is
 /// the first adopter; `DocumentManager`'s document handoffs are the next
-/// (#1993, Phase D).
+/// (Phase D).
 ///
 /// ## `@unchecked Sendable` — safety argument
 ///
@@ -224,7 +217,7 @@ public struct ConfinedYDocument: @unchecked Sendable {
 /// `open`/`openAlias`): the live `YDocument` plus the document's locally
 /// cached metadata at open time (`nil` when no metadata is stored yet).
 ///
-/// Plainly `Sendable` since #1992: the live document is carried in a
+/// Plainly `Sendable`: the live document is carried in a
 /// `ConfinedYDocument`, so this type owns no unchecked claim of its own and
 /// the compiler checks the rest (`LocalMetadataEntry` is `Sendable`).
 public struct OpenDocumentResult: Sendable {
@@ -255,7 +248,7 @@ public struct OpenDocumentResult: Sendable {
 /// Options for `createWithAlias` — title and alias are both required.
 ///
 /// `tags`, `metadata` and `documentFormat` mean here exactly what they mean on
-/// `CreateDocumentOptions` (#3757): applied when the call creates the document,
+/// `CreateDocumentOptions`: applied when the call creates the document,
 /// under the same limits, refused with the same codes. Each is `nil` by default
 /// and encoded only when set, so an ordinary create's request body is exactly
 /// what it was before they existed — which matters, because the route now
@@ -269,9 +262,10 @@ public struct CreateWithAliasOptions: Encodable, Sendable {
     /// Opaque metadata blob to attach at creation (≤ 4 KB serialized UTF-8).
     /// The platform round-trips it verbatim.
     public var metadata: JSONValue?
-    /// Create a LARGE document (`2`) instead of an ordinary one, with the same
-    /// meaning it has on `CreateDocumentOptions.documentFormat`. The server
-    /// refuses a value outside the set, as it does for the plain create.
+    /// The document's format, `1` or `3`, with the same meaning it has on
+    /// `CreateDocumentOptions.documentFormat`. `2` (a large document) is
+    /// refused with `.documentFormatUnsupported` before any request; the
+    /// server refuses any other value outside the set.
     public var documentFormat: Int?
 
     public init(
@@ -316,14 +310,17 @@ public struct GetOrCreateWithAliasOptions: Encodable, Sendable {
     public var alias: AliasRef
     public var title: String?
     public var tags: [String]?
-    /// Create a LARGE document (`2`) instead of an ordinary one.
+    /// The document's format, `1` or `3`, as on
+    /// `CreateDocumentOptions.documentFormat`. `2` (a large document) is
+    /// refused with `.documentFormatUnsupported` before any request.
     ///
     /// Applied when this call creates the document, and otherwise taken as a
     /// statement about the document the alias already names: a stored format
     /// that differs makes the call fail with server code
-    /// `DOCUMENT_FORMAT_MISMATCH`, because an app that asks for a large document
-    /// and is handed an ordinary one has already made the mistake this route
-    /// exists to prevent. A format that agrees is echoed back on the result.
+    /// `DOCUMENT_FORMAT_MISMATCH`, because an app that asks for a record-log
+    /// document and is handed an ordinary one has already made the mistake
+    /// this route exists to prevent. A format that agrees is echoed back on
+    /// the result.
     ///
     /// `nil` — the default — states nothing, so an existing binding is answered
     /// exactly as it was before this option existed.
@@ -446,13 +443,17 @@ public struct CommitOfflineCreateResult: Sendable, Equatable {
     /// `true` when the local doc was linked to a pre-existing server doc
     /// (`onExists: .link`).
     public let linked: Bool?
+    /// `true` when the server refused a pending db3 create (`reason` holds
+    /// its message, and `Db3CreateFailedEvent` fired); `nil` otherwise.
+    public let refused: Bool?
     /// Failure / no-op reason: `"not_pending"`, `"exists"`, or a server
     /// error message. `nil` on success.
     public let reason: String?
 
-    public init(created: Bool, linked: Bool? = nil, reason: String? = nil) {
+    public init(created: Bool, linked: Bool? = nil, refused: Bool? = nil, reason: String? = nil) {
         self.created = created
         self.linked = linked
+        self.refused = refused
         self.reason = reason
     }
 }
@@ -471,7 +472,7 @@ public struct CancelPendingCreateOptions: Sendable {
 
 /// Result of `createWithAlias`.
 ///
-/// The last three are echoed only when the call applied them (#3757), which is
+/// The last three are echoed only when the call applied them, which is
 /// the rule every document read follows: an absent `documentFormat` means an
 /// ordinary document.
 public struct CreateWithAliasResult: Decodable, Sendable {
@@ -481,7 +482,7 @@ public struct CreateWithAliasResult: Decodable, Sendable {
     public let createdAt: String?
     public let modifiedAt: String?
     public let alias: DocumentAliasInfo
-    /// `2` for a large document, absent for an ordinary one.
+    /// `3` for a record-log document, absent for an ordinary one.
     public let documentFormat: Int?
     /// Echoed when the call applied tags.
     public let tags: [String]?
@@ -499,9 +500,9 @@ public struct GetOrCreateWithAliasResult: Decodable, Sendable {
     public let modifiedAt: String?
     public let alias: DocumentAliasInfo
     public let created: Bool
-    /// `2` for a large document, absent for an ordinary one — echoed on a
+    /// `3` for a record-log document, absent for an ordinary one — echoed on a
     /// create, and on an existing binding when the caller stated a format that
-    /// agreed with the stored one (#3757).
+    /// agreed with the stored one.
     public let documentFormat: Int?
     /// Echoed when this call created the document and applied tags.
     public let tags: [String]?
@@ -523,12 +524,43 @@ public enum DocumentPermissionTarget: Sendable, ExpressibleByStringLiteral {
 // MARK: Link access ("anyone with the link")
 
 /// The level an "anyone with the link" share confers. Mirrors js-bao's
-/// `"reader" | "read-write"` union on `documents.setLinkAccess`. A deliberate
-/// subset of `DocumentPermission`: link access can never confer `owner` or
-/// `admin`.
-public enum DocumentLinkAccessLevel: String, Codable, Sendable {
+/// `"reader" | "read-write"` union on `documents.setLinkAccess` and
+/// `LinkAccessResult.linkAccess`. Link access can never confer `owner`. A level
+/// this client does not know decodes as `.unknown` carrying the string sent.
+public enum DocumentLinkAccessLevel: RawRepresentable, CaseIterable, Codable, Sendable, Hashable {
     case reader
-    case readWrite = "read-write"
+    case readWrite
+    /// A level this client does not know, as the server sent it.
+    case unknown(String)
+
+    /// The known levels.
+    public static var allCases: [DocumentLinkAccessLevel] { [.reader, .readWrite] }
+
+    public init(rawValue: String) {
+        switch rawValue {
+        case "reader": self = .reader
+        case "read-write": self = .readWrite
+        default: self = .unknown(rawValue)
+        }
+    }
+
+    /// The wire string: `"reader"`, `"read-write"`, or the unknown level.
+    public var rawValue: String {
+        switch self {
+        case .reader: return "reader"
+        case .readWrite: return "read-write"
+        case .unknown(let value): return value
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        self.init(rawValue: try decoder.singleValueContainer().decode(String.self))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
 
 /// How the caller's effective permission on a document was obtained. Mirrors
@@ -536,11 +568,35 @@ public enum DocumentLinkAccessLevel: String, Codable, Sendable {
 /// document's "anyone with the link" access floor rather than an explicit
 /// grant — a link-opened document does NOT appear in `me/shared-documents`, so
 /// an app that wants a "get back to it" affordance must track it itself.
+/// `.app` means the level came from the db3's app access, which grants every
+/// member of the app (`client.db3.setAppAccess(_:level:)`); only the `db3/*`
+/// routes answer it.
+/// `.resource` means the caller is a member of the platform resource that
+/// holds the db3, such as an agent session, and reads it as a `reader`; only
+/// the `db3/*` routes answer it.
+///
+/// A document or db3 answer whose `accessSource` names a value this client
+/// does not know decodes with `accessSource == nil`, so a later value never
+/// fails the rest of the decode:
+///
+/// ```swift
+/// let info = try await client.db3.get(db3Id)
+/// if info.accessSource == .app { print("every member of the app can read this") }
+/// ```
 public enum DocumentAccessSource: String, Codable, Sendable {
     case owner
     case grant
     case group
     case link
+    case app
+    case resource
+
+    /// The `accessSource` under `key`: `nil` when it is absent, null, or a
+    /// value this client does not know, rather than a decode failure.
+    static func lenient<Key: CodingKey>(_ container: KeyedDecodingContainer<Key>, forKey key: Key) -> DocumentAccessSource? {
+        guard let raw = (try? container.decodeIfPresent(String.self, forKey: key)) ?? nil else { return nil }
+        return DocumentAccessSource(rawValue: raw)
+    }
 }
 
 /// Result of `documents.setLinkAccess` / `clearLinkAccess` / `getLinkAccess`.
@@ -561,13 +617,13 @@ public struct LinkAccessResult: Decodable, Sendable, Equatable {
 ///
 /// `name` is `nil` for a user who has none — the server omits the key rather
 /// than sending an empty string, and a user provisioned through the
-/// email-code flow gets no name (#2980) — so display code should fall back
+/// email-code flow gets no name — so display code should fall back
 /// to `email`. Mirrors js-bao's `DocumentPermissionEntry.name?: string`.
 public struct DocumentPermissionEntry: Decodable, Sendable, Equatable {
     public let userId: String
     public let email: String
     public let name: String?
-    public let permission: DocumentPermission
+    public let permission: DocumentAccessLevel
     public let grantedAt: String
 }
 
@@ -576,17 +632,26 @@ public struct DocumentGroupPermissionEntry: Decodable, Sendable, Equatable {
     public let documentId: String
     public let groupType: String
     public let groupId: String
-    public let permission: String
+    public let permission: DocumentGrantLevel
     public let grantedAt: String
     public let grantedBy: String
 }
 
-/// Parameters for `grantGroupPermission`.
+/// Parameters for `grantGroupPermission`: the group, by id, and the
+/// permission it gets.
 public struct GrantGroupPermissionParams: Encodable, Sendable {
-    public var groupType: String
+    /// The group's stored type; sent only by the deprecated init.
+    @available(*, deprecated, message: "Groups are addressed by groupId alone; omit it. Removed by #4718.")
+    public var groupType: String?
     public var groupId: String
     public var permission: String
 
+    public init(groupId: String, permission: String) {
+        self.groupId = groupId
+        self.permission = permission
+    }
+
+    @available(*, deprecated, message: "Groups are addressed by groupId alone: use init(groupId:permission:). Removed by #4718.")
     public init(groupType: String, groupId: String, permission: String) {
         self.groupType = groupType
         self.groupId = groupId
@@ -675,13 +740,13 @@ public struct DirectPermissionGrant: Decodable, Sendable {
     /// `"granted"` or `"updated"`.
     public let status: String
     public let userId: String
-    public let permission: String
+    public let permission: DocumentGrantLevel
 }
 
 /// Result of a deferred permission grant (recipient not yet in the app).
 public struct DeferredPermissionGrant: Decodable, Sendable {
     public let email: String
-    public let permission: String
+    public let permission: DocumentGrantLevel
     /// Always `"pending_signup"`.
     public let status: String
     public let appInvitationCreated: Bool
@@ -730,11 +795,11 @@ public struct ValidateAccessSubjectParams: Encodable, Sendable {
 }
 
 /// Result of `validateAccess` — the caller's access, or the access of the
-/// user named by `userId` (#3658).
+/// user named by `userId`.
 public struct DocumentAccessResult: Decodable, Sendable {
     public let success: Bool
     public let hasAccess: Bool
-    public let permission: DocumentPermission?
+    public let permission: DocumentAccessLevel?
     /// How the access was obtained: `"owner"`, `"grant"`, `"group"` or
     /// `"link"`. Present whenever `hasAccess` is true.
     public let accessSource: String?
@@ -756,16 +821,16 @@ public struct DocumentAccessRequest: Decodable, Sendable {
     /// `"pending"`, `"approved"`, or `"denied"`.
     public let status: String
     /// `"read-write"` or `"reader"`.
-    public let requestedPermission: String
+    public let requestedPermission: DocumentGrantLevel
     public let message: String?
     public let createdAt: String
     public let resolvedBy: String?
     public let resolvedAt: String?
-    public let grantedPermission: String?
+    public let grantedPermission: DocumentGrantLevel?
 }
 
 /// A short document summary attached to an access-request response.
-public struct AccessRequestDocumentSummary: Decodable, Sendable {
+public struct AccessRequestDocumentSummary: Decodable, Sendable, Equatable {
     public let documentId: String?
     public let title: String?
     public let tags: [String]?
@@ -838,11 +903,34 @@ public struct DenyAccessRequestOptions: Encodable, Sendable {
 /// A pending (deferred) invitation scoped to a single document.
 public struct PendingInvitationEntry: Decodable, Sendable {
     public let email: String
-    public let permission: String
+    public let permission: DocumentGrantLevel
     public let invitationId: String
     public let createdAt: String
     public let expiresAt: String
     public let grantedBy: String?
+}
+
+/// The answer of a resource's `revokePendingInvitation`: the invitation's
+/// unaccepted grants on that resource were deleted. The invitation and its
+/// grants on other resources stay.
+public struct PendingInvitationRevokeResult: Decodable, Sendable, Equatable {
+    public let success: Bool
+    /// Always `"pending_cancelled"`.
+    public let status: String
+    /// The invitation whose grants on the resource were revoked.
+    public let invitationId: String
+    /// The invited address.
+    public let email: String
+    /// How many unaccepted grant rows were deleted.
+    public let deferredCount: Int
+
+    public init(success: Bool, status: String, invitationId: String, email: String, deferredCount: Int) {
+        self.success = success
+        self.status = status
+        self.invitationId = invitationId
+        self.email = email
+        self.deferredCount = deferredCount
+    }
 }
 
 // MARK: Small result wrappers

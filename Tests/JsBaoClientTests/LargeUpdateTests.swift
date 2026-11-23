@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-large-update.test.ts
 /// Tests large updates (>100KB) that trigger R2 storage and sync.
+@available(*, deprecated)
 final class LargeUpdateTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

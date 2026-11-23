@@ -389,7 +389,7 @@ final class CodegenGauntletTests: XCTestCase {
         // depend on the storage encoding.
         var counts: [Bool: Int] = [:]
         for row in groups {
-            let active = row["active"]?.rowBoolValue
+            let active = row["group"]?["active"]?.rowBoolValue
             if let active, let n = row["n"]?.numberValue {
                 counts[active] = Int(n)
             }

@@ -31,6 +31,7 @@ final class LinksLiveTests: XCTestCase {
         await ctx.cleanup()
     }
 
+    @available(*, deprecated)
     func testDocumentShareLinkEndToEnd() async throws {
         // `documents.create` returns only metadata; `createWithAlias`
         // (user-scope) is the create variant that returns the id.

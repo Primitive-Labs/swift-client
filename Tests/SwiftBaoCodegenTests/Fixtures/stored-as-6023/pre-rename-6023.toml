@@ -1,0 +1,12 @@
+[type]
+name = "tasks6023"
+
+[models.renamed_tasks]
+class_name = "PreRenameTask6023"
+
+[models.renamed_tasks.fields.title]
+type = "string"
+
+[models.renamed_tasks.fields.due]
+type = "number"
+unique = true

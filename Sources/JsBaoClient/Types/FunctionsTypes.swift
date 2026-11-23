@@ -44,17 +44,18 @@ public struct FunctionInvokeResult: Decodable, Sendable {
     /// Present when `status` is `"completed"`. Opaque blob; a JSON `null`
     /// output decodes to `.null`.
     public let output: JSONValue?
-    /// Present when `status` is `"failed"` or `"timeout"` (#3448).
+    /// Present when `status` is `"failed"` or `"timeout"`.
     public let error: String?
     public let errorCode: String?
     /// The ceilings the sandbox ran under; `nil` when it never reported.
     public let limits: FunctionInvokeLimits?
-    /// The invocation-log record this answer belongs to (#3448).
+    /// The invocation-log record this answer belongs to.
     ///
     /// Minted before the run, so the record and the answer share it: hand it
     /// to `primitive functions logs <functionId> --invocation <id>` to read
     /// what the invocation printed and the error it threw. `nil` when the
-    /// platform recorded nothing, and on a server older than #3448.
+    /// platform recorded nothing, or when talking to a server that
+    /// predates this field.
     public let invocationId: String?
 
     public init(
@@ -77,7 +78,7 @@ public struct FunctionInvokeResult: Decodable, Sendable {
 /// Typed twin of `FunctionInvokeResult`: the same envelope with `output`
 /// decoded into `Output`. `nil` when the output is absent or JSON `null`.
 /// Named separately because Swift does not let a generic and a non-generic
-/// type share a name — the `RunSyncWorkflowResult` / `RunSyncResult<Output>`
+/// type share a name — the `FunctionRunStatus` / `FunctionRunResult<Output>`
 /// split.
 public struct FunctionResult<Output: Decodable & Sendable>: Sendable {
     public let status: String
@@ -85,7 +86,7 @@ public struct FunctionResult<Output: Decodable & Sendable>: Sendable {
     public let error: String?
     public let errorCode: String?
     public let limits: FunctionInvokeLimits?
-    /// The invocation-log record this answer belongs to (#3448); see
+    /// The invocation-log record this answer belongs to; see
     /// `FunctionInvokeResult.invocationId`.
     public let invocationId: String?
 

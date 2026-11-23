@@ -1,0 +1,22 @@
+{
+  "name": "databases.grantGroupPermission",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "POST",
+  "path": "/app/<appId>/api/databases/<ulid>/group-permissions",
+  "caller": "owner",
+  "request": {
+    "groupType": "team",
+    "groupId": "baseline",
+    "permission": "manager"
+  },
+  "status": 201,
+  "body": {
+    "databaseId": "<ulid>",
+    "groupType": "team",
+    "groupId": "baseline",
+    "permission": "manager",
+    "grantedAt": "<iso>",
+    "grantedBy": "<ulid>"
+  }
+}

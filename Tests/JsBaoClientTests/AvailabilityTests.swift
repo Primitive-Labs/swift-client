@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-availability.test.ts
 /// Tests availability gating: waitForLocalOrNetwork behavior.
+@available(*, deprecated)
 final class AvailabilityTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!
@@ -50,6 +51,7 @@ final class AvailabilityTests: XCTestCase {
     /// no wrapper swallows them (#2667, behavior 7). Uses the live server so
     /// the sub-API is exercised the way callers reach it, against a document
     /// that really exists.
+    @available(*, deprecated)
     func testDocumentsOpenTwinSurfaceThrowsTypedErrors() async throws {
         let client = createTestClient(
             appId: testApp.appId,

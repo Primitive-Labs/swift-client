@@ -10,6 +10,7 @@ import YSwift
 /// (`CodegenAcceptance/Generated/TaskRecord.swift`) so it exercises the real
 /// emitted code, and against an offline in-memory client so `save(in:)` takes
 /// its real path through `JsBaoClient.codegen.save`.
+@available(*, deprecated)
 final class TypedSaveChangeTrackingTests: XCTestCase {
 
     override func setUp() {
@@ -321,9 +322,10 @@ final class TypedSaveChangeTrackingTests: XCTestCase {
         )
 
         let made = CrashTestRecord(id: "c1", requiredTags: ["a"])
-        XCTAssertNil(made.`default`, "precondition: the caller never set the defaulted fields")
-        XCTAssertNil(made.score)
-        XCTAssertNil(made.active)
+        // Precondition: the caller never set the defaulted fields. They read
+        // their defaults, which the model supplied, so no write sends them (#6304).
+        XCTAssertEqual(made._suppliedDefaults, ["default", "score", "active"])
+        XCTAssertNil(made.primitiveValues()["score"])
 
         let saved = try made.save(in: docId)
         XCTAssertEqual(saved.`default`, "fallback")

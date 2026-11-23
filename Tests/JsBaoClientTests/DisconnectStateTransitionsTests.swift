@@ -23,6 +23,7 @@ import YSwift
 /// through a socket: which callback emits the status is exactly what the bug
 /// is about, and a live close fires them both within a millisecond of each
 /// other, so only the split can distinguish the fix from the defect.
+@available(*, deprecated)
 final class DisconnectStateTransitionsTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!
@@ -88,6 +89,7 @@ final class DisconnectStateTransitionsTests: XCTestCase {
 
     // MARK: - Behavior 3 — remote awareness cleared on close
 
+    @available(*, deprecated)
     func testRemoteAwarenessClearedOnClose() async throws {
         let docId = try await ctx.createDocument(
             appId: testApp.appId, jwt: testApp.ownerJWT, title: "Awareness Cleared On Close"
@@ -148,6 +150,7 @@ final class DisconnectStateTransitionsTests: XCTestCase {
     /// late close is dropped as stale, so the close handler never runs. That
     /// terminal point has to clear presence too, or peer cursors stay on
     /// screen for good.
+    @available(*, deprecated)
     func testRemoteAwarenessClearedWhenTheDisconnectResolvesOnTimeout() async throws {
         let docId = try await ctx.createDocument(
             appId: testApp.appId, jwt: testApp.ownerJWT, title: "Awareness Cleared On Timeout"

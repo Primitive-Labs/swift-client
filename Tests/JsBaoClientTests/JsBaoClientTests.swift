@@ -3,6 +3,7 @@ import XCTest
 import YSwift
 
 /// Core client tests ported from tests/client/js-bao-client.test.ts
+@available(*, deprecated)
 final class JsBaoClientTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!
@@ -151,6 +152,7 @@ final class JsBaoClientTests: XCTestCase {
     /// `serverCode` and `serverMessage` on the thrown `HttpError`, so
     /// apps can switch on the code and display the human message
     /// instead of "HTTP 403".
+    @available(*, deprecated)
     func testHttpErrorSurfacesStructuredServerBody() async throws {
         // The 403 path: a plain member trying to invite a brand-new
         // email triggers MEMBER_INVITATIONS_DISABLED with a structured

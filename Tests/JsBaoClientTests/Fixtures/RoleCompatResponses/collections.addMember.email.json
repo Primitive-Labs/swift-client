@@ -1,0 +1,24 @@
+{
+  "name": "collections.addMember.email",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "POST",
+  "path": "/app/<appId>/api/collections/<ulid>/members",
+  "caller": "owner",
+  "request": {
+    "email": "<email>",
+    "permission": "reader"
+  },
+  "status": 200,
+  "body": {
+    "status": "pending_signup",
+    "email": "<email>",
+    "permission": "reader",
+    "appInvitationCreated": false,
+    "deferredId": "<ulid>",
+    "expiresAt": "<iso>",
+    "collectionId": "<ulid>",
+    "invitationId": "<ulid>",
+    "inviteToken": "<token>"
+  }
+}

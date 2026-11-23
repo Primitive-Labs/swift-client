@@ -12,6 +12,7 @@ import XCTest
 ///
 /// Server-free (`*HermeticTests`): the `fetchDocumentInfo` hook is injected,
 /// which is the same seam `JsBaoClient` wires to `documents.get`.
+@available(*, deprecated)
 final class OpenPermissionBootstrapHermeticTests: XCTestCase {
 
     private var clients: [JsBaoClient] = []
@@ -107,6 +108,10 @@ final class OpenPermissionBootstrapHermeticTests: XCTestCase {
             "a reader's document is still reported writable after the refresh"
         )
 
+        // The refresh caches the permission after it takes it in memory.
+        try await eventually(description: "the refreshed permission to be cached") {
+            client.documentManager.getLocalMetadata(docId)?.lastKnownPermission == "reader"
+        }
         let meta = client.documentManager.getLocalMetadata(docId)
         XCTAssertEqual(meta?.lastKnownPermission, "reader")
         XCTAssertNotNil(

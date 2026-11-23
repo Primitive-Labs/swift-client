@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     public static let modelName = "crashTest"
     public static let primitiveSchema = PrimitiveSchema(
         name: "crashTest",
@@ -24,6 +24,23 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         ]
     )
 
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    public struct Fields: Sendable {
+        public let id: CrashTestRecord._IdFieldToken = .init("id")
+        public let tags: CrashTestRecord._StringSetFieldToken = .init("tags")
+        public let requiredTags: CrashTestRecord._StringSetFieldToken = .init("requiredTags")
+        public let email: CrashTestRecord._StringFieldToken = .init("email")
+        public let boundedName: CrashTestRecord._StringFieldToken = .init("boundedName")
+        public let `default`: CrashTestRecord._StringFieldToken = .init("default")
+        public let `where`: CrashTestRecord._StringFieldToken = .init("where")
+        public let score: CrashTestRecord._NumberFieldToken = .init("score")
+        public let active: CrashTestRecord._BooleanFieldToken = .init("active")
+    }
+
+    /// The model's field tokens.
+    public static let fields = Fields()
+
     public var id: String {
         didSet { _changedFields.insert("id") }
     }
@@ -39,17 +56,17 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
     public var boundedName: String? {
         didSet { _changedFields.insert("boundedName") }
     }
-    public var `default`: String? {
-        didSet { _changedFields.insert("default") }
+    public var `default`: String {
+        didSet { _changedFields.insert("default"); _suppliedDefaults.remove("default") }
     }
     public var `where`: String? {
         didSet { _changedFields.insert("where") }
     }
-    public var score: Double? {
-        didSet { _changedFields.insert("score") }
+    public var score: Double {
+        didSet { _changedFields.insert("score"); _suppliedDefaults.remove("score") }
     }
-    public var active: Bool? {
-        didSet { _changedFields.insert("active") }
+    public var active: Bool {
+        didSet { _changedFields.insert("active"); _suppliedDefaults.remove("active") }
     }
 
     public var related: RelatedRecords = .empty
@@ -72,6 +89,15 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
     /// field, whatever this holds.
     /// Not part of the record's persisted/equatable identity.
     public private(set) var _changedFields: Set<String> = []
+
+    /// The fields whose value this model supplied from their `default`
+    /// rather than read or were given (#6304): a field the record held
+    /// no value of its kind for, an initializer parameter left out, a
+    /// decoded key that held none. `primitiveValues()` leaves them out,
+    /// so no write sends a default the model filled in; assigning the
+    /// field, or `markAllChanged()`, makes its value the caller's.
+    /// Not part of the record's persisted/equatable identity.
+    public private(set) var _suppliedDefaults: Set<String> = []
 
     /// Forget the pending field changes without writing them, so a
     /// later `save(in:)` treats this value as unmodified. Mirrors
@@ -97,6 +123,7 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
     /// Every field it writes wins last-writer-wins against a concurrent
     /// remote edit to that field, which is the cost of a full copy.
     public mutating func markAllChanged() {
+        _suppliedDefaults = []
         _changedFields = Set(primitiveValues().keys)
     }
 
@@ -116,12 +143,15 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         self.requiredTags = requiredTags
         self.email = email
         self.boundedName = boundedName
-        self.`default` = `default`
+        self.`default` = `default` ?? "fallback"
         self.`where` = `where`
-        self.score = score
-        self.active = active
+        self.score = score ?? 100
+        self.active = active ?? true
         self.related = .empty
-        self._changedFields = Set(primitiveValues().keys)
+        if `default` == nil { _suppliedDefaults.insert("default") }
+        if score == nil { _suppliedDefaults.insert("score") }
+        if active == nil { _suppliedDefaults.insert("active") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     /// Create a record with an auto-generated id. The id is NOT
@@ -144,47 +174,68 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         self.requiredTags = requiredTags
         self.email = email
         self.boundedName = boundedName
-        self.`default` = `default`
+        self.`default` = `default` ?? "fallback"
         self.`where` = `where`
-        self.score = score
-        self.active = active
+        self.score = score ?? 100
+        self.active = active ?? true
         self.related = .empty
         self._explicitId = false
-        self._changedFields = Set(primitiveValues().keys)
+        if `default` == nil { _suppliedDefaults.insert("default") }
+        if score == nil { _suppliedDefaults.insert("score") }
+        if active == nil { _suppliedDefaults.insert("active") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     public init?(record: PrimitiveRecord) {
-        guard let requiredTags = record["requiredTags"]?.asStringSet
+        guard let requiredTags = record["requiredTags"]?.asStringSet,
+              !record.isCleared("default"),
+              !record.isCleared("score"),
+              !record.isCleared("active")
         else { return nil }
+        let _default = record.fittingValue("default", as: .string)?.asString
+        let _score = record.fittingValue("score", as: .number)?.asNumber
+        let _active = record.fittingValue("active", as: .boolean)?.asBoolean
         self.id = record.id
         self.tags = record["tags"]?.asStringSet
         self.requiredTags = requiredTags
         self.email = record["email"]?.asString
         self.boundedName = record["boundedName"]?.asString
-        self.`default` = record["default"]?.asString
+        self.`default` = _default ?? "fallback"
         self.`where` = record["where"]?.asString
-        self.score = record["score"]?.asNumber
-        self.active = record["active"]?.asBoolean
+        self.score = _score ?? 100
+        self.active = _active ?? true
         self.related = .empty
         self._changedFields = []
+        if _default == nil { _suppliedDefaults.insert("default") }
+        if _score == nil { _suppliedDefaults.insert("score") }
+        if _active == nil { _suppliedDefaults.insert("active") }
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
     public init?(row: [String: JSONValue]) {
         guard let id = row["id"]?.stringValue,
-              let requiredTags = (row["requiredTags"]?.stringArrayValue).map(Set.init)
+              let requiredTags = (row["requiredTags"]?.stringArrayValue).map(Set.init),
+              !PrimitiveRecord.isCleared("default", in: row),
+              !PrimitiveRecord.isCleared("score", in: row),
+              !PrimitiveRecord.isCleared("active", in: row)
         else { return nil }
+        let _default = PrimitiveRecord.fittingValue("default", as: .string, in: row)?.asString
+        let _score = PrimitiveRecord.fittingValue("score", as: .number, in: row)?.asNumber
+        let _active = PrimitiveRecord.fittingValue("active", as: .boolean, in: row)?.asBoolean
         self.id = id
         self.tags = (row["tags"]?.stringArrayValue).map(Set.init)
         self.requiredTags = requiredTags
         self.email = row["email"]?.stringValue
         self.boundedName = row["boundedName"]?.stringValue
-        self.`default` = row["default"]?.stringValue
+        self.`default` = _default ?? "fallback"
         self.`where` = row["where"]?.stringValue
-        self.score = row["score"]?.numberValue
-        self.active = row["active"]?.rowBoolValue
+        self.score = _score ?? 100
+        self.active = _active ?? true
         self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []
+        if _default == nil { _suppliedDefaults.insert("default") }
+        if _score == nil { _suppliedDefaults.insert("score") }
+        if _active == nil { _suppliedDefaults.insert("active") }
     }
 
     public func primitiveValues() -> [String: PrimitiveValue] {
@@ -194,10 +245,10 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         if let tags { values["tags"] = .stringset(tags) }
         if let email { values["email"] = .string(email) }
         if let boundedName { values["boundedName"] = .string(boundedName) }
-        if let `default` { values["default"] = .string(`default`) }
+        if !_suppliedDefaults.contains("default") { values["default"] = .string(`default`) }
         if let `where` { values["where"] = .string(`where`) }
-        if let score { values["score"] = .number(score) }
-        if let active { values["active"] = .boolean(active) }
+        if !_suppliedDefaults.contains("score") { values["score"] = .number(score) }
+        if !_suppliedDefaults.contains("active") { values["active"] = .boolean(active) }
         return values
     }
 
@@ -211,12 +262,18 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         self.requiredTags = try container.decode(Set<String>.self, forKey: .requiredTags)
         self.email = try container.decodeIfPresent(String.self, forKey: .email)
         self.boundedName = try container.decodeIfPresent(String.self, forKey: .boundedName)
-        self.`default` = try container.decodeIfPresent(String.self, forKey: .`default`)
+        let _default = container.fittingValue(forKey: .`default`, as: .string)?.asString
+        self.`default` = _default ?? "fallback"
         self.`where` = try container.decodeIfPresent(String.self, forKey: .`where`)
-        self.score = try container.decodeIfPresent(Double.self, forKey: .score)
-        self.active = try container.decodeIfPresent(Bool.self, forKey: .active)
+        let _score = container.fittingValue(forKey: .score, as: .number)?.asNumber
+        self.score = _score ?? 100
+        let _active = container.fittingValue(forKey: .active, as: .boolean)?.asBoolean
+        self.active = _active ?? true
         self.related = .empty
-        self._changedFields = Set(primitiveValues().keys)
+        if _default == nil { _suppliedDefaults.insert("default") }
+        if _score == nil { _suppliedDefaults.insert("score") }
+        if _active == nil { _suppliedDefaults.insert("active") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     public enum CodingKeys: String, CodingKey {
@@ -287,7 +344,8 @@ public extension CrashTestRecord {
             data: PrimitiveRowDecoder.decodeAll(page.data, as: CrashTestRecord.self),
             nextCursor: page.nextCursor,
             prevCursor: page.prevCursor,
-            hasMore: page.hasMore
+            hasMore: page.hasMore,
+            drift: page.drift
         )
     }
 
@@ -299,13 +357,15 @@ public extension CrashTestRecord {
             data: PrimitiveRowDecoder.decodeAll(page.data, as: CrashTestRecord.self),
             nextCursor: page.nextCursor,
             prevCursor: page.prevCursor,
-            hasMore: page.hasMore
+            hasMore: page.hasMore,
+            drift: page.drift
         )
     }
 
-    /// Count across all open documents.
-    static func count(_ filter: DocumentFilter? = nil) throws -> Int {
-        try JsBaoClient.requireDefault().codegen.count(primitiveSchema, filter: filter)
+    /// Count across all open documents. `options.maxDrift` refuses a
+    /// db3's count `DB3_DRIFT_EXCEEDED` as a page is.
+    static func count(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> Int {
+        try JsBaoClient.requireDefault().codegen.count(primitiveSchema, filter: filter, options: options)
     }
 
     /// Every record across all open documents. Synchronous like the
@@ -488,8 +548,95 @@ public extension CrashTestRecord {
         return copy
     }
 
+    /// The fields `save(in:upsertOn:)` may name: each one a unique
+    /// constraint covers on its own.
+    enum UniqueField: String, Sendable {
+        case email = "email"
+    }
+
+    /// `save(in:upsertOn:)` by one of the model's unique fields.
+    @discardableResult
+    func save(in documentId: String, upsertOn: UniqueField) throws -> CrashTestRecord {
+        try save(in: documentId, upsertOn: upsertOn.rawValue)
+    }
+
+    /// The unique constraints `upsertByUnique` may name.
+    enum UniqueConstraint: String, Sendable {
+        case crashTest_email_unique = "crashTest_email_unique"
+        case name_score_combo = "name_score_combo"
+    }
+
+    /// `upsertByUnique(_:mode:in:)` by one of the model's unique constraints.
+    @discardableResult
+    func upsertByUnique(_ constraint: UniqueConstraint, mode: UpsertMode = .either, in documentId: String) throws -> CrashTestRecord {
+        try upsertByUnique(constraint.rawValue, mode: mode, in: documentId)
+    }
+
+    /// `upsertByUnique(_:lookupValue:mode:in:)` by one of the model's unique constraints.
+    @discardableResult
+    func upsertByUnique(_ constraint: UniqueConstraint, lookupValue: [PrimitiveValue], mode: UpsertMode = .either, in documentId: String) throws -> CrashTestRecord {
+        try upsertByUnique(constraint.rawValue, lookupValue: lookupValue, mode: mode, in: documentId)
+    }
+
     /// Delete this record from document `documentId`. Throws if the doc isn't open.
     func delete(in documentId: String) throws {
         try JsBaoClient.requireDefault().codegen.delete(Self.primitiveSchema, id: id, in: documentId)
+    }
+
+    /// `save(in:)` with a db3 write's guards. On a db3 the room judges
+    /// them: `options.condition` (the record must match it, in the
+    /// query filter grammar) and `options.ifNotExists` (the save lands
+    /// only as a create, while no live record has this id). A guarded
+    /// save shows on this device only once the room accepts it. With
+    /// `options.confirm` the call returns once the room accepted the
+    /// save and throws its refusal: `.db3ConditionNotMet`, with the
+    /// record as it is now under `details["current"]`. While the db3
+    /// is not subscribed, a confirmed save waits for the next subscribe.
+    ///
+    /// Returns the record as this device then shows it, with no pending
+    /// changes left: with `confirm`, as saved; without it, a guarded
+    /// save's values are not shown yet. On a document that is not a db3
+    /// the options are ignored and it saves as `save(in:)` does.
+    @discardableResult
+    func save(in documentId: String, options: JsBaoClient.Db3WriteOptions) async throws -> CrashTestRecord {
+        let record = try await JsBaoClient.requireDefault().codegen.save(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId, changedFields: _changedFields, options: options)
+        guard var saved = CrashTestRecord(record: record) else {
+            var fallback = self
+            fallback.discardChanges()
+            return fallback
+        }
+        // Carried over, not persisted: query-time includes and the
+        // caller-pinned-id flag have no representation in the stored
+        // record, and this path never changes the record's id.
+        saved.related = related
+        saved._explicitId = _explicitId
+        return saved
+    }
+
+    /// Delete this record from db3 `documentId` only if it matches
+    /// `options.condition`, which the room judges. With
+    /// `options.confirm` the call returns once the room accepted the
+    /// delete and throws its refusal (`.db3ConditionNotMet`); while the
+    /// db3 is not subscribed, it waits for the next subscribe. With
+    /// neither, and on a document that is not a db3, it deletes as
+    /// `delete(in:)` does.
+    func delete(in documentId: String, options: JsBaoClient.Db3WriteOptions) async throws {
+        try await JsBaoClient.requireDefault().codegen.delete(Self.primitiveSchema, id: id, in: documentId, options: options)
+    }
+
+    /// Add each of `fields` to record `id`'s number fields in db3
+    /// `documentId`: a negative delta subtracts, and a missing field
+    /// starts at 0. Increments made offline or on several devices at
+    /// once all count. Answers each field's new value as this device
+    /// shows it; with `options.confirm` or an `options.condition`, the
+    /// room's values once it applied the increment, throwing its
+    /// refusal (`.db3ConditionNotMet`, or `.db3RecordNotFound` for a
+    /// record deleted meanwhile). A record this device does not hold
+    /// throws `.db3RecordNotFound` and nothing is sent; a document that
+    /// is not a db3 throws `.invalidArgument`. Mirrors the JS client's
+    /// `Model.increment(id, fields, options)`.
+    @discardableResult
+    static func increment(id: String, fields: [String: Double], in documentId: String, options: JsBaoClient.Db3WriteOptions = JsBaoClient.Db3WriteOptions()) async throws -> [String: Double] {
+        try await JsBaoClient.requireDefault().codegen.increment(primitiveSchema, id: id, fields: fields, in: documentId, options: options)
     }
 }

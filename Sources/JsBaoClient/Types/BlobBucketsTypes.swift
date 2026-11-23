@@ -8,7 +8,7 @@ import Foundation
 // bucket-scoped blob metadata type is named `BucketBlobInfo` (not `BlobInfo`)
 // because the per-document `BlobInfo` already exists in `BlobManager.swift`
 // with a *different* field set; the bucket surface's `BlobInfo` carries
-// `bucketId`/`tags`/`uploaded`/`etag`, so it gets its own name to avoid a
+// `bucketId`/`tags`/`createdAt`/`etag`, so it gets its own name to avoid a
 // collision.
 
 // MARK: Enums
@@ -25,20 +25,14 @@ public enum BlobBucketTtlTier: String, Codable, Sendable {
     case permanent
 }
 
-/// Access policy for blobs in a bucket. Mirrors JS `BlobBucketAccessPolicy`.
-public enum BlobBucketAccessPolicy: String, Codable, Sendable {
-    case publicRead = "public-read"
-    case authenticated
-    case ownerOnly = "owner-only"
-}
-
-/// Named access preset for a bucket. Mirrors JS `BlobBucketPreset`.
+/// A bucket's access, one of four named presets. Mirrors JS
+/// `BlobBucketPreset`. For access a preset cannot express, make the bucket
+/// `.adminOnly` and hand out read URLs from a server function.
 public enum BlobBucketPreset: String, Codable, Sendable {
     case publicAccess = "public"
     case authenticated
     case adminOnly = "admin-only"
     case personalUploads = "personal-uploads"
-    case custom
 }
 
 // MARK: Bucket metadata
@@ -52,17 +46,17 @@ public struct BlobBucketInfo: Decodable, Sendable, Equatable {
     public let description: String?
     public let ttlTier: BlobBucketTtlTier
     public let preset: BlobBucketPreset
-    /// Deprecated JS read-alias of `preset`. Kept as `String` because the
-    /// server may return preset names that are outside the legacy input enum.
-    public let accessPolicy: String
-    public let ruleSetId: String?
+    /// True for a bucket stored with a rule set. Such a bucket is served as
+    /// `.adminOnly` until `updateBucket` names a preset, which clears the
+    /// mark. Decodes as `false` when the server omits it.
+    public let convertedFromRuleSet: Bool
     public let createdBy: String
     public let createdAt: String
     public let modifiedAt: String
 
     private enum CodingKeys: String, CodingKey {
-        case bucketId, appId, bucketKey, name, description, ttlTier
-        case preset, accessPolicy, ruleSetId, createdBy, createdAt, modifiedAt
+        case bucketId, appId, bucketKey, name, description, ttlTier, preset
+        case convertedFromRuleSet, createdBy, createdAt, modifiedAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -73,26 +67,12 @@ public struct BlobBucketInfo: Decodable, Sendable, Equatable {
         name = try c.decode(String.self, forKey: .name)
         description = try c.decodeIfPresent(String.self, forKey: .description)
         ttlTier = try c.decode(BlobBucketTtlTier.self, forKey: .ttlTier)
-        ruleSetId = try c.decodeIfPresent(String.self, forKey: .ruleSetId)
+        preset = try c.decode(BlobBucketPreset.self, forKey: .preset)
+        convertedFromRuleSet =
+            try c.decodeIfPresent(Bool.self, forKey: .convertedFromRuleSet) ?? false
         createdBy = try c.decode(String.self, forKey: .createdBy)
         createdAt = try c.decode(String.self, forKey: .createdAt)
         modifiedAt = try c.decode(String.self, forKey: .modifiedAt)
-
-        if let decodedPreset = try c.decodeIfPresent(BlobBucketPreset.self, forKey: .preset) {
-            preset = decodedPreset
-        } else {
-            let legacy = try c.decode(BlobBucketAccessPolicy.self, forKey: .accessPolicy)
-            preset = Self.preset(from: legacy)
-        }
-        accessPolicy = try c.decodeIfPresent(String.self, forKey: .accessPolicy) ?? preset.rawValue
-    }
-
-    private static func preset(from legacy: BlobBucketAccessPolicy) -> BlobBucketPreset {
-        switch legacy {
-        case .publicRead: return .publicAccess
-        case .authenticated: return .authenticated
-        case .ownerOnly: return .adminOnly
-        }
     }
 }
 
@@ -109,32 +89,21 @@ public struct CreateBlobBucketParams: Encodable, Sendable {
     public var description: String?
     /// Retention tier — controls automatic expiration.
     public var ttlTier: BlobBucketTtlTier
-    /// Named access preset. Provide this or a `ruleSetId`; legacy
-    /// `accessPolicy` remains accepted as an input alias. For custom access,
-    /// pass `ruleSetId` and leave `preset` nil; `.custom` is returned by the
-    /// server on bucket info but is not a meaningful create input.
+    /// Named access preset; the server requires one.
     public var preset: BlobBucketPreset?
-    /// Access policy for blobs in this bucket.
-    public var accessPolicy: BlobBucketAccessPolicy?
-    /// Optional rule set ID for CEL-based access control.
-    public var ruleSetId: String?
 
     public init(
         bucketKey: String,
         name: String,
         ttlTier: BlobBucketTtlTier,
-        accessPolicy: BlobBucketAccessPolicy? = nil,
         preset: BlobBucketPreset? = nil,
-        description: String? = nil,
-        ruleSetId: String? = nil
+        description: String? = nil
     ) {
         self.bucketKey = bucketKey
         self.name = name
         self.ttlTier = ttlTier
-        self.accessPolicy = accessPolicy
         self.preset = preset
         self.description = description
-        self.ruleSetId = ruleSetId
     }
 }
 
@@ -142,25 +111,18 @@ public struct CreateBlobBucketParams: Encodable, Sendable {
 
 /// Parameters for `updateBucket`. Mirrors JS `UpdateBlobBucketParams`.
 public struct UpdateBlobBucketParams: Encodable, Sendable {
-    /// New access preset. For custom access, set `ruleSetId` instead; `.custom`
-    /// is returned by the server on bucket info but is not a meaningful update
-    /// input.
+    /// New access preset. On a bucket with `convertedFromRuleSet`, naming a
+    /// preset clears the mark.
     public var preset: BlobBucketPreset?
-    public var accessPolicy: BlobBucketAccessPolicy?
-    public var ruleSetId: Updatable<String>?
     public var name: String?
     public var description: Updatable<String>?
 
     public init(
         preset: BlobBucketPreset? = nil,
-        accessPolicy: BlobBucketAccessPolicy? = nil,
-        ruleSetId: Updatable<String>? = nil,
         name: String? = nil,
         description: Updatable<String>? = nil
     ) {
         self.preset = preset
-        self.accessPolicy = accessPolicy
-        self.ruleSetId = ruleSetId
         self.name = name
         self.description = description
     }
@@ -171,7 +133,8 @@ public struct UpdateBlobBucketParams: Encodable, Sendable {
 /// Metadata for a single blob inside a bucket. Mirrors JS `BlobInfo`
 /// (named `BucketBlobInfo` here to avoid colliding with the per-document
 /// `BlobInfo` in `BlobManager.swift`). JS `BucketBlobUploadResult` extends
-/// `BlobInfo` with no extra fields, so `upload` also returns this type.
+/// `BlobInfo` with an optional `bytesTransferred`, so `upload` also returns
+/// this type.
 public struct BucketBlobInfo: Decodable, Sendable, Equatable {
     public let blobId: String
     public let bucketId: String
@@ -181,46 +144,41 @@ public struct BucketBlobInfo: Decodable, Sendable, Equatable {
     public let sha256: String?
     public let tags: [String]
     public let createdBy: String?
-    public let uploaded: String?
+    /// When the blob was stored, ISO 8601.
+    public let createdAt: String?
     public let etag: String?
+    /// On an upload's answer: the bytes sent, 0 when the same bytes were
+    /// already stored under the id. `nil` on metadata and list items.
+    public let bytesTransferred: Int?
 }
 
 /// A page of blobs in a bucket with an optional R2 pagination cursor.
 /// Mirrors JS `BucketBlobListResult`.
 public struct BucketBlobListResult: Decodable, Sendable, Equatable {
     public let items: [BucketBlobInfo]
-    /// Continuation token for the next page (#1316).
+    /// Continuation token for the next page.
     public let nextCursor: String?
-    /// True when a next page exists (#1316).
+    /// True when a next page exists.
     public let hasMore: Bool
-    /// Deprecated alias of `nextCursor` kept for one deprecation window
-    /// (#1316, #1982). Computed from `nextCursor` so the type's own
-    /// initializers never reference the deprecated declaration.
-    @available(*, deprecated, message: "Use nextCursor.")
-    public var cursor: String? { nextCursor }
 
     private enum CodingKeys: String, CodingKey {
-        case items, cursor, nextCursor, hasMore
+        case items, nextCursor, hasMore
     }
 
     public init(
         items: [BucketBlobInfo],
-        cursor: String? = nil,
         nextCursor: String? = nil,
         hasMore: Bool? = nil
     ) {
         self.items = items
-        let next = nextCursor ?? cursor
-        self.nextCursor = next
-        self.hasMore = hasMore ?? (next != nil)
+        self.nextCursor = nextCursor
+        self.hasMore = hasMore ?? (nextCursor != nil)
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         items = try c.decodeIfPresent([BucketBlobInfo].self, forKey: .items) ?? []
-        // #1316: prefer `nextCursor`; `cursor` is the deprecated alias.
         let next = try c.decodeIfPresent(String.self, forKey: .nextCursor)
-            ?? c.decodeIfPresent(String.self, forKey: .cursor)
         nextCursor = next
         hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (next != nil)
     }
@@ -257,7 +215,7 @@ public struct BlobDeletedResult: Decodable, Sendable, Equatable {
     public let deleted: Bool
 }
 
-/// Result of a batch blob delete (#1455) via `delete(bucketIdOrKey:blobIds:)`.
+/// Result of a batch blob delete via `delete(bucketIdOrKey:blobIds:)`.
 /// Mirrors JS's `BatchBlobDeleteResult` — `{ deleted, blobIds, bucketId }`,
 /// returned by `POST /blob-buckets/:bucketId/blobs/delete`.
 public struct BatchBlobDeleteResult: Decodable, Sendable, Equatable {

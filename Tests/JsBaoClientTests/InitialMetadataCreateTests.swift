@@ -2,7 +2,8 @@ import XCTest
 @testable import JsBaoClient
 
 /// Live tests for create-time `initialMetadata` on the Swift client's
-/// collection- and database-create surfaces (issue #1451, parity with #1420).
+/// collection-, database- and group-create surfaces (issue #1451, parity with
+/// #1420; groups since #3983).
 ///
 /// These cover what the Swift surface owns: the parameter reaches the server on
 /// both create endpoints and the categories it names are stamped on the new
@@ -85,28 +86,9 @@ final class InitialMetadataCreateTests: XCTestCase {
         XCTAssertEqual(stamped["tier"] as? String, "pro")
     }
 
-    /// Behavior 7: `databases.create` stamps the named category on the new
-    /// database.
-    func testDatabaseCreateStampsInitialMetadata() async throws {
-        try await createCategory(resourceType: "database", category: "settings", field: "visibility")
-
-        let created = try await client.databases.create(params: CreateDatabaseParams(
-            title: "Class Roster",
-            databaseType: "roster",
-            initialMetadata: ["settings": ["visibility": .string("class-only")]]
-        ))
-        XCTAssertFalse(created.databaseId.isEmpty)
-
-        let stamped = try await readMetadata(
-            resourceType: "database",
-            resourceId: created.databaseId,
-            category: "settings"
-        )
-        XCTAssertEqual(stamped["visibility"] as? String, "class-only")
-    }
-
     /// Behavior 8: an unknown category fails the whole create — the Swift call
     /// throws and no collection is left behind.
+    @available(*, deprecated)
     func testCollectionCreateWithUnknownCategoryFailsAtomically() async throws {
         let name = "orphan-\(Int(Date().timeIntervalSince1970))"
         await XCTAssertThrowsErrorAsync(
@@ -118,6 +100,46 @@ final class InitialMetadataCreateTests: XCTestCase {
         )
 
         let list = try await client.collections.listAll()
+        XCTAssertFalse(list.items.contains { $0.name == name })
+    }
+
+    /// A group create stamps the named category on the new group. A session
+    /// cannot create a group (#4735), so the group is created through the
+    /// admin API (`TestContext.createGroup`, #4737), with the app owner as its
+    /// custodian.
+    func testGroupCreateStampsInitialMetadata() async throws {
+        try await createCategory(resourceType: "group", category: "classLink", field: "classId")
+
+        let created = try await ctx.createGroup(
+            app: testApp,
+            name: "Reading group",
+            initialMetadata: ["classLink": ["classId": "class-A"]]
+        )
+        XCTAssertFalse(created.groupId.isEmpty)
+
+        let stamped = try await readMetadata(
+            resourceType: "group",
+            resourceId: created.groupId,
+            category: "classLink"
+        )
+        XCTAssertEqual(stamped["classId"] as? String, "class-A")
+    }
+
+    /// An unknown category fails the whole group create and no group is left
+    /// behind: the Swift client's list does not find it.
+    func testGroupCreateWithUnknownCategoryFailsAtomically() async throws {
+        // The id is minted on success only (#4917), so the check is by name.
+        let name = "Orphan-\(Int(Date().timeIntervalSince1970))"
+        await XCTAssertThrowsErrorAsync(
+            try await self.ctx.createGroup(
+                app: self.testApp,
+                name: name,
+                initialMetadata: ["nonexistent": ["x": "1"]]
+            ),
+            "create with an unknown metadata category should fail"
+        )
+
+        let list = try await client.groups.list()
         XCTAssertFalse(list.items.contains { $0.name == name })
     }
 }

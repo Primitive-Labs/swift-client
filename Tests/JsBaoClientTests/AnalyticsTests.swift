@@ -8,6 +8,7 @@ import XCTest
 /// synchronous members: awaiting is what makes "log, then connect, then assert"
 /// deterministic. The deprecated synchronous surface has its own behavioral
 /// guard in `DeprecationWindowInternalUseTests`.
+@available(*, deprecated)
 final class AnalyticsTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

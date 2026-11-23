@@ -1,0 +1,92 @@
+[models.Mix]
+class_name = "Mix"
+# omitted: field "title" (it differs from "Title" only in case, and a query table keeps one column per field name ignoring case); its values stay readable through documents.records()
+
+[models.Mix.fields.id]
+type = "id"
+auto_assign = true
+
+[models.Mix.fields.Title]
+type = "string"
+
+[models.Mix.fields.at]
+type = "string"
+
+[models.Mix.fields.mixed]
+# observed: string, number, boolean (a value that does not fit string is converted when read)
+type = "string"
+
+[models.Mix.fields.n]
+# observed: string, number (a value that does not fit string is converted when read)
+type = "string"
+
+[models.Mix.fields.nothing]
+# observed: null only (exported as string)
+type = "string"
+
+[models.Mix.fields.tags]
+type = "stringset"
+
+
+[models.Shelf]
+class_name = "Shelf"
+# omitted: model "shelf" (it differs from "Shelf" only in case, and the client's query tables keep one table per model name ignoring case); its records stay readable through documents.records()
+# dropped: unique constraint "byTitleCode" on [title, code] (exported TOML declares no constraint; add a [[models.Shelf.unique_constraints]] entry to keep it)
+
+[models.Shelf.fields.id]
+type = "id"
+auto_assign = true
+
+[models.Shelf.fields.title]
+# dropped: indexed = true (exported TOML declares no index; add it back to keep this field's query index)
+type = "string"
+
+[models.Shelf.fields.code]
+type = "string"
+
+[models.Shelf.fields.tags]
+type = "stringset"
+default = []
+
+
+[models.any]
+class_name = "AnyModel"
+
+[models.any.fields.id]
+type = "id"
+auto_assign = true
+
+[models.any.fields.label]
+type = "string"
+
+
+[models.primitive_row]
+class_name = "PrimitiveRowModel"
+
+[models.primitive_row.fields.id]
+type = "id"
+auto_assign = true
+
+[models.primitive_row.fields.label]
+type = "string"
+
+
+[models.tasks]
+
+[models.tasks.fields.id]
+type = "id"
+auto_assign = true
+
+[models.tasks.fields.label]
+type = "string"
+
+
+[models.tasks_record]
+class_name = "TasksRecordModel"
+
+[models.tasks_record.fields.id]
+type = "id"
+auto_assign = true
+
+[models.tasks_record.fields.label]
+type = "string"

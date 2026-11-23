@@ -1,0 +1,39 @@
+{
+  "model": "Turn",
+  "row": {
+    "id": "turn_1",
+    "seq": 1,
+    "status": "completed",
+    "initiatorUserId": "u_owner",
+    "startedAt": "2026-09-28T12:00:00.000Z",
+    "endedAt": "2026-09-28T12:00:04.000Z",
+    "inputTokens": 120,
+    "outputTokens": 30,
+    "totalTokens": 150,
+    "cost": 0.0021
+  },
+  "expect": {
+    "id": "turn_1",
+    "seq": 1,
+    "status": "completed",
+    "initiatorUserId": "u_owner",
+    "startedAt": "2026-09-28T12:00:00.000Z",
+    "endedAt": "2026-09-28T12:00:04.000Z",
+    "errorCode": {
+      "$absent": true
+    },
+    "errorMessage": {
+      "$absent": true
+    },
+    "inputTokens": 120,
+    "outputTokens": 30,
+    "totalTokens": 150,
+    "reasoningTokens": {
+      "$absent": true
+    },
+    "cachedInputTokens": {
+      "$absent": true
+    },
+    "cost": 0.0021
+  }
+}

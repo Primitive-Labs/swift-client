@@ -21,6 +21,44 @@ enum CodegenError: Error, CustomStringConvertible {
     /// A unique constraint on a stringset field (#3719); `message` is the
     /// sentence js-bao and `TomlSchemaLoader` answer.
     case uniqueOnStringset(message: String)
+    /// A declared field name the platform reserves (#3501, #4505); `message`
+    /// is js-bao's `[models.<model>.fields.<field>]: <sentence>`.
+    case reservedFieldName(message: String)
+    /// One model declared differently in two input files (#5025).
+    case conflictingDeclarations(model: String, first: String, second: String, differences: [String])
+    /// Two models whose resolved Swift name writes one file.
+    case swiftNameCollision(fileName: String, models: [String])
+    /// A model whose resolved Swift name is the registration barrel's.
+    case reservedBarrelName(fileName: String)
+    /// A model whose resolved Swift name is a library protocol every
+    /// generated model names in its conformance clause, which the model
+    /// would shadow.
+    case reservedProtocolName(model: String, name: String)
+    /// An error raised reading one of several input files, naming the file.
+    indirect case inFile(name: String, error: CodegenError)
+    /// A `vector` field outside a db3 type file (#5225).
+    case vectorFieldOutsideDb3Type(model: String, field: String)
+    /// A vector field the client cannot encode, or `dims`/`element` on
+    /// another field (#5225); `reason` is js-bao's sentence.
+    case invalidVectorField(model: String, field: String, reason: String)
+    /// A unique constraint naming a vector field (#5225).
+    case vectorInUniqueConstraint(model: String, constraint: String, field: String)
+    /// An `enforce_enum` that is not `true` or `false` (#5897): it never
+    /// reads as enforcement off.
+    case invalidEnforceEnum(model: String, field: String)
+    /// A misused `storedAs` (a renamed db3 field's stored name); `message`
+    /// is js-bao's `[models.<model>.fields.<field>]: storedAs …` sentence.
+    case invalidStoredAs(message: String)
+    /// A field `ref` that names no shared enum, or sits beside `type`/`enum`
+    /// (#5545); `message` is js-bao's `[models.<model>.fields.<field>]: ref …`.
+    case sharedEnumRef(message: String)
+    /// A model whose own names would take or shadow what a ref'd field
+    /// generates (#5896); `message` names the model, the field and the def.
+    case sharedEnumNaming(message: String)
+    /// An input type file that allows local-only db3s and cannot be embedded
+    /// (a hook beside the setting, a model it names that no input declares,
+    /// a value js-bao prints differently); `message` names the file.
+    case localOnlyType(message: String)
 
     var description: String {
         switch self {
@@ -29,7 +67,7 @@ enum CodegenError: Error, CustomStringConvertible {
         case let .missingFieldType(model, field):
             return "Model `\(model)` field `\(field)` is missing required `type`"
         case let .unknownFieldType(model, field, typeName):
-            return "Model `\(model)` field `\(field)` has unknown type `\(typeName)` — allowed: string, number, boolean, date, id, stringset"
+            return "Model `\(model)` field `\(field)` has unknown type `\(typeName)` — allowed: string, number, boolean, date, id, stringset, vector"
         case let .malformedUniqueConstraint(model, index, reason):
             return "Model `\(model)` unique_constraints[\(index)]: \(reason)"
         case let .uniqueConstraintUnknownField(model, constraint, field):
@@ -58,6 +96,36 @@ enum CodegenError: Error, CustomStringConvertible {
             return "\(context): unknown key `\(key)`. Allowed: \(allowed.joined(separator: ", "))"
         case let .uniqueOnStringset(message):
             return message
+        case let .reservedFieldName(message):
+            return message
+        case let .sharedEnumRef(message):
+            return message
+        case let .sharedEnumNaming(message):
+            return message
+        case let .localOnlyType(message):
+            return message
+        case let .conflictingDeclarations(model, first, second, differences):
+            return "Model `\(model)` is declared differently in \(first) and \(second): "
+                + "\(differences.joined(separator: "; ")). Declare it in one file, or make both "
+                + "declarations the same."
+        case let .swiftNameCollision(fileName, models):
+            return "\(fileName) would be written by multiple models: \(models.joined(separator: ", ")). Disambiguate with [models.<name>] class_name = \"...\"."
+        case let .reservedBarrelName(fileName):
+            return "a model resolves to the reserved barrel filename \(fileName). Disambiguate with [models.<name>] class_name = \"...\"."
+        case let .reservedProtocolName(model, name):
+            return "Model `\(model)` resolves to the Swift name `\(name)`, the JsBaoClient protocol every generated model conforms to. Disambiguate with [models.<name>] class_name = \"...\"."
+        case let .inFile(name, error):
+            return "\(name): \(error.description)"
+        case let .vectorFieldOutsideDb3Type(model, field):
+            return "Model `\(model)` field `\(field)`: a vector field belongs to a db3 type (a schema with a [type] table); a document schema or a database type cannot declare one"
+        case let .invalidVectorField(model, field, reason):
+            return "Model `\(model)` field `\(field)`: \(reason)"
+        case let .invalidEnforceEnum(model, field):
+            return "[models.\(model).fields.\(field)]: enforce_enum must be true or false"
+        case let .invalidStoredAs(message):
+            return message
+        case let .vectorInUniqueConstraint(model, constraint, field):
+            return "[[models.\(model).unique_constraints]]: unique constraint \"\(constraint)\" names the vector field \"\(field)\", which cannot be unique"
         }
     }
 }
@@ -67,11 +135,12 @@ enum CodegenError: Error, CustomStringConvertible {
 /// rejects in strict mode is rejected here too, and vice versa.
 private enum KnownKeys {
     static let model: Set<String> = [
-        "fields", "relationships", "unique_constraints", "class_name",
+        "fields", "relationships", "unique_constraints", "class_name", "removedFields",
     ]
     static let field: Set<String> = [
         "type", "indexed", "unique", "required", "auto_assign",
         "auto_stamp", "max_length", "max_count", "default", "enum",
+        "enforce_enum", "dims", "element", "deprecated", "cleared", "storedAs",
     ]
     static let relationship: Set<String> = [
         "type", "model", "related_id_field", "join_model",
@@ -96,17 +165,195 @@ enum TomlParser {
     /// a typo'd key (`requierd = true`) fails loud at codegen time
     /// rather than producing a subtly-wrong model. Pass `strict: false`
     /// (the `--no-strict` CLI flag) for the legacy lenient behavior.
+    ///
+    /// When `rejectReservedFieldNames` is true, a declared field name the
+    /// platform reserves (`reservedFieldProblem`) raises
+    /// `CodegenError.reservedFieldName` before the field's type is checked —
+    /// js-bao's loader option of the same name, in the same order. The plugin
+    /// passes `true`; the default reads a schema as stored.
     static func parse(
         tomlString: String,
         swiftNameSuffix: String,
-        strict: Bool = true
+        strict: Bool = true,
+        rejectReservedFieldNames: Bool = false
     ) throws -> [ParsedSchema] {
+        try parseAll(
+            documents: [(sourceName: "", source: tomlString)],
+            swiftNameSuffix: swiftNameSuffix,
+            strict: strict,
+            rejectReservedFieldNames: rejectReservedFieldNames
+        )
+    }
+
+    /// Parse several TOML documents into one model namespace (#5025): the
+    /// models of every document in input order, each document's in its own
+    /// order, with relationships resolved over the union. A model two
+    /// documents declare the same way is kept once, from the first; declared
+    /// differently, the parse throws naming both files and what differs.
+    /// Each schema's `sourceName` is its document's.
+    ///
+    /// `sharedEnums`, one per document, expands each field's shared-enum
+    /// `ref` before the document is read (#5545); without one, `ref` is an
+    /// unknown key as always.
+    static func parseAll(
+        documents: [(sourceName: String, source: String)],
+        sharedEnums: [SharedEnums?]? = nil,
+        swiftNameSuffix: String,
+        strict: Bool = true,
+        rejectReservedFieldNames: Bool = false
+    ) throws -> [ParsedSchema] {
+        // One document reads, and refuses, exactly as it always has; among
+        // several, a refusal names the file it came from.
+        func naming<T>(_ sourceName: String, _ body: () throws -> T) throws -> T {
+            guard documents.count > 1 else { return try body() }
+            do {
+                return try body()
+            } catch let error as CodegenError {
+                throw CodegenError.inFile(name: sourceName, error: error)
+            }
+        }
+
+        var perDocument: [(sourceName: String, models: TOMLTable, schemas: [ParsedSchema])] = []
+        for (position, document) in documents.enumerated() {
+            let parsed = try naming(document.sourceName) {
+                try parseModels(
+                    tomlString: document.source,
+                    sourceName: document.sourceName,
+                    sharedEnums: position < (sharedEnums?.count ?? 0) ? sharedEnums![position] : nil,
+                    swiftNameSuffix: swiftNameSuffix,
+                    strict: strict,
+                    rejectReservedFieldNames: rejectReservedFieldNames
+                )
+            }
+            guard let parsed else { continue }
+            perDocument.append((
+                document.sourceName,
+                parsed.models,
+                parsed.schemas.map { schema in
+                    var named = schema
+                    named.sourceName = document.sourceName
+                    return named
+                }
+            ))
+        }
+
+        // Relationships need the full known-model set: every document's.
+        let knownModels = Set(perDocument.flatMap { $0.schemas.map(\.name) })
+        var merged: [ParsedSchema] = []
+        var mergedTables: [TOMLTable?] = []
+        var indexByName: [String: Int] = [:]
+        for document in perDocument {
+            for var schema in document.schemas {
+                if let relsTable = document.models[schema.name]?.table?["relationships"]?.table {
+                    schema.relationships = try naming(document.sourceName) {
+                        try buildRelationships(
+                            modelName: schema.name,
+                            relsTable: relsTable,
+                            knownModels: knownModels,
+                            strict: strict
+                        )
+                    }
+                }
+                let table = document.models[schema.name]?.table
+                guard let index = indexByName[schema.name] else {
+                    indexByName[schema.name] = merged.count
+                    merged.append(schema)
+                    mergedTables.append(table)
+                    continue
+                }
+                let first = merged[index]
+                merged[index].typeNames = Array(Set(first.typeNames + schema.typeNames)).sorted()
+                let differences = declarationDifferences(first, schema)
+                    + defaultDifferences(first, mergedTables[index], schema, table)
+                if !differences.isEmpty {
+                    throw CodegenError.conflictingDeclarations(
+                        model: schema.name, first: first.sourceName,
+                        second: schema.sourceName, differences: differences
+                    )
+                }
+            }
+        }
+        // A type that names a model declared in another file (`[type]
+        // models = [...]`) holds that model too.
+        for document in documents {
+            guard let type = (try? TOMLTable(string: document.source))?["type"]?.table,
+                  let listed = type["models"]?.array else { continue }
+            let declared = type["name"]?.string ?? ""
+            let stem = ((document.sourceName as NSString).lastPathComponent as NSString).deletingPathExtension
+            let typeName = declared.isEmpty ? stem : declared
+            guard !typeName.isEmpty else { continue }
+            for position in 0..<listed.count {
+                guard let model = listed[position].string, let index = indexByName[model] else { continue }
+                merged[index].typeNames = Array(Set(merged[index].typeNames + [typeName])).sorted()
+            }
+        }
+        return merged
+    }
+
+    /// What differs between two declarations of one model, as phrases naming
+    /// the field (or option) and the file each side came from. Empty when
+    /// they are the same declaration.
+    static func declarationDifferences(_ a: ParsedSchema, _ b: ParsedSchema) -> [String] {
+        var out: [String] = []
+        for name in a.fieldOrder + b.fieldOrder.filter({ a.fields[$0] == nil }) {
+            switch (a.fields[name], b.fields[name]) {
+            case (.some, .none): out.append("field `\(name)` is only in \(a.sourceName)")
+            case (.none, .some): out.append("field `\(name)` is only in \(b.sourceName)")
+            case let (.some(x), .some(y)) where x.declared != y.declared: out.append("field `\(name)` differs")
+            default: break
+            }
+        }
+        if a.swiftName != b.swiftName { out.append("class_name differs") }
+        if a.uniqueConstraints != b.uniqueConstraints { out.append("unique_constraints differ") }
+        let shape = { (s: ParsedSchema) in
+            s.relationships.map { "\($0.name):\($0.descriptor.rawType):\($0.descriptor.properties.map { "\($0.0)=\($0.1)" })" }.sorted()
+        }
+        if shape(a) != shape(b) { out.append("relationships differ") }
+        return out
+    }
+
+    /// The fields whose `default` differs as a TOML value, among fields that
+    /// otherwise read the same. The IR keeps only the defaults the emitter
+    /// writes (strings, booleans, numbers), so a date, time or array default
+    /// is compared here, from each model's own table.
+    static func defaultDifferences(
+        _ a: ParsedSchema, _ aTable: TOMLTable?,
+        _ b: ParsedSchema, _ bTable: TOMLTable?
+    ) -> [String] {
+        let declared = { (table: TOMLTable?, field: String) -> TOMLValue? in
+            table?["fields"]?.table?[field]?.table?["default"]?.tomlValue
+        }
+        return a.fieldOrder.compactMap { name in
+            guard let field = a.fields[name], b.fields[name]?.declared == field.declared else { return nil }
+            return declared(aTable, name) == declared(bTable, name) ? nil : "field `\(name)` differs"
+        }
+    }
+
+    /// One document's models, without relationships, or `nil` when it has no
+    /// `[models]` table. In a db3 type file (a document with a `[type]`
+    /// table) a model that declares no `id` gets the field a declared
+    /// `type = "id", auto_assign = true` gives, first in field order, as
+    /// js-bao's loader reads the same file.
+    private static func parseModels(
+        tomlString: String,
+        sourceName: String = "",
+        sharedEnums: SharedEnums? = nil,
+        swiftNameSuffix: String,
+        strict: Bool,
+        rejectReservedFieldNames: Bool
+    ) throws -> (models: TOMLTable, schemas: [ParsedSchema])? {
         let table: TOMLTable
         do {
             table = try TOMLTable(string: tomlString)
         } catch {
             throw CodegenError.parse(String(describing: error))
         }
+        let (sharedEnumDefs, jsonDefs) = try sharedEnums?.expandAll(table) ?? ([:], [:])
+        let isTypeFile = table["type"]?.table != nil
+        // A type file's db3 type name: its `[type] name`, else its file's stem.
+        let declaredTypeName = table["type"]?.table?["name"]?.string ?? ""
+        let stem = ((sourceName as NSString).lastPathComponent as NSString).deletingPathExtension
+        let typeName: String? = isTypeFile ? (declaredTypeName.isEmpty ? (stem.isEmpty ? nil : stem) : declaredTypeName) : nil
 
         // A fresh-template schema.toml ships with no models yet (the
         // user adds the first `[models.<name>]` block as their next
@@ -117,7 +364,7 @@ enum TomlParser {
         // run-ios.sh) call codegen unconditionally without failing
         // before the schema has any models.
         guard let modelsTable = table["models"]?.table else {
-            return []
+            return nil
         }
 
         // First pass: collect field/constraint/codegen info per model.
@@ -132,9 +379,13 @@ enum TomlParser {
                 model, allowed: KnownKeys.model,
                 context: "Model `\(key)`", strict: strict
             )
+            // As js-bao's loader asks: does the model declare `id` at all.
+            let synthesizesId = isTypeFile && model["fields"]?.table?["id"] == nil
             var schema = try buildSchema(
                 name: key, table: model,
-                swiftNameSuffix: swiftNameSuffix, strict: strict
+                swiftNameSuffix: swiftNameSuffix, strict: strict,
+                rejectReservedFieldNames: rejectReservedFieldNames,
+                synthesizeId: synthesizesId, vectors: isTypeFile
             )
             // TOMLKit hands keys back alphabetically, which is fine for
             // every internal use (lookups go through a dictionary) but
@@ -150,26 +401,20 @@ enum TomlParser {
                 model: key,
                 source: tomlString
             )
+            // The synthesized `id` is not in the source, so it is placed
+            // first again after the source order is recovered.
+            if synthesizesId {
+                schema.fieldOrder.removeAll { $0 == "id" }
+                schema.fieldOrder.insert("id", at: 0)
+            }
+            for (field, def) in sharedEnumDefs[key] ?? [:] { schema.fields[field]?.sharedEnum = def }
+            for (field, def) in jsonDefs[key] ?? [:] { schema.fields[field]?.json = def }
+            if let typeName { schema.typeNames = [typeName] }
             schemasByName[key] = schema
             modelOrder.append(key)
         }
 
-        // Second pass: relationships (need full known-model set).
-        for key in modelOrder {
-            guard let model = modelsTable[key]?.table,
-                  var schema = schemasByName[key] else { continue }
-            if let relsTable = model["relationships"]?.table {
-                schema.relationships = try buildRelationships(
-                    modelName: key,
-                    relsTable: relsTable,
-                    knownModels: Set(schemasByName.keys),
-                    strict: strict
-                )
-                schemasByName[key] = schema
-            }
-        }
-
-        return modelOrder.compactMap { schemasByName[$0] }
+        return (modelsTable, modelOrder.compactMap { schemasByName[$0] })
     }
 
     // MARK: - Strict unknown-key validation
@@ -198,19 +443,47 @@ enum TomlParser {
         name: String,
         table: TOMLTable,
         swiftNameSuffix: String,
-        strict: Bool
+        strict: Bool,
+        rejectReservedFieldNames: Bool,
+        synthesizeId: Bool = false,
+        vectors: Bool = false
     ) throws -> ParsedSchema {
-        let (fieldOrder, fields) = try buildFields(
-            modelName: name, table: table, strict: strict
+        var (fieldOrder, fields) = try buildFields(
+            modelName: name, table: table, strict: strict,
+            rejectReservedFieldNames: rejectReservedFieldNames, vectors: vectors
         )
+        // A cleared field is no field of a generated model; a tombstoned
+        // name (`removedFields`) is never in `fields`.
+        let cleared = Set(fields.filter { $0.value.cleared }.map(\.key))
+        if !cleared.isEmpty {
+            fields = fields.filter { !cleared.contains($0.key) }
+            fieldOrder.removeAll { cleared.contains($0) }
+        }
+        // A db3 type file's model with no `id` is read as declaring
+        // `type = "id", auto_assign = true`, before anything that judges the
+        // model's fields (a unique constraint may name `id`), as js-bao does.
+        if synthesizeId && fields["id"] == nil {
+            fields["id"] = ParsedField(
+                type: .id, indexed: false, unique: false, required: false,
+                autoAssign: true, maxLength: nil, maxCount: nil,
+                defaultLiteral: nil, enumValues: nil, autoStamp: nil
+            )
+            fieldOrder.insert("id", at: 0)
+        }
         let constraints = try buildUniqueConstraints(
             modelName: name, table: table, fieldNames: Set(fields.keys),
-            strict: strict
+            strict: strict, clearedNames: cleared
         )
         if let message = uniqueStringsetViolation(
             modelName: name, fields: fields, constraints: constraints
         ) {
             throw CodegenError.uniqueOnStringset(message: message)
+        }
+        // A vector cannot be part of a unique key (#5225).
+        for c in constraints.sorted(by: { $0.name < $1.name }) {
+            if let field = c.fields.first(where: { fields[$0]?.type == .vector }) {
+                throw CodegenError.vectorInUniqueConstraint(model: name, constraint: c.name, field: field)
+            }
         }
         let swiftName = try resolveSwiftName(
             modelName: name, table: table, suffix: swiftNameSuffix
@@ -360,10 +633,25 @@ enum TomlParser {
 
     // MARK: - Fields
 
+    /// Why a field name is reserved, or `nil` when a model may declare it —
+    /// js-bao's `checkReservedFieldName`, sentence for sentence: `id` is
+    /// allowed, `type` maps to the internal `_type` column, a leading `_` is
+    /// internal, and a name in `ReservedFieldNames` (generated from js-bao's
+    /// list) breaks a generated model on the JavaScript or the Swift client.
+    static func reservedFieldProblem(_ name: String) -> String? {
+        if name == "id" { return nil }
+        if name == "type" { return "Field 'type' is reserved (maps to internal _type column in queries)" }
+        if name.hasPrefix("_") { return "Field '\(name)' is reserved (fields starting with '_' are internal)" }
+        if let reason = ReservedFieldNames.reasons[name] { return "Field '\(name)' is reserved (\(reason))" }
+        return nil
+    }
+
     private static func buildFields(
         modelName: String,
         table: TOMLTable,
-        strict: Bool
+        strict: Bool,
+        rejectReservedFieldNames: Bool,
+        vectors: Bool
     ) throws -> ([String], [String: ParsedField]) {
         guard let fieldsTable = table["fields"]?.table else { return ([], [:]) }
         var order: [String] = []
@@ -372,10 +660,12 @@ enum TomlParser {
             guard let field = fieldsTable[fieldName]?.table else { continue }
             out[fieldName] = try buildField(
                 modelName: modelName, fieldName: fieldName,
-                table: field, strict: strict
+                table: field, strict: strict,
+                rejectReservedFieldNames: rejectReservedFieldNames, vectors: vectors
             )
             order.append(fieldName)
         }
+        try checkStoredNames(modelName: modelName, order: order, fields: out)
         return (order, out)
     }
 
@@ -383,8 +673,18 @@ enum TomlParser {
         modelName: String,
         fieldName: String,
         table: TOMLTable,
-        strict: Bool
+        strict: Bool,
+        rejectReservedFieldNames: Bool,
+        vectors: Bool
     ) throws -> ParsedField {
+        // js-bao refuses a reserved name before it parses the field's
+        // options, so a reserved field with no `type` names the reserved
+        // name, not the missing type.
+        if rejectReservedFieldNames, let problem = reservedFieldProblem(fieldName) {
+            throw CodegenError.reservedFieldName(
+                message: "[models.\(modelName).fields.\(fieldName)]: \(problem)"
+            )
+        }
         // js-bao validates the field type FIRST (before the unknown-key
         // sweep) — match that order so the error a malformed field
         // surfaces is identical across runtimes.
@@ -401,6 +701,19 @@ enum TomlParser {
             context: "Model `\(modelName)` field `\(fieldName)`",
             strict: strict
         )
+        if type == .vector && !vectors {
+            throw CodegenError.vectorFieldOutsideDb3Type(model: modelName, field: fieldName)
+        }
+        if let reason = vectorFieldProblem(table, type: typeLiteral) {
+            throw CodegenError.invalidVectorField(model: modelName, field: fieldName, reason: reason)
+        }
+        // `storedAs`, strict or not, as js-bao's loader judges it.
+        let storedAs = try storedAsOf(table, modelName: modelName, fieldName: fieldName)
+        // `enforce_enum` takes `true` or `false`, strict or not, as js-bao's loader judges it (#5897).
+        // It changes nothing the codegen emits: the room enforces it.
+        if let flag = table["enforce_enum"], flag.bool == nil {
+            throw CodegenError.invalidEnforceEnum(model: modelName, field: fieldName)
+        }
         let autoStamp = try decodeAutoStamp(
             table["auto_stamp"], modelName: modelName, fieldName: fieldName
         )
@@ -418,8 +731,89 @@ enum TomlParser {
             maxCount: table["max_count"]?.int,
             defaultLiteral: decodeDefault(table["default"]),
             enumValues: enumValues,
-            autoStamp: autoStamp
+            autoStamp: autoStamp,
+            stringSetDefault: type == .stringset ? decodeStringSetDefault(table["default"]) : nil,
+            dims: type == .vector ? table["dims"]?.int : nil,
+            element: type == .vector ? table["element"]?.string : nil,
+            deprecated: table["deprecated"]?.bool ?? false,
+            cleared: table["cleared"]?.bool ?? false,
+            storedAs: storedAs
         )
+    }
+
+    /// A field's `storedAs`: js-bao's `storedAsOf`, sentence for sentence. A
+    /// non-empty identifier that is not reserved and not `id`, never on the
+    /// `id` field; equal to the field's own key, it means nothing (`nil`).
+    private static func storedAsOf(_ table: TOMLTable, modelName: String, fieldName: String) throws -> String? {
+        guard let raw = table["storedAs"] else { return nil }
+        let context = "[models.\(modelName).fields.\(fieldName)]"
+        guard let value = raw.string, !value.isEmpty else {
+            throw CodegenError.invalidStoredAs(message: "\(context): storedAs must be a non-empty string naming the field's stored name")
+        }
+        if fieldName == "id" {
+            throw CodegenError.invalidStoredAs(message: "\(context): storedAs cannot be set on the id field")
+        }
+        if value == "id" {
+            throw CodegenError.invalidStoredAs(message: "\(context): storedAs \"id\" names the record's id; a field's stored name is never id")
+        }
+        if let reserved = reservedFieldProblem(value) {
+            throw CodegenError.invalidStoredAs(message: "\(context): storedAs \(jsonQuoted(value)) is reserved: \(reserved)")
+        }
+        if value.range(of: "^[A-Za-z][A-Za-z0-9_]*$", options: .regularExpression) == nil {
+            throw CodegenError.invalidStoredAs(message: "\(context): storedAs \(jsonQuoted(value)) is not an identifier (a letter, then letters, digits or _)")
+        }
+        return value == fieldName ? nil : value
+    }
+
+    /// A model's stored names, as js-bao's `storedNamesProblem` judges them:
+    /// two fields never share one, and a field's `storedAs` never names
+    /// another declared field's key.
+    private static func checkStoredNames(modelName: String, order: [String], fields: [String: ParsedField]) throws {
+        var storedBy: [String: String] = [:]
+        for field in order {
+            guard let stored = fields[field]?.storedAs else { continue }
+            let context = "[models.\(modelName).fields.\(field)]"
+            if fields[stored] != nil {
+                throw CodegenError.invalidStoredAs(message: "\(context): storedAs \(jsonQuoted(stored)) is the key of another declared field; a stored name belongs to one field")
+            }
+            if let other = storedBy[stored] {
+                throw CodegenError.invalidStoredAs(message: "\(context): storedAs \(jsonQuoted(stored)) is also the stored name of \(other); a stored name belongs to one field")
+            }
+            storedBy[stored] = field
+        }
+    }
+
+    /// `value` as `JSON.stringify` writes a string.
+    private static func jsonQuoted(_ value: String) -> String {
+        guard let data = try? JSONEncoder().encode(value), let text = String(data: data, encoding: .utf8) else { return "\"\(value)\"" }
+        return text.replacingOccurrences(of: "\\/", with: "/")
+    }
+
+    /// The element types a vector field may declare (#5225).
+    static let vectorElements = ["f32", "f16", "i8"]
+
+    /// What is wrong with a field table's vector options, or `nil`: the rule
+    /// `JsBaoClient.TomlSchemaLoader` and js-bao's `vectorFieldProblem` apply.
+    private static func vectorFieldProblem(_ table: TOMLTable, type: String) -> String? {
+        guard type == "vector" else {
+            for key in ["dims", "element"] where table[key] != nil {
+                return "`\(key)` applies to a vector field only, not a \"\(type)\" field"
+            }
+            return nil
+        }
+        guard let dims = table["dims"]?.int, dims >= 1 else {
+            return "a vector field needs `dims`, an integer of at least 1"
+        }
+        guard let element = table["element"]?.string, vectorElements.contains(element) else {
+            return "a vector field needs `element`, one of \(vectorElements.joined(separator: ", "))"
+        }
+        for key in ["indexed", "unique", "default", "enum", "auto_assign", "auto_stamp", "max_length", "max_count"] {
+            guard let value = table[key] else { continue }
+            // A flag set `false` is no option; `default = false` would write `false` into the vector.
+            if ["indexed", "unique", "auto_assign"].contains(key), value.bool == false { continue }
+            return "`\(key)` does not apply to a vector field"
+        }
+        return nil
     }
 
     /// Parse `auto_stamp = "create" | "update" | "both"`. Fail-fast on any
@@ -485,6 +879,18 @@ enum TomlParser {
         return out
     }
 
+    /// A string set's `default` members, when the default is an array of
+    /// strings; `nil` otherwise, so the field reads as stored.
+    private static func decodeStringSetDefault(_ value: TOMLValue?) -> [String]? {
+        guard let arr = value?.array else { return nil }
+        var out: [String] = []
+        for i in 0..<arr.count {
+            guard let s = arr[i].string else { return nil }
+            out.append(s)
+        }
+        return out
+    }
+
     private static func decodeDefault(_ value: TOMLValue?) -> ParsedDefault? {
         guard let value else { return nil }
         if let s = value.string { return .string(s) }
@@ -500,7 +906,8 @@ enum TomlParser {
         modelName: String,
         table: TOMLTable,
         fieldNames: Set<String>,
-        strict: Bool
+        strict: Bool,
+        clearedNames: Set<String> = []
     ) throws -> [ParsedUniqueConstraint] {
         guard let arr = table["unique_constraints"]?.array else { return [] }
         var out: [ParsedUniqueConstraint] = []
@@ -531,6 +938,9 @@ enum TomlParser {
                 }
                 fields.append(s)
             }
+            // A single-field constraint over a cleared field goes with the
+            // field, as the room's install drops it.
+            if fields.count == 1, clearedNames.contains(fields[0]) { continue }
             for f in fields where !fieldNames.contains(f) {
                 throw CodegenError.uniqueConstraintUnknownField(
                     model: modelName, constraint: name, field: f

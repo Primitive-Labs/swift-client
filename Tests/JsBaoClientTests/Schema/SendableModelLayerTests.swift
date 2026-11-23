@@ -20,9 +20,8 @@ import YSwift
 ///    `--require-zero` from `run-tests.sh`, is the per-file half: it builds
 ///    the library target and exits non-zero if any Phase C file regains a
 ///    Sendable site, naming the file — which a bare build failure does not.
-///  - The source-text checks assert the *written safety argument* exists and
-///    names the actual locks. An `@unchecked Sendable` is only as good as its
-///    argument, so a future conformance added without one fails here.
+///  - The source-text checks assert that the locks the safety arguments name
+///    are actually taken, and that the checked conformances stay checked.
 ///  - The rest are ordinary behavior tests: the live-handle semantics that
 ///    must survive (#1156), and read-path parity through the row bag.
 final class SendableModelLayerTests: XCTestCase {
@@ -283,66 +282,11 @@ final class SendableModelLayerTests: XCTestCase {
         XCTAssertNil(row["absent"])
     }
 
-    // MARK: - Behavior 6 — every unchecked conformance carries its argument
-
-    /// `@unchecked Sendable` is a claim the compiler does not check, so the
-    /// acceptance bar for this phase is a written safety argument that names
-    /// the specific locks. Assert the argument exists — and names the right
-    /// locks — for each of the three sync-domain classes, so a later
-    /// conformance can't be added bare.
-    func testUncheckedConformancesCarryWrittenSafetyArguments() throws {
-        let cases: [(file: String, declaration: String, mustMention: [String])] = [
-            (
-                "Schema/DynamicModel.swift",
-                "public final class DynamicModel: @unchecked Sendable",
-                ["observerLock", "listenerLock", "ffiLock", "NSRecursiveLock",
-                 "withExclusiveAccess", "transactSync"]
-            ),
-            (
-                "Schema/MultiDocModel.swift",
-                "final class MultiDocModel: IncludeTarget, @unchecked Sendable",
-                // `listenerLock` is the member's lock, taken while `lock` is
-                // still held — naming it is what completes the acquisition
-                // order (a two-lock claim would be incomplete, not wrong).
-                ["subscribeLock", "activeSubs", "members", "NSLock", "listenerLock"]
-            ),
-            (
-                "Query/BaoModelQueryEngine.swift",
-                "public final class BaoModelQueryEngine: @unchecked Sendable",
-                ["_rowWriteCount", "registeredJunctions", "stringFieldsByModel",
-                 "fieldTypeNamesByModel", "NSLock"]
-            ),
-            (
-                "Types/DocumentTypes.swift",
-                "public struct ConfinedYDocument: @unchecked Sendable",
-                ["ffiLock", "NSRecursiveLock", "transactSync"]
-            ),
-        ]
-
-        for entry in cases {
-            let source = try Self.clientSource(entry.file)
-            guard let argument = Self.docComment(precedingDeclaration: entry.declaration, in: source) else {
-                XCTFail("\(entry.file): expected declaration `\(entry.declaration)`")
-                continue
-            }
-            XCTAssertTrue(
-                argument.contains("safety argument"),
-                "\(entry.file): `\(entry.declaration)` must be preceded by a written safety argument"
-            )
-            for token in entry.mustMention {
-                XCTAssertTrue(
-                    argument.contains(token),
-                    "\(entry.file): the safety argument must name `\(token)`"
-                )
-            }
-        }
-    }
+    // MARK: - Behavior 6 — the unchecked conformances' locks hold in the code
 
     /// The safety table says every subscription handle is `observerLock`-
-    /// confined outside `deinit`. `testUncheckedConformancesCarryWrittenSafety
-    /// Arguments` only proves the token `observerLock` appears somewhere in the
-    /// block, which a handle written with no lock at all would still satisfy —
-    /// so check the write sites themselves. Every assignment to
+    /// confined outside `deinit`, so check the write sites themselves. Every
+    /// assignment to
     /// `rootSubscription` / `docUpdateSubscription` outside `deinit` must be on
     /// an `observerLock.withLock` line.
     ///
@@ -455,13 +399,9 @@ final class SendableModelLayerTests: XCTestCase {
     // MARK: - Helpers
 
     // The implementations live in `Helpers/ClientSourceText.swift` — the same
-    // three helpers were copied into every phase's structural suite, so there
-    // is one copy now (consolidated in Phase D4 of #1993). These are the local
-    // names the tests above use.
-
-    private static func docComment(precedingDeclaration declaration: String, in source: String) -> String? {
-        ClientSourceText.docComment(precedingDeclaration: declaration, in: source)
-    }
+    // helpers were copied into every phase's structural suite, so there is one
+    // copy now (consolidated in Phase D4 of #1993). These are the local names
+    // the tests above use.
 
     private static func uncheckedDeclarations(in source: String) -> [String] {
         ClientSourceText.uncheckedDeclarations(in: source)

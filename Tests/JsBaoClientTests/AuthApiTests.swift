@@ -2,8 +2,8 @@ import XCTest
 @testable import JsBaoClient
 
 /// Live integration coverage for the typed `client.auth` namespace
-/// (#964 / #1058): identity accessors, auth/app config, magic-link + OTP
-/// request/verify, and logout. The JS client's authController is the source
+/// (#964 / #1058): identity accessors, auth/app config, the email sign-in
+/// request and its two verify calls, and logout. The JS client's authController is the source
 /// of truth for the wire shapes.
 ///
 /// Native flows (passkeys #929, Google OAuth #928) are deferred and not
@@ -42,50 +42,56 @@ final class AuthApiTests: XCTestCase {
     // MARK: - Auth / app config
 
     /// `getAuthConfig()` decodes the typed `AuthConfigInfo` and reflects
-    /// admin-side feature flags (otpEnabled flips after the admin PUT).
+    /// admin-side feature flags (`emailSignInEnabled` flips with the admin
+    /// PUT).
     func testGetAuthConfigTypedReflectsAdminSettings() async throws {
-        try await ctx.updateAppSettings(
-            appId: testApp.appId,
-            settings: ["otpEnabled": true]
-        )
+        for enabled in [false, true] {
+            try await ctx.updateAppSettings(
+                appId: testApp.appId,
+                settings: ["emailSignInEnabled": enabled]
+            )
 
-        let config = try await client.auth.getAuthConfig()
-        XCTAssertEqual(config.appId, testApp.appId)
-        XCTAssertEqual(config.name, testApp.name)
-        XCTAssertEqual(config.mode, "public")
-        XCTAssertTrue(config.otpEnabled, "otpEnabled must reflect the admin PUT")
+            let config = try await client.auth.getAuthConfig()
+            XCTAssertEqual(config.appId, testApp.appId)
+            XCTAssertEqual(config.name, testApp.name)
+            XCTAssertEqual(config.mode, "public")
+            XCTAssertEqual(
+                config.emailSignInEnabled, enabled,
+                "emailSignInEnabled must reflect the admin PUT"
+            )
+        }
     }
 
     /// `getAppConfig()` returns the typed app-launch subset, including
-    /// `magicLinkEnabled`.
+    /// `emailSignInEnabled`.
     func testGetAppConfigTyped() async throws {
         try await ctx.updateAppSettings(
             appId: testApp.appId,
-            settings: ["magicLinkEnabled": true]
+            settings: ["emailSignInEnabled": true]
         )
 
         let config = try await client.auth.getAppConfig()
         XCTAssertEqual(config.appId, testApp.appId)
         XCTAssertEqual(config.mode, "public")
-        XCTAssertTrue(config.magicLinkEnabled)
+        XCTAssertTrue(config.emailSignInEnabled)
     }
 
-    // MARK: - OTP
+    // MARK: - Email sign-in
 
-    /// Happy path: with OTP enabled, `otpRequest` resolves `{ success: true }`
-    /// (the server answers success regardless of account existence to prevent
-    /// enumeration). Edge: a wrong 6-digit code on `otpVerify` surfaces the
-    /// server's "Invalid or expired" rejection as a thrown error, not a decode
-    /// of garbage.
-    func testOtpRequestSucceedsAndBadCodeVerifyThrows() async throws {
+    /// Happy path: with email sign-in enabled, a code-only
+    /// `emailSignInRequest` resolves `{ success: true }` (the server answers
+    /// success regardless of account existence to prevent enumeration). Edge:
+    /// a wrong 6-digit code on `otpVerify` surfaces the server's "Invalid or
+    /// expired" rejection as a thrown error, not a decode of garbage.
+    func testEmailSignInRequestSucceedsAndBadCodeVerifyThrows() async throws {
         try await ctx.updateAppSettings(
             appId: testApp.appId,
-            settings: ["otpEnabled": true]
+            settings: ["emailSignInEnabled": true]
         )
 
         // The endpoint answers success for any well-formed email (enumeration
         // safety), so a synthetic address is fine here.
-        let result = try await client.auth.otpRequest(email: "test@example.com")
+        let result = try await client.auth.emailSignInRequest(email: "test@example.com")
         XCTAssertTrue(result.success)
 
         do {
@@ -101,21 +107,16 @@ final class AuthApiTests: XCTestCase {
     }
 
     /// Edge: with email sign-in disabled the request endpoint rejects rather
-    /// than silently succeeding. Since #2884 there is no per-method OTP
-    /// toggle: `otpEnabled` is a compatibility field derived from the one
-    /// `emailSignInEnabled` flow (writing `otpEnabled: false` alone leaves
-    /// email sign-in on), and `/auth/otp/request` is a deprecated alias of
-    /// the unified issuance path — so only turning email sign-in off as a
-    /// whole produces the rejection.
-    func testOtpRequestRejectsWhenEmailSignInDisabled() async throws {
+    /// than silently succeeding.
+    func testEmailSignInRequestRejectsWhenEmailSignInDisabled() async throws {
         try await ctx.updateAppSettings(
             appId: testApp.appId,
             settings: ["emailSignInEnabled": false]
         )
 
         do {
-            _ = try await client.auth.otpRequest(email: "test@example.com")
-            XCTFail("otpRequest must throw when email sign-in is disabled for the app")
+            _ = try await client.auth.emailSignInRequest(email: "test@example.com")
+            XCTFail("emailSignInRequest must throw when email sign-in is disabled for the app")
         } catch {
             let msg = String(describing: error)
             XCTAssertTrue(
@@ -127,14 +128,15 @@ final class AuthApiTests: XCTestCase {
 
     // MARK: - Magic link
 
-    /// Happy path: with magic link enabled and an allow-listed redirectUri,
-    /// `magicLinkRequest` resolves `{ success: true }`. Edge: verifying a
-    /// garbage token throws instead of returning a half-decoded result.
-    func testMagicLinkRequestSucceedsAndBadVerifyThrows() async throws {
+    /// Happy path: with an allow-listed redirectUri, `emailSignInRequest`
+    /// resolves `{ success: true }` (the email carries a link). Edge:
+    /// verifying a garbage token throws instead of returning a half-decoded
+    /// result.
+    func testEmailSignInRequestWithLinkSucceedsAndBadVerifyThrows() async throws {
         try await ctx.updateAppSettings(
             appId: testApp.appId,
             settings: [
-                "magicLinkEnabled": true,
+                "emailSignInEnabled": true,
                 // The magic-link allow-list is its own key as of #2891, and it
                 // is fail-closed: with none of these set the server rejects
                 // every request rather than allowing any redirect.
@@ -142,7 +144,7 @@ final class AuthApiTests: XCTestCase {
             ]
         )
 
-        let result = try await client.auth.magicLinkRequest(
+        let result = try await client.auth.emailSignInRequest(
             email: "test@example.com",
             redirectUri: "https://example.com/callback"
         )
@@ -161,11 +163,11 @@ final class AuthApiTests: XCTestCase {
     }
 
     /// Edge: a redirectUri that is NOT on the app's allowlist is rejected.
-    func testMagicLinkRequestRejectsUnlistedRedirectUri() async throws {
+    func testEmailSignInRequestRejectsUnlistedRedirectUri() async throws {
         try await ctx.updateAppSettings(
             appId: testApp.appId,
             settings: [
-                "magicLinkEnabled": true,
+                "emailSignInEnabled": true,
                 // The magic-link allow-list is its own key as of #2891, and it
                 // is fail-closed: with none of these set the server rejects
                 // every request rather than allowing any redirect.
@@ -174,11 +176,11 @@ final class AuthApiTests: XCTestCase {
         )
 
         do {
-            _ = try await client.auth.magicLinkRequest(
+            _ = try await client.auth.emailSignInRequest(
                 email: "test@example.com",
                 redirectUri: "https://evil.example.net/steal"
             )
-            XCTFail("magicLinkRequest must reject a non-allow-listed redirectUri")
+            XCTFail("emailSignInRequest must reject a non-allow-listed redirectUri")
         } catch {
             let msg = String(describing: error)
             XCTAssertTrue(

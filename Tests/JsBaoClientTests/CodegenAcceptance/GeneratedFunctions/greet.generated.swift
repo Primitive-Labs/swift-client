@@ -1,6 +1,6 @@
 // AUTO-GENERATED FROM functions/greet.toml — DO NOT EDIT.
 // Run `primitive functions codegen --lang swift` to regenerate.
-// fingerprint: 5e3c1f51e9ddb182
+// fingerprint: 7d680c67dbcd70c4
 
 import Foundation
 import JsBaoClient

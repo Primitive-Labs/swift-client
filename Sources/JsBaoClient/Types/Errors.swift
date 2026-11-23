@@ -20,113 +20,325 @@ public enum JsBaoErrorCode: String, Sendable {
     case integrationSecretMissing = "INTEGRATION_SECRET_MISSING"
     case integrationRequestInvalid = "INTEGRATION_REQUEST_INVALID"
     case integrationProxyFailed = "INTEGRATION_PROXY_FAILED"
-    case workflowApplyNotConfirmed = "WORKFLOW_APPLY_NOT_CONFIRMED"
-    /// `workflows.waitFor` gave up after `timeoutMs` without the run reaching
-    /// a terminal state. Mirrors the JS client's `WORKFLOW_WAIT_TIMEOUT`.
-    case workflowWaitTimeout = "WORKFLOW_WAIT_TIMEOUT"
-    /// `locks.acquire` reached its `timeoutMs` deadline without winning the
-    /// key. Mirrors the JS client's `LockTimeoutError` (`LOCK_TIMEOUT`); the
-    /// error's `details` carry `key` and `timeoutMs`.
-    case lockTimeout = "LOCK_TIMEOUT"
+    /// `functions.waitFor` gave up after its timeout without the run reaching
+    /// a terminal state. Mirrors the JS client's `FUNCTION_WAIT_TIMEOUT`.
+    case functionWaitTimeout = "FUNCTION_WAIT_TIMEOUT"
     /// `openDocument` waited out its `availabilityWait` budget without the
     /// document's sync completing — the server never answered. Mirrors JS
-    /// `waitForAvailability`'s `NETWORK_TIMEOUT` (#2667, parity C8).
+    /// `waitForAvailability`'s `NETWORK_TIMEOUT` (parity C8).
     case networkTimeout = "NETWORK_TIMEOUT"
     /// `openDocument` needed the network, but the WebSocket is neither up nor
     /// able to come up — no token, or `setShouldConnect(false)` (the state an
     /// auth failure or a logout leaves behind). Mirrors JS
-    /// `waitForAvailability`'s `CONNECTION_DISABLED` (#2667, parity C8).
+    /// `waitForAvailability`'s `CONNECTION_DISABLED` (parity C8).
     case connectionDisabled = "CONNECTION_DISABLED"
     /// `openDocument` had no local copy of the document and no way to fetch
     /// one — `waitForLoad: .localIfAvailableElseNetwork` with the document's
     /// sync left to the caller (`enableNetworkSync: false`). Mirrors JS
-    /// `waitForAvailability`'s `NO_LOCAL_AND_NO_NETWORK` (#2667, parity C8).
+    /// `waitForAvailability`'s `NO_LOCAL_AND_NO_NETWORK` (parity C8).
     case noLocalAndNoNetwork = "NO_LOCAL_AND_NO_NETWORK"
     /// `openDocument` asked for the network path (`waitForLoad: .network`)
     /// with `enableNetworkSync: false`, so nothing would ever start the sync
     /// it is waiting for. Mirrors JS `waitForAvailability`'s
-    /// `NETWORK_REQUIRES_AUTOSTART` (#2667, parity C8).
+    /// `NETWORK_REQUIRES_AUTOSTART` (parity C8).
     case networkRequiresAutostart = "NETWORK_REQUIRES_AUTOSTART"
-    /// DEPRECATED (#3482): the backstop against a server that predates the
-    /// runtime routes, removed by phase 7.
-    ///
-    /// A function's config no longer says anything about how it runs — the
-    /// caller picks the runtime at each call, `functions.invoke` posts to the
-    /// route that runs it inside the request and `functions.start` to the one
-    /// that runs it as a task — so against a current server neither verb can
-    /// be "the wrong one" and this is unreachable. Against an OLDER
-    /// deployment, where one route's body field decided what it answered, it
-    /// is still thrown when the envelope is the other shape. Mirrors the JS
-    /// client's `FUNCTION_MODE_MISMATCH` (#3278). `details` carry
-    /// `functionKey` plus `runId` (the run was started) or `status` (the
-    /// function ran).
-    case functionModeMismatch = "FUNCTION_MODE_MISMATCH"
     /// `subscribeToChannel` did not get its channel's ack: the server's
     /// uniform refusal, the 20 s ack timeout, the channel was left while the
-    /// join was in flight, or the socket closed while joining (#3278).
+    /// join was in flight, or the socket closed while joining.
     /// `details` carry `channel`; the message is the server's refusal text
     /// when there was one.
     case channelSubscribeFailed = "CHANNEL_SUBSCRIBE_FAILED"
 
-    // MARK: - Large documents (format 2, #3436)
+    // MARK: - Local record stores
     //
     // Raw values are the JS client's strings verbatim. A Swift app and a JS
     // app hitting the same condition report the same code, which is what
-    // makes a shared runbook possible (principle 11).
+    // makes a shared runbook possible (principle 11). The `FORMAT2_` codes
+    // keep the name of the large-document format they were introduced for,
+    // which is no longer served; a record-log document raises them now.
 
-    /// The room refused this client build: the document is a large document
-    /// and the client either did not declare format 2 or declared a manifest
-    /// version below the document's base. Followed by close 4426, which the
-    /// reconnect policy does not act on. `details` carry `documentId`.
-    case clientUpgradeRequired = "CLIENT_UPGRADE_REQUIRED"
-    /// A large document was opened on storage that cannot host its record
-    /// store. `details` carry `reason`: `not-persistent` (an in-memory
+    /// A record-log document was opened on storage that cannot host its
+    /// record store. `details` carry `reason`: `not-persistent` (an in-memory
     /// provider) or `over-quota`.
     case format2StorageUnavailable = "FORMAT2_STORAGE_UNAVAILABLE"
-    /// The document's local state cannot be advanced to the room's epoch
-    /// in place — it has to be reloaded from a covering base. Reads keep
-    /// answering from the local merged view; writes and outbound frames are
-    /// held. `details` carry `plan`.
-    case format2ReloadRequired = "FORMAT2_RELOAD_REQUIRED"
     /// An unscoped query on a model whose connected documents are of both
     /// kinds. The two kinds' rows live in different query engines, so there is
     /// no one table to answer from; scope the query to documents of one kind.
     case format2QueryScope = "FORMAT2_QUERY_SCOPE"
-    /// A model was read on a large document whose rows have not been loaded.
+    /// A model was read on a record-log document whose rows have not been
+    /// loaded.
     case format2ModelNotHydrated = "FORMAT2_MODEL_NOT_HYDRATED"
-    /// A fold of the epoch overlay into the merged view failed, so the merged
-    /// row is wrong and later updates cannot be trusted over it. Sticky: every
-    /// read and write on the document is refused until a rebind's whole-overlay
-    /// catch-up repairs it. `details` carry `error`.
-    case format2FoldBroken = "FORMAT2_FOLD_BROKEN"
     /// A snapshot manifest is malformed. `details` carry `reason`.
     case snapshotManifestInvalid = "SNAPSHOT_MANIFEST_INVALID"
     /// A snapshot manifest is well formed but written in a shape this client
     /// does not read. `details` carry `version`.
     case snapshotManifestUnsupported = "SNAPSHOT_MANIFEST_UNSUPPORTED"
-    /// A cold load ran out of repair passes with chunks still missing.
-    /// `details` carry `missing`.
-    case format2SnapshotLoadIncomplete = "FORMAT2_SNAPSHOT_LOAD_INCOMPLETE"
-    /// A local write on a large document that has not synced for longer than
-    /// its offline write window, so the server can no longer reconcile a write
-    /// made against the epoch this client holds. Reads keep answering, and a
-    /// sync restores writes. `details` carry `lastSyncAt`, `windowDays` and
-    /// `overdueMs`. The JS client's own code string.
+    /// A write the room refused because this client had not synced for
+    /// longer than the document's offline write window. `details` carry what
+    /// the room sent. The JS client's own code string.
     case documentOfflineWindowExpired = "DOCUMENT_OFFLINE_WINDOW_EXPIRED"
-    // Appended rather than filed beside `clientUpgradeRequired`, which is where
-    // it belongs by subject: a case INSERTED into this enum shifts every later
-    // case's ordinal, and SwiftPM does not recompile a test object whose library
-    // signatures moved underneath it — so a stale incremental build reads every
-    // code after the insertion point as its neighbour (#3436's linker hazard,
-    // sixty tests' worth of it). At the end, nothing that already exists moves.
+    // Appended rather than filed by subject: a case INSERTED into this enum
+    // shifts every later case's ordinal, and SwiftPM does not recompile a test
+    // object whose library signatures moved underneath it — so a stale
+    // incremental build reads every code after the insertion point as its
+    // neighbour (#3436's linker hazard, sixty tests' worth of it). At the end,
+    // nothing that already exists moves.
     /// This client opened a document as one format and the platform resolved the
-    /// other (#3764). The document is NOT served: a format-2 client fed ordinary
-    /// sync frames, or a format-1 client fed `epoch.info`, is a client silently
-    /// reading the wrong document. Unlike `clientUpgradeRequired` the connection
-    /// is not closed — the disagreement is about one document — and the document
-    /// is closed under the app with its store intact. `details` carry
+    /// other. The document is NOT served: a format-1 client fed a
+    /// record-log document's frames is a client silently reading the wrong
+    /// document. The connection is not closed — the disagreement is about one
+    /// document — and the document is closed under the app with its store
+    /// intact. `details` carry
     /// `documentId`, `declared` and `actual`. The JS client's code, verbatim.
     case documentFormatMismatch = "DOCUMENT_FORMAT_MISMATCH"
+    /// An agent session view's `cancel()` found no turn to cancel: none was
+    /// named, the session row names none and `get` answers none. Nothing was
+    /// sent. The JS client's code, verbatim.
+    case agentSessionNoActiveTurn = "AGENT_SESSION_NO_ACTIVE_TURN"
+    // The record-log (`documentFormat: 3`) codes, appended for the reason given
+    // above `documentFormatMismatch`. Each is the JS client's string verbatim.
+    /// The platform no longer serves this document's format — a large
+    /// document (`documentFormat: 2`). Thrown by a create that asks for one
+    /// and by an open whose format resolves to it, before anything is sent,
+    /// and for the platform's own refusal (an HTTP 410, a refused open). The
+    /// document is closed under the app with its local store left as it was.
+    /// `details` carry `documentId` when there is one.
+    case documentFormatUnsupported = "DOCUMENT_FORMAT_UNSUPPORTED"
+    /// A write to a format-3 document would give two records the same unique
+    /// key. `details` carry `documentId`, `scope`, `constraint` and `conflicting`.
+    case documentConstraintViolated = "DOCUMENT_CONSTRAINT_VIOLATED"
+    /// A format-3 write was made in an epoch the room has frozen; it is handed
+    /// back with nothing applied.
+    case documentEpochFrozen = "DOCUMENT_EPOCH_FROZEN"
+    /// A format-3 document's local store was purged (an eviction or an account
+    /// wipe) with writes the room had not judged; they are handed back.
+    case documentStorePurged = "DOCUMENT_STORE_PURGED"
+    /// This client's copies of the two epochs it may write into are full;
+    /// connect so the room can rotate before writing more.
+    case documentEpochBudget = "DOCUMENT_EPOCH_BUDGET"
+    /// A format-3 write is larger than the room reads (1 MiB of JSON).
+    case documentEntryTooLarge = "DOCUMENT_ENTRY_TOO_LARGE"
+    /// A format-3 write holds a value the wire cannot carry exactly: a number
+    /// that is not finite, or an integer outside ±2^53.
+    case documentEntryInvalid = "DOCUMENT_ENTRY_INVALID"
+    /// A format-3 write names an epoch the room has not opened.
+    case documentEpochNotOpen = "DOCUMENT_EPOCH_NOT_OPEN"
+    /// This client may no longer write to the document; its unjudged writes
+    /// are handed back.
+    case writeAccessDenied = "WRITE_ACCESS_DENIED"
+    // The agent session upload codes, appended for the reason given above
+    // `documentFormatMismatch`. Each is the JS client's string verbatim.
+    /// `view.attachments.waitUntilUploaded` named an upload this client
+    /// neither queued nor completed. `details` carry `blobId`.
+    case agentSessionUploadUnknown = "AGENT_SESSION_UPLOAD_UNKNOWN"
+    /// A session upload was cancelled (`view.attachments.cancel`) while
+    /// something waited for it. `details` carry `blobId`.
+    case agentSessionUploadCancelled = "AGENT_SESSION_UPLOAD_CANCELLED"
+    /// The signed-in user changed (another user's token, or a logout) while
+    /// something waited for a session upload. The upload stays with the user
+    /// who queued it. `details` carry `blobId`.
+    case agentSessionUploadIdentityChanged = "AGENT_SESSION_UPLOAD_IDENTITY_CHANGED"
+    // The db3 code, appended for the reason given above `documentFormatMismatch`;
+    // the JS client's string verbatim.
+    /// A db3 read whose answer would pass its limits and cannot be shortened
+    /// without changing it: an aggregate whose rows pass 8 MiB of JSON, a page
+    /// whose `_related` takes it past 8 MiB, or a `hasMany` include reading more
+    /// than 1,000 related rows for the page. `details` carry `bytes` and `limit`,
+    /// or `include`, `rows` and `limit` for an include leg. Narrow the filter,
+    /// group more coarsely, or pass `sort` and a smaller `limit`.
+    case db3PageTooLarge = "DB3_PAGE_TOO_LARGE"
+    // The `client.db3` lifecycle codes, appended for the reason given above
+    // `documentFormatMismatch`; each is the JS client's string verbatim.
+    /// A subscription's `ready()` waited its `readyTimeout` with no progress.
+    /// The client keeps retrying; `details` carry `db3Id` and `readyTimeoutMs`.
+    case db3ReadyTimeout = "DB3_READY_TIMEOUT"
+    /// The room refused this user access to the db3 (a revoked grant): its
+    /// subscriptions' `ready()` throws it, and `Db3GoneEvent` carries it.
+    case db3AccessRefused = "DB3_ACCESS_REFUSED"
+    /// `client.db3.evict` without `force` while the db3 holds writes the room
+    /// has not judged. `details` carry `db3Id` and `pendingWrites`.
+    case db3PendingWrites = "DB3_PENDING_WRITES"
+    /// `client.db3.evict` while another holder keeps the db3's store. Declared
+    /// for parity with the JS client, where another tab can; one process holds
+    /// a Swift client's store file, so it is never raised here.
+    case db3Held = "DB3_HELD"
+    /// A subscription was disposed, or its client destroyed or signed out,
+    /// before `ready()` settled.
+    case db3Disposed = "DB3_DISPOSED"
+    /// `client.db3.subscribe` of a document that is not a db3. `details` carry
+    /// `db3Id` and `documentFormat`.
+    case notADb3 = "NOT_A_DB3"
+    /// A db3 read or save named a db3 whose rows have not been loaded on this
+    /// device (its first load did not complete). Subscribe and await
+    /// `available()` first. `details` carry `documents`.
+    case db3NotResident = "DB3_NOT_RESIDENT"
+    // The db3 write codes, appended for the reason given above
+    // `documentFormatMismatch`; each is the JS client's string verbatim.
+    /// A db3 write's `condition` did not hold, or `ifNotExists` met a live
+    /// record: the room did not apply it. `details.current` is the record it
+    /// was judged against (`{ model, id, row }`, `row` null when it has none).
+    case db3ConditionNotMet = "DB3_CONDITION_NOT_MET"
+    /// An increment named a db3 record that does not exist or was deleted:
+    /// refused here when this device's view holds no row, or by the room,
+    /// whose refusal carries `details.current` with `row` null.
+    case db3RecordNotFound = "DB3_RECORD_NOT_FOUND"
+    /// The room needs a newer client than this one to sync the db3: it refused
+    /// the open for the wire version this client speaks. Subscriptions'
+    /// `ready()` throws it and `Db3GoneEvent` carries it
+    /// (`reason: .clientOutdated`). Update the client; the rows stay readable.
+    case db3ClientOutdated = "DB3_CLIENT_OUTDATED"
+    /// The db3's sync is off (an admin or a function turned it off): no socket
+    /// reaches it. A subscription's `ready()` throws it, and the db3 is gone
+    /// with `Db3GoneEvent.Reason.syncOff`, until its sync is on again.
+    case db3SyncOff = "DB3_SYNC_OFF"
+    /// The db3 was deleted: a subscription's `ready()` throws it, and the db3
+    /// is gone with `Db3GoneEvent.Reason.deleted`. Its rows stay readable on
+    /// the device until it is evicted.
+    case db3Deleted = "DB3_DELETED"
+    /// One of the db3's triggers refused the write: the room did not apply
+    /// it. `details.reason` is the refusing trigger's own code.
+    case db3TriggerRefused = "DB3_TRIGGER_REFUSED"
+    /// The db3 is typed: its type declares its models, so the room declares
+    /// nothing the client sends. The client carries on under the type's
+    /// declarations, and a subscription still becomes ready.
+    case db3DeclarationRefusedTyped = "DB3_DECLARATION_REFUSED_TYPED"
+    /// A write to a model the db3's type does not declare: the room did not
+    /// apply it, and the write is handed back with this code.
+    case db3ModelNotDeclared = "DB3_MODEL_NOT_DECLARED"
+    /// The db3 lives only on this device (`client.db3.create(title:localOnly:
+    /// true)`) and has no server record: a call that would send a request
+    /// naming it and an eviction door (its only copy is here) are refused
+    /// with it before anything is sent or removed. `details` carry `db3Id`.
+    case db3LocalOnly = "DB3_LOCAL_ONLY"
+    // `client.db3.indexes` on a db3 that lives only on this device, refused by
+    // the room's rules on the device, with the room's codes.
+    /// An invalid registration (`model`, `field` or `fields`, `unique`, `name`).
+    case db3IndexInvalid = "DB3_INDEX_INVALID"
+    /// A field declared a string set takes no index of its own value: register
+    /// it with `members: true`. `details` carry `field`.
+    case db3IndexSetField = "DB3_INDEX_SET_FIELD"
+    /// A member index on a field that holds one value, not a string set. `details` carry `field`.
+    case db3IndexNotSetField = "DB3_INDEX_NOT_SET_FIELD"
+    /// Another index of the model holds the name over other fields. `details` carry `index`.
+    case db3IndexNameTaken = "DB3_INDEX_NAME_TAKEN"
+    /// The fields are indexed already under another name. `details` carry `index`.
+    case db3IndexExists = "DB3_INDEX_EXISTS"
+    /// A unique registration over records sharing a key. `details` carry `duplicates`.
+    case db3IndexNotUnique = "DB3_INDEX_NOT_UNIQUE"
+    /// No index has the name. `details` carry `index`.
+    case db3IndexNotFound = "DB3_INDEX_NOT_FOUND"
+    /// A declaration keeps the index. `details` carry `index` and `origins`.
+    case db3IndexInUse = "DB3_INDEX_IN_USE"
+    /// An index kind and placement no side builds yet, refused before anything
+    /// is recorded: `details` carry `kind` and `on`. On a db3 that lives only
+    /// on this device, `.server` or `.both` is `DB3_LOCAL_ONLY` instead. Also
+    /// a query that needs a device index this device could not build: a
+    /// `$search` whose text index, or a `$near` whose vector index, is not
+    /// built here, with `details.engine` (`swift-sqlite`) and
+    /// `details.reason`; every other query answers.
+    case db3IndexPlacementUnsupported = "DB3_INDEX_PLACEMENT_UNSUPPORTED"
+    /// A vector field's value does not fit its encoding: the wrong
+    /// number of numbers, a number that is not finite, an `f16` value past
+    /// 65504, or stored text that is not the encoding's canonical base64. A
+    /// save is refused with it before anything commits (`details.scope:
+    /// "local"`), a typed db3's room hands a write back with it, and
+    /// `VectorCodec` throws it.
+    case db3VectorInvalid = "DB3_VECTOR_INVALID"
+    /// A write that would leave a value outside a field's enum where the
+    /// db3's type enforces it (`enforce_enum = true`). A save is
+    /// refused with it before anything commits (`details.scope: "local"`),
+    /// and a typed db3's room hands a write back with it.
+    case db3ValueNotInEnum = "DB3_VALUE_NOT_IN_ENUM"
+    /// A type write to a type at least one db3 is of, refused because it
+    /// would make stored records unreadable: a removed model or field, a
+    /// changed field type, a removed enum value, a field made required or a
+    /// new required one, a changed vector. `details["reasons"]` lists
+    /// each change as `{ path, change, reason }`.
+    case db3TypeNotAppendOnly = "DB3_TYPE_NOT_APPEND_ONLY"
+    /// A type write that asked for `allowFieldRemoval` on an app whose stored
+    /// settings do not have `allowFieldRemoval = true`.
+    case db3TypeFieldRemovalNotEnabled = "DB3_TYPE_FIELD_REMOVAL_NOT_ENABLED"
+    /// A create, alias create or type attach of a db3 type the app archived
+    /// (`archived = true` in its file): the type takes no new db3s,
+    /// and existing db3s of it keep working. `details["type"]` names the
+    /// type. A local-first create returns first and reports it as
+    /// `Db3CreateFailedEvent`.
+    case db3TypeArchived = "DB3_TYPE_ARCHIVED"
+    /// A create, alias create or type attach the caller's role may not make:
+    /// the type says `create = "admins"` in its file, or the db3 is
+    /// untyped and the app says `untypedDb3Create = "admins"` in app.toml.
+    /// `details["type"]` names the type (`null` for an untyped db3). App
+    /// admins, owners and server functions create as before. A local-first
+    /// create returns first and reports it as `Db3CreateFailedEvent`.
+    case db3CreateRoleRequired = "DB3_CREATE_ROLE_REQUIRED"
+    /// A subscribe or refresh of a db3 whose type the build was not generated
+    /// with, in a build generated with `--known-types-only`
+    /// (`GeneratedModels.register(on:)`). `details["db3Id"]` and
+    /// `details["type"]` name them. Nothing of the db3 is applied and the
+    /// open is not retried; subscribe with `allowUnknownType` to open it anyway.
+    case db3TypeUnknownToClient = "DB3_TYPE_UNKNOWN_TO_CLIENT"
+    /// A db3 that lives only on this device whose type's declarations do
+    /// not stand with this build: ``Db3State/error`` when the build's
+    /// declarations were not installed (`reasons`, named as a push refusal
+    /// names them), diverged from the ones the copy holds, or cannot be
+    /// read. A write refused for the last two carries `details["scope"]`
+    /// `"local"` and `details["diverged"]` or `details["unreadable"]`.
+    case db3TypeRefused = "DB3_TYPE_REFUSED"
+    /// A device read with `QueryOptions.maxDrift` whose db3 copy is further
+    /// behind the server than the bound, or has not heard the server's
+    /// position yet (`details["drift"]` is then `null`). `details` carry
+    /// `db3Id`, `drift` and `maxDrift`. Subscribe to the db3 and await
+    /// `ready()`, or widen the bound. A db3 that lives only on this device
+    /// never is.
+    case db3DriftExceeded = "DB3_DRIFT_EXCEEDED"
+    /// A read needs an index this device does not hold, refused before
+    /// anything is read: a `$search` on a model with no text index on this
+    /// device (register one with `kind: .text, on: .device`; `details` carry
+    /// `model`), or a `$near` on a field with no vector index (register one
+    /// with `kind: .vector`; `details` carry `operator`, `model` and `field`).
+    case queryIndexNotOnDevice = "QUERY_INDEX_NOT_ON_DEVICE"
+    /// A read the server answers needs an index the server does not hold: a
+    /// `$search` on a model with no text index on the server (`details` carry
+    /// `model`, and `index` when the model's text index is built on devices
+    /// only), or `$near` in a records query, count or aggregate, which the
+    /// server never answers (`details` carry `operator`, `model` and `field`).
+    case queryIndexNotOnServer = "QUERY_INDEX_NOT_ON_SERVER"
+    /// A device read that cannot answer without an index this device declined
+    /// (`client.db3.indexes.decline`, or the client's `deviceIndexes` option
+    /// with nothing built): a `$search` on a declined text index, refused
+    /// before anything is read, and a `$near` on a declined vector index.
+    /// `details` carry `model`, `index` (the room's name) and `kind`;
+    /// `client.db3.indexes.accept` builds it again. A read a declined scalar
+    /// or member index only speeds answers by a scan.
+    case db3IndexDeclinedOnDevice = "DB3_INDEX_DECLINED_ON_DEVICE"
+    /// A read explained on this device (`client.db3.records(id).explain`)
+    /// forced onto an index that cannot serve it. `details` carry `index`,
+    /// `model` and `reason`: `kind` (a text or vector index), `placement`
+    /// (placed on the server only), `unbuilt` (not built here; with `status`
+    /// and `why`), `fields` (the read neither filters, sorts nor groups on its
+    /// fields), `shape` (no statement of the read took it), `search` (a
+    /// `$search` under `none`), `near` (a `$near` under any force) or `plan`
+    /// (SQLite found no plan through it). A name the db3's index list does not
+    /// have is `.db3IndexNotFound`.
+    case db3IndexCannotServe = "DB3_INDEX_CANNOT_SERVE"
+    // A vector index's shared model (`client.db3.indexes.fetchModel`,
+    // `uploadModel`, `deleteModel`): an `HttpError` whose `serverCode` is one
+    // of these. `JsBaoErrorCode(rawValue: error.serverCode)` reads it.
+    /// The index has a model, or another device holds the claim on its upload
+    /// (`details.pending` true, with `expiresAt`): fetch it instead.
+    case db3IndexModelExists = "DB3_INDEX_MODEL_EXISTS"
+    /// The upload names another generation of the index than the room's: the
+    /// index was dropped and registered again since the list was read.
+    case db3IndexGenerationStale = "DB3_INDEX_GENERATION_STALE"
+    /// The upload names a revision the room has moved past (its model was
+    /// deleted), or a claim that lapsed: read the index list again.
+    case db3IndexModelStale = "DB3_INDEX_MODEL_STALE"
+    /// The index has no model to fetch or delete.
+    case db3IndexModelNotFound = "DB3_INDEX_MODEL_NOT_FOUND"
+    /// The model is more than 64 MiB.
+    case db3IndexModelTooLarge = "DB3_INDEX_MODEL_TOO_LARGE"
+    /// The upload carries no body, or headers that do not describe one.
+    case db3IndexModelInvalid = "DB3_INDEX_MODEL_INVALID"
 }
 
 /// Main error type for the JsBao client library
@@ -159,8 +371,7 @@ public func isJsBaoError(_ error: Error) -> Bool {
 /// Auth error codes. The first block is client-side (token lifecycle
 /// inside the SDK); the second block mirrors js-bao's `AUTH_CODES`
 /// (see `authController.ts`) — server-returned codes that surface
-/// in the JSON error body so apps can switch on them
-/// (#850 / issue #466).
+/// in the JSON error body so apps can switch on them.
 public enum AuthCode: String, Sendable {
     // Client-side (SDK-generated)
     case tokenExpired = "TOKEN_EXPIRED"
@@ -175,16 +386,16 @@ public enum AuthCode: String, Sendable {
     case invalidToken = "INVALID_TOKEN"
     case passkeyNotEnabled = "PASSKEY_NOT_ENABLED"
     /// A passkey start call named an `rpId` the app does not configure
-    /// (#3024) — the app asked for a relying party that isn't the
+    /// — the app asked for a relying party that isn't the
     /// server's, rather than the server failing to work out which one.
     case passkeyRpNotConfigured = "PASSKEY_RP_NOT_CONFIGURED"
     /// The passkey provider returned a credential it had not verified the
-    /// user for, while the ceremony required verification (#3027). Ask the
+    /// user for, while the ceremony required verification. Ask the
     /// user to try again and complete Face ID / their passcode — a generic
     /// sign-in failure gives them nothing to act on.
     case passkeyUserVerificationFailed = "PASSKEY_USER_VERIFICATION_FAILED"
     case magicLinkNotEnabled = "MAGIC_LINK_NOT_ENABLED"
-    /// Native Sign in with Apple (`POST /auth/apple/callback`, #3084). The
+    /// Native Sign in with Apple (`POST /auth/apple/callback`). The
     /// callback is a Swift-only surface — the JS client has no Apple path —
     /// so these mirror `AUTH_CODES` in `src/auth/auth-codes.ts` directly.
     /// `APPLE_IDENTITY_INVALID` (401) is the signature/claims/nonce
@@ -373,7 +584,7 @@ public extension HttpError {
 // MARK: - Raw-bytes transfers
 
 extension HttpError {
-    /// The error for a refused RAW-BYTES transfer (#3403).
+    /// The error for a refused RAW-BYTES transfer.
     ///
     /// Blob and avatar transfers read bytes rather than JSON, so they never
     /// reach the parse `HttpClient` applies to every failure on the typed
@@ -406,13 +617,13 @@ extension HttpError: LocalizedError {
 
 /// Errors thrown by the client's WebSocket connect and send paths. Public
 /// because apps catch it; the `WebSocketManager` that raises it is
-/// module-internal (#2363), so the error type lives here with the client's
+/// module-internal, so the error type lives here with the client's
 /// other public errors rather than in `Internal/`.
 public enum WebSocketError: Error, Sendable {
     case notConnected
     case connectionFailed(String)
     /// A transport-level failure, reduced to a `Sendable` value at the
-    /// `URLSession` delegate boundary (#2171). `URLSession` hands the client a
+    /// `URLSession` delegate boundary. `URLSession` hands the client a
     /// bare `Error`, which is not `Sendable` and so cannot travel on the
     /// manager's ordered delegate-event channel; the message and the
     /// `URLError` code are carried instead.
@@ -450,7 +661,7 @@ extension WebSocketError: LocalizedError {
 /// and decode failures. Treat it as *retryable*, not as proof of no side
 /// effect.
 ///
-/// Before #2367 these surfaced as the raw `URLError` `URLSession` produced, so
+/// These used to surface as the raw `URLError` `URLSession` produced, so
 /// apps had to catch a Foundation type to handle them. They are now normalized
 /// through one internal helper, so `URLError` no longer escapes the client's
 /// HTTP paths.
@@ -533,7 +744,7 @@ extension JsBaoNetworkError {
 /// The one place the client calls `URLSession`'s async data methods.
 ///
 /// Every HTTP path in the client goes through here so `URLError` is normalized
-/// in exactly one place (#2367). Calling `URLSession.data(...)` directly
+/// in exactly one place. Calling `URLSession.data(...)` directly
 /// anywhere else re-introduces the raw-`URLError` leak this exists to close —
 /// `TransportSpineTests` asserts that it doesn't happen.
 enum NetworkSession {
@@ -544,7 +755,7 @@ enum NetworkSession {
     /// disk-backed on iOS and keyed by URL alone, ignoring `Authorization`.
     /// An authenticated response stored there is readable by a request
     /// carrying a different token or none, and survives app restarts
-    /// unencrypted (#3170). The paths that ride this default are the client's
+    /// unencrypted. The paths that ride this default are the client's
     /// most sensitive: blob bytes, the OAuth code exchange's access token, the
     /// refresh proxy, and oversized document updates.
     ///

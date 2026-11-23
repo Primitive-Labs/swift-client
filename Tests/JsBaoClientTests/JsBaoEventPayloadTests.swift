@@ -43,28 +43,15 @@ final class JsBaoEventPayloadTests: XCTestCase {
         PendingCreateFailedEvent(documentId: "d1", error: "nope"),
         DocumentMetadataChangedEvent(documentId: "d1", action: "updated", source: "server"),
         DocumentSyncStateChangedEvent(documentId: "d1", state: "synced"),
-        DocumentSnapshotLoadEvent(
-            documentId: "d1", phase: .progress, epoch: 5,
-            rows: 10, totalRows: 40, chunks: 1, totalChunks: 4, model: "Note"
-        ),
         DocumentWriteRefusedEvent(
             documentId: "d1", model: "Note", recordId: "r1",
             error: JsBaoError(
-                code: .documentOfflineWindowExpired, message: "past the window"
+                code: .documentConstraintViolated, message: "taken"
             )
         ),
         DocumentFormatMismatchEvent(
-            documentId: "d1", declared: 1, actual: 2,
-            error: JsBaoError(code: .documentFormatMismatch, message: "format 2")
-        ),
-        DocumentOfflineWritesResolvedEvent(
-            documentId: "d1", epoch: 5,
-            notices: [
-                OfflineReplayNotice(
-                    model: "Note", recordId: "r1", field: "title", op: .patch,
-                    outcome: .dropped, reason: .outdated, epoch: 4, ts: 1
-                )
-            ]
+            documentId: "d1", declared: 1, actual: 3,
+            error: JsBaoError(code: .documentFormatMismatch, message: "format 3")
         ),
         SyncEvent(documentId: "d1", synced: true),
         SyncPerfEvent(documentId: "d1", timings: ["totalMs": 5]),
@@ -77,11 +64,12 @@ final class JsBaoEventPayloadTests: XCTestCase {
         MeUpdatedEvent(value: ["name": "Ada"]),
         MeUpdateFailedEvent(reason: "conflict"),
         NotificationEvent(notificationId: "n1", title: "t", body: "b", createdAt: "2026-01-01"),
-        WorkflowStatusEvent(workflowKey: "w", workflowId: "wid", runKey: "rk", runId: "rid", status: "completed"),
-        WorkflowStartedEvent(workflowKey: "w", runId: "rid"),
         ChannelMessageEvent(channel: "orders:1", payload: .string("p"), functionKey: "fk", sentAt: "2026-01-01"),
         ChannelSubscribeFailedEvent(channel: "orders:1", message: "refused"),
         DirectMessageEvent(payload: .string("p"), functionKey: "fk", sentAt: "2026-01-01"),
+        AgentSessionChangedEvent(
+            action: .removed, change: .deleted, at: "2026-01-01", sessionId: "s1", item: nil, members: nil
+        ),
         blobProgress,
         blobCompleted,
         blobFailed,
@@ -90,7 +78,32 @@ final class JsBaoEventPayloadTests: XCTestCase {
         BlobsQueueDrainedEvent(),
         CacheUpdatedEvent(key: "k", updatedAt: "2026-01-01", value: 1),
         CacheUpdateFailedEvent(key: "k", error: "boom"),
+        Db3StateEvent(state: Db3State(
+            id: "d1", resident: true, subscribed: true, phase: .live, progress: nil, cursor: 3, rows: 2,
+            lastSyncAt: nil, pendingWrites: 0, permission: .owner, error: nil
+        )),
+        Db3ReadyEvent(id: "d1"),
+        Db3RowsEvent(id: "d1", changes: [Db3RowChange(model: "Note", id: "r1", row: ["title": "t"])], origin: .local, models: nil),
+        Db3WriteRefusedEvent(DocumentWriteRefusedEvent(
+            documentId: "d1", model: "Note", recordId: "r1", error: JsBaoError(code: .writeAccessDenied, message: "no")
+        )),
+        Db3EvictedEvent(id: "d1", reason: .explicit),
+        Db3GoneEvent(id: "d1"),
+        Db3ErrorEvent(id: "d1", code: "OPEN_FAILED", message: "boom"),
+        Db3CreatedEvent(id: "d1"),
+        Db3CreateFailedEvent(code: "DB3_ID_EXISTS", message: "taken", title: "Orders", type: nil, id: "d1"),
+        accessRequestCreated,
+        accessRequestResolved,
+        Db3AccessRequestCreatedEvent(accessRequestCreated),
+        Db3AccessRequestResolvedEvent(accessRequestResolved),
     ]
+
+    private static let accessRequestCreated = DocumentAccessRequestCreatedEvent(
+        requestId: "r1", documentId: "d1", requesterId: "u1", requestedPermission: "reader", status: "pending"
+    )
+    private static let accessRequestResolved = DocumentAccessRequestResolvedEvent(
+        requestId: "r1", documentId: "d1", requesterId: "u1", requestedPermission: "reader", status: "denied"
+    )
 
     private static let blobProgress = BlobUploadProgressEvent(
         documentId: "d1", blobId: "b1", queueId: "q1", filename: "f", contentType: "text/plain",

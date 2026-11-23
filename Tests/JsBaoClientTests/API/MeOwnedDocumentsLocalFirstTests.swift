@@ -83,7 +83,7 @@ final class MeOwnedDocumentsLocalFirstTests: XCTestCase {
     private static let serverPage = #"{"items":[{"documentId":"srv1","title":"Server Doc","permission":"owner"}]}"#
 
     /// A server page carrying a cursor — what a real paged fetch returns.
-    private static let serverPageWithCursor = #"{"items":[{"documentId":"srv1","title":"Server Doc","permission":"owner"}],"cursor":"next-cursor"}"#
+    private static let serverPageWithCursor = #"{"items":[{"documentId":"srv1","title":"Server Doc","permission":"owner"}],"hasMore":true,"nextCursor":"next-cursor"}"#
 
     /// A server page that also carries the app root (what
     /// `?includeRoot=true` returns — and what a stale server could return
@@ -150,6 +150,31 @@ final class MeOwnedDocumentsLocalFirstTests: XCTestCase {
         await api.awaitBackgroundRefresh()
 
         XCTAssertEqual(transport.calls.count, 1, "one refresh in flight at a time")
+    }
+
+    /// Edge: a refresh cancelled while its fetch is in flight (what logout
+    /// does) never merges the answer into the cache.
+    func testCancelledBackgroundRefreshNeverMergesItsAnswer() async throws {
+        let store = MetadataStore([Self.ownedEntry("local1")])
+        // The fetch answers only once the refresh is cancelled, so the answer
+        // always arrives after the cancellation, never before it.
+        let transport = RecordingTransport(responder: { _ in
+            while !Task.isCancelled { try? await Task.sleep(nanoseconds: 1_000_000) }
+            return TransportResponse(
+                status: 200,
+                headers: ["Content-Type": "application/json"],
+                body: Data(Self.serverPage.utf8)
+            )
+        })
+        let api = makeAPI(store: store, transport: transport)
+
+        // Unbounded, so the fetch runs in the refresh task itself rather than
+        // under `withTimeout`, whose cancelled timer could throw first.
+        _ = try await api.ownedDocuments(options: MeOwnedDocumentsOptions(serverTimeout: 0))
+        await api.cancelBackgroundRefresh()
+
+        XCTAssertEqual(store.syncCallCount, 0, "a cancelled refresh merged its answer")
+        XCTAssertEqual(Set(store.snapshot().keys), ["local1"])
     }
 
     // MARK: - Behavior 5: cold cache falls through to the server

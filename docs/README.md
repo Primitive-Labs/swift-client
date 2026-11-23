@@ -16,7 +16,7 @@ Known divergences from the JS client are tracked as GitHub issues (label `swift-
 
 - [`overview.md`](overview.md) — orientation: what is this client, layer diagram, key types
 - [`baomodels.md`](baomodels.md) — typed model authoring guide (`PrimitiveModel`, `TypedModel<T>`, `DynamicModel`)
-- [`large-documents.md`](large-documents.md) — opening a large document (`documentFormat: 2`), what differs, and what is deferred
+- [`record-log.md`](record-log.md) — record-log documents (`documentFormat: 3`): the store, refusals, upserts, `confirm`, `syncState`, `transact`
 - [`architecture.md`](architecture.md) — how internals fit together
 
 ### "I'm contributing to the Swift client"
@@ -33,7 +33,7 @@ docs/
 ├── overview.md                       ← layer diagram, key types, quick start
 ├── architecture.md                   ← module map, concurrency model
 ├── baomodels.md                      ← typed model authoring
-├── large-documents.md                ← large documents (documentFormat: 2)
+├── record-log.md                     ← record-log documents (documentFormat: 3)
 ├── testing.md                        ← running the suite
 └── yswift-fork.md                    ← CRDT layer fork rationale
 ```
@@ -92,31 +92,52 @@ syncSubscription = client.observeOnMainActor(SyncEvent.self) { event in
 // For one occurrence: `try await client.nextEvent(SyncEvent.self, timeout: 30)`.
 ```
 
+## SwiftUI views (`JsBaoClientUI`)
+
+The package's second library product, `JsBaoClientUI`, holds SwiftUI views over the client, so `JsBaoClient` itself never imports SwiftUI. `BlobImage` shows a db3 blob as `AsyncImage` shows a URL, loading through `client.db3.blobs(db3Id).read(blobId:)` with the client's auth, local copy and offline behavior. The Swift template links the product; another app adds `.product(name: "JsBaoClientUI", package: "JsBaoClient")` to its target.
+
+```swift
+import JsBaoClientUI
+
+BlobImage(client.db3.blobs(db3Id), blobId: blobId) { image in
+    image.resizable().scaledToFit()
+} placeholder: {
+    ProgressView()
+}
+```
+
+An app on an image library sends `client.db3.blobs(db3Id).downloadRequest(blobId:)`, which carries the user's `Authorization` header.
+
 ## Status
 
 This client is at **v1**. All 19 JS sub-APIs exist on Swift with matching method sets; remaining behavioral divergences are tracked as GitHub issues (label `swift-client-parity`).
 
-## Breaking changes in the current parity batch
+## The event surface
 
-- The whole untyped event surface — `client.events`, `on`, `onAny`,
-  `emit(_:_:)` and the free `waitForEvent(emitter:...)` — is **deprecated** and
-  is removed in the next major release. Migrate to
-  `client.stream(for:buffering:replayingLatest:)`,
-  `client.observeOnMainActor(_:handler:)` and
-  `client.nextEvent(_:timeout:where:)`, which derive the event key from the
-  payload type. Deprecated calls keep working — and keep their synchronous,
-  in-registration-order delivery — for the whole window.
-- The `.invitation` event and its `InvitationEvent` payload are **removed**
-  (#2951, with the per-document invitation routes that were its only emitter).
-  There is no replacement push event — the new sharing system grants access
-  immediately, so a subscriber has nothing left to wait for. Subscriptions
-  written as `client.events.on(.invitation) { ... }` or
-  `client.stream(for: InvitationEvent.self)` no longer compile; delete them.
-- Nine events that used to be emitted as bare `[String: Any]` dictionaries are
-  typed payloads now (`meUpdated`, `pendingCreateFailed`, `authRefreshDeferred`,
-  the five `offlineAuth*` events, and `blobsQueueDrained`). A handler still
-  annotated `[String: Any]` keeps receiving the pre-conversion dictionary for
-  the whole deprecation window.
+Events are delivered through typed payloads only. Each payload type names the
+one event key it is delivered under, so there is no separate event argument to
+get wrong:
+
+- `client.stream(for:buffering:replayingLatest:)` — an `AsyncStream` of one
+  payload type, for `for await` loops.
+- `client.observeOnMainActor(_:handler:)` — a callback on the main actor. Hold
+  the returned `EventSubscription` for as long as the handler should stay live.
+- `client.nextEvent(_:timeout:where:)` — one occurrence, awaited.
+
+What is no longer there:
+
+- The untyped surface — `client.events`, `on`, `onAny`, `emit(_:_:)` and the
+  free `waitForEvent(emitter:...)` — was removed in #2367. The "batched
+  breaking API cleanup (#2367)" entry in `../CHANGELOG.md` has the
+  symbol-by-symbol replacement table.
+- Every payload is a typed struct; there is no `[String: Any]` handler shape.
+  The nine events that used to be bare dictionaries (`meUpdated`,
+  `pendingCreateFailed`, `authRefreshDeferred`, the five `offlineAuth*` events
+  and `blobsQueueDrained`) are typed payloads.
+- The `.invitation` event and its `InvitationEvent` payload were removed in
+  #2951, with the per-document invitation routes that were its only emitter.
+  There is no replacement push event — the sharing system grants access
+  immediately, so a subscriber has nothing left to wait for.
 
 ## Parity policy
 

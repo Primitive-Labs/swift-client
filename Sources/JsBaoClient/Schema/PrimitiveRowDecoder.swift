@@ -1,7 +1,7 @@
 import Foundation
 
 /// The one place a query row becomes a typed model — and the one place a row
-/// that fails to decode is accounted for (#2825).
+/// that fails to decode is accounted for.
 ///
 /// The generated read facade (`Model.query` / `queryPaged` / `queryOne` /
 /// `findByUnique`) keeps the rows that decode, because JS has no decode step

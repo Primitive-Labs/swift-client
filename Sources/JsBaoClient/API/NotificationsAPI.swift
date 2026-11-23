@@ -19,9 +19,11 @@ public final class NotificationsAPI: @unchecked Sendable {
         self.transport = transport
     }
 
+    #if PRIMITIVE_EXPERIMENTAL_APIS
     // MARK: - Inbox
 
     /// List the caller's notifications, newest first.
+    /// - Stability: experimental
     public func list(
         limit: Int? = nil,
         cursor: String? = nil
@@ -33,11 +35,13 @@ public final class NotificationsAPI: @unchecked Sendable {
     }
 
     /// Count the caller's unread notifications.
+    /// - Stability: experimental
     public func unreadCount() async throws -> NotificationUnreadCountResult {
         try await transport.request(method: .get, path: "/notifications/unread-count")
     }
 
     /// Mark one of the caller's notifications as read.
+    /// - Stability: experimental
     public func markRead(notificationId: String) async throws -> NotificationInfo {
         let escaped = URLEncoding.encodeComponent(notificationId)
         return try await transport.request(
@@ -48,6 +52,7 @@ public final class NotificationsAPI: @unchecked Sendable {
     }
 
     /// Mark all of the caller's notifications as read.
+    /// - Stability: experimental
     public func markAllRead() async throws -> NotificationMarkAllReadResult {
         try await transport.request(
             method: .post,
@@ -57,6 +62,7 @@ public final class NotificationsAPI: @unchecked Sendable {
     }
 
     /// Send a notification to an app user (requires app admin permission).
+    /// - Stability: experimental
     public func send(params: SendNotificationParams) async throws -> NotificationSendResponse {
         try await transport.request(method: .post, path: "/notifications/send", body: params)
     }
@@ -64,25 +70,31 @@ public final class NotificationsAPI: @unchecked Sendable {
     // MARK: - Push devices
 
     /// Register (upsert) the calling user's device push token.
+    /// - Stability: experimental
     public func registerDevice(params: RegisterPushDeviceParams) async throws -> PushDeviceInfo {
         try await transport.request(method: .post, path: "/me/push-tokens", body: params)
     }
 
     /// List the calling user's registered push devices.
+    /// - Stability: experimental
     public func listDevices() async throws -> PushDeviceListResult {
         try await transport.request(method: .get, path: "/me/push-tokens")
     }
 
     /// Unregister one of the calling user's device push tokens (e.g. on logout).
+    /// - Stability: experimental
     public func unregisterDevice(token: String) async throws -> UnregisterPushDeviceResult {
         let escaped = URLEncoding.encodeComponent(token)
         return try await transport.request(method: .delete, path: "/me/push-tokens/\(escaped)")
     }
+    #endif
 }
 
+#if PRIMITIVE_EXPERIMENTAL_APIS
 // MARK: - Request shims
 
 /// The `{}` request body the mark-read endpoints have always sent (previously
 /// an empty untyped dictionary literal). A typed `Encodable` keeps the wire
 /// bytes identical without going through `Any`.
 private struct EmptyObjectBody: Encodable, Sendable {}
+#endif

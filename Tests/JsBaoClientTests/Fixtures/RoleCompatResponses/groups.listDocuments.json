@@ -1,0 +1,21 @@
+{
+  "name": "groups.listDocuments",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "GET",
+  "path": "/app/<appId>/api/groups/team/baseline/documents",
+  "caller": "owner",
+  "request": null,
+  "status": 200,
+  "body": [
+    {
+      "documentId": "<ulid>",
+      "title": "Baseline Document",
+      "createdBy": "<ulid>",
+      "createdAt": "<iso>",
+      "lastModified": "<iso>",
+      "permission": "reader",
+      "grantedAt": "<iso>"
+    }
+  ]
+}

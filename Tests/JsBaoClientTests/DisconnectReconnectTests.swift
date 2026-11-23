@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-disconnect-reconnect.test.ts
 /// Tests disconnect/reconnect stress scenarios.
+@available(*, deprecated)
 final class DisconnectReconnectTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!
@@ -372,6 +373,7 @@ final class DisconnectReconnectTests: XCTestCase {
 
     // MARK: - Awareness re-established after reconnect
 
+    @available(*, deprecated)
     func testAwarenessReestablishedAfterReconnect() async throws {
         let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT, title: "Awareness Reconnect Test")
 

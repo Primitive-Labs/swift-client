@@ -4,7 +4,7 @@ import Foundation
 
 /// How `WebSocketManager` calls back into `JsBaoClient`.
 ///
-/// Module-internal on purpose (#2363). While this was `public`, `JsBaoClient`'s
+/// Module-internal on purpose. While this was `public`, `JsBaoClient`'s
 /// conformance put all 13 `webSocketManagerOn*` / `webSocketManagerBuild*`
 /// methods on the client's public API: app code could read the bearer token out
 /// of `webSocketManagerBuildConnectionRequest(connectionId:)`'s `?token=` URL,
@@ -12,18 +12,24 @@ import Foundation
 /// app's own observers would treat as real. Nothing outside the module
 /// implements or calls this, and tests reach it through `@testable import`.
 ///
-/// Refined to `Sendable` by #2171: the manager is an `actor` now and calls the
+/// Refined to `Sendable`: the manager is an `actor` now and calls the
 /// delegate from `nonisolated` context, so the reference genuinely crosses
 /// isolation domains. `JsBaoClient` — the only conformer — is already
 /// `@unchecked Sendable`, so it conforms for free. Every method keeps its
 /// signature, including the eleven synchronous ones: an `await` inside
-/// `connect()`'s decision region would reopen the double-connect race (#1993
-/// decision 2).
+/// `connect()`'s decision region would reopen the double-connect race.
 protocol WebSocketManagerDelegate: AnyObject, Sendable {
     func webSocketManagerHasAccessToken() -> Bool
     func webSocketManagerBuildConnectionRequest(connectionId: String) -> (url: URL, headers: [String: String])
     func webSocketManagerOnStatusChange(_ status: ConnectionStatus)
     func webSocketManagerOnConnecting()
+    /// The socket opened: the server accepted the handshake. The manager stays
+    /// `.connecting` until the server's `ready` frame, which is what
+    /// `webSocketManagerOnConnected()` reports.
+    ///
+    /// Defaulted to a no-op, so a delegate with no handshake policy — every
+    /// test double — is unaffected.
+    func webSocketManagerOnSocketOpened()
     func webSocketManagerOnConnected()
     func webSocketManagerOnMessage(_ data: Data) async
     func webSocketManagerOnMessage(_ text: String) async
@@ -35,7 +41,7 @@ protocol WebSocketManagerDelegate: AnyObject, Sendable {
     /// because what follows a deliberate close and what follows the server
     /// refusing a token look identical from outside: a socket that went away
     /// before its handshake completed. Reading the second into the first cost a
-    /// hydrated session its connection outright (#3437) — the auth recovery
+    /// hydrated session its connection outright — the auth recovery
     /// refreshed a token nobody had rejected and, on the 401 a fixed-token
     /// client gets, stopped reconnecting.
     ///
@@ -47,17 +53,37 @@ protocol WebSocketManagerDelegate: AnyObject, Sendable {
     func webSocketManagerOnDisconnectInitiated()
     func webSocketManagerOnDisconnectResolved()
     func webSocketManagerShouldReconnect(code: Int?, reason: String?) -> Bool
+    /// Whether automatic connects are held: the server refused this client as
+    /// outdated and no policy fetch has released it. Asked inside the connect
+    /// decision, beside the token check, for every connect whose origin is
+    /// `.automatic`; a connect the app asked for itself is never held.
+    ///
+    /// Defaulted to `false`, so a delegate with no version policy — every test
+    /// double — is unaffected.
+    func webSocketManagerAutomaticConnectHeld() -> Bool
 }
 
 extension WebSocketManagerDelegate {
     func webSocketManagerWillDeliverDeliberateClose() {}
+    func webSocketManagerOnSocketOpened() {}
+    func webSocketManagerAutomaticConnectHeld() -> Bool { false }
+}
+
+/// Who asked for a connect. `.caller` is the app itself, through the client's
+/// public connect, set-should-connect and force-reconnect calls; everything else the
+/// client starts on its own — a reconnect timer, a token, a network restore, a
+/// channel join, its own rebuilds — is `.automatic`, the default, so a connect
+/// site added later is held after a refusal unless it says otherwise.
+enum ConnectOrigin: Sendable {
+    case automatic
+    case caller
 }
 
 // MARK: - WebSocketManager
 
 /// The client's WebSocket transport and its reconnect state machine.
 ///
-/// An `actor` since #2171. The `NSLock` it used to hold is gone; every piece of
+/// An `actor`. The `NSLock` it used to hold is gone; every piece of
 /// connection state below is actor-isolated. Two things that could not follow
 /// it into isolation are enumerated in `WebSocketTransportBoxes.swift`, each
 /// with its own written safety argument: the transport snapshot the synchronous
@@ -103,7 +129,15 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         case closed(task: ObjectIdentifier, code: Int, reason: String?)
         case completed(task: ObjectIdentifier, failure: WebSocketError)
         case receiveLoopFailed(task: ObjectIdentifier, code: Int?, failure: WebSocketError)
+        /// The server's `ready` frame arrived on `task`. It joins the
+        /// channel rather than calling in, so it is ordered with the task's own
+        /// open and close and is applied only while `task` is current.
+        case ready(task: ObjectIdentifier)
     }
+
+    /// Longer than any `ready` frame, so recognising one never parses a real
+    /// payload.
+    private static let readyFrameMaxLength = 64
 
     // MARK: - Nonisolated state
 
@@ -144,6 +178,9 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     private var session: URLSession?
     private var shouldConnect = true
     private var manualReconnectPending = false
+    /// Who asked for the pending manual reconnect; the connect that follows its
+    /// close carries it.
+    private var manualReconnectOrigin: ConnectOrigin = .automatic
     private var reconnectAttempts = 0
     private var lastCloseInitiator: String?
     private var reconnectTask: Task<Void, Never>?
@@ -174,9 +211,21 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     // Receive loop task
     private var receiveLoopTask: Task<Void, Never>?
 
-    /// Test seam (#2171): the pump reports every event it handled, in handling
+    /// How long an open socket may wait for the server's `ready` before it is
+    /// closed and the reconnect loop retries; `nil` waits forever.
+    private let readyTimeoutMs: Int?
+    private var readyDeadlineTask: Task<Void, Never>?
+
+    /// The current task opened and its `ready` would still connect it. Cleared
+    /// as soon as the manager starts closing that task — a forced reconnect,
+    /// the readiness deadline, `disconnect()` — because the task stays current
+    /// until its close callback lands, and a `ready` already queued behind the
+    /// close request must not bring a socket being torn down up as connected.
+    private var awaitingReady = false
+
+    /// Test seam: the pump reports every event it handled, in handling
     /// order, so the ordering and no-drop behaviors can be observed. Mirrors
-    /// `onOutboundFlushedForTest` (#2105).
+    /// `onOutboundFlushedForTest`.
     var onDelegateEventHandledForTest: (@Sendable (DelegateEvent) -> Void)?
 
     // MARK: - Transport state, stored in the snapshot box
@@ -227,9 +276,15 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
     // MARK: - Init
 
-    init(logger: Logger, maxReconnectDelayMs: Int, delegate: (any WebSocketManagerDelegate)? = nil) {
+    init(
+        logger: Logger,
+        maxReconnectDelayMs: Int,
+        readyTimeoutMs: Int? = nil,
+        delegate: (any WebSocketManagerDelegate)? = nil
+    ) {
         self.logger = logger
         self.maxReconnectDelayMs = maxReconnectDelayMs
+        self.readyTimeoutMs = readyTimeoutMs
         var continuation: AsyncStream<DelegateEvent>.Continuation!
         self.events = AsyncStream(DelegateEvent.self, bufferingPolicy: .unbounded) { continuation = $0 }
         self.eventContinuation = continuation
@@ -260,6 +315,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         receiveLoopTask?.cancel()
         reconnectTask?.cancel()
         disconnectTimeoutTask?.cancel()
+        readyDeadlineTask?.cancel()
         // `snapshot.task`, not the isolated `task` accessor: `deinit` may touch
         // isolated *stored* state, but not a computed property.
         snapshot.task?.cancel(with: .goingAway, reason: nil)
@@ -282,6 +338,12 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
     nonisolated var isSocketOpen: Bool { snapshot.socketIsOpen }
 
+    /// Whether the socket is open, connected or still waiting for the server's
+    /// `ready`. `isSocketOpen` is the gate for sends, which wait for
+    /// `ready`; this is the one an applied token is routed by, so a token for
+    /// another user that lands during the wait rebuilds the socket.
+    nonisolated var isTransportOpen: Bool { snapshot.transportIsOpen }
+
     /// The strictly-current values, for callers that would rather take an actor
     /// hop than a snapshot. Undeprecated — the synchronous forms above are not
     /// going away.
@@ -293,10 +355,12 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
     var isSocketOpenAsync: Bool { snapshot.socketIsOpen }
 
+    var isTransportOpenAsync: Bool { snapshot.transportIsOpen }
+
     /// Whether the manager is currently trying to hold a connection open — the
     /// `shouldConnect` intent, not the live transport state. The WS auth
     /// recovery reads it so it never revives a connection the caller
-    /// deliberately took down (#2637).
+    /// deliberately took down.
     var desiredConnection: Bool { shouldConnect }
 
     func setMaxReconnectDelay(_ ms: Int) {
@@ -304,7 +368,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         maxReconnectDelayMs = ms
     }
 
-    // MARK: - Receive limit (#2477, #3436)
+    // MARK: - Receive limit (#2477)
 
     /// The receive limit this manager has been asked for, or `nil` while it is
     /// still on Foundation's default (1 MiB).
@@ -317,10 +381,10 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     /// Raise the receive limit, for every task from here on.
     ///
     /// NEVER LOWERS. One socket carries every document, so a format-1 document
-    /// opened after a large one would otherwise take the limit back down and
-    /// the large document's next `epoch.info` would be refused by the receive
-    /// — a failure that surfaces as a dead socket rather than as anything
-    /// naming the frame.
+    /// opened after a record-log one would otherwise take the limit back down
+    /// and the record-log document's next large frame would be refused by the
+    /// receive — a failure that surfaces as a dead socket rather than as
+    /// anything naming the frame.
     ///
     /// **A raise on a LIVE task rebuilds the socket, and it has to.**
     /// `URLSessionWebSocketTask.maximumMessageSize` is only honoured if it is
@@ -329,14 +393,14 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     /// takes the connection down with it. So assigning the property to a
     /// running task is not a smaller version of this — it does nothing, and a
     /// client that had only ever opened ordinary documents would find its
-    /// first large one's `epoch.info` refused by the very limit this call was
-    /// made to lift. The reconnect is ordinary: the sweep re-syncs every open
+    /// first record-log document's catch-up refused by the very limit this
+    /// call was made to lift. The reconnect is ordinary: the sweep re-syncs every open
     /// document, and it happens at most once per session, on the first
     /// document not locally known to be format 1.
     ///
-    /// (This is why decision 3436-SO-07 raises the limit at the OPEN rather
-    /// than when a document turns out to be large: on a first open, before the
-    /// socket is up, there is no task to rebuild.)
+    /// (This is why the limit is raised at the OPEN rather than when a
+    /// document's format is learned: on a first open, before the socket is
+    /// up, there is no task to rebuild.)
     func setMaximumMessageSize(_ bytes: Int) {
         guard bytes > (configuredMaximumMessageSize ?? 0) else { return }
         configuredMaximumMessageSize = bytes
@@ -363,7 +427,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     /// touching the socket — `setDesiredConnection` is the form that also
     /// connects or disconnects. Mirrors JS `setShouldConnectFlag`. Its caller
     /// is the auth transition: a token arriving where there was none re-arms a
-    /// connection an earlier logout took down (#2663).
+    /// connection an earlier logout took down.
     func setShouldConnectFlag(_ value: Bool) {
         logger.debug("[WSM][debug] setShouldConnectFlag", value)
         shouldConnect = value
@@ -375,8 +439,8 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
     // MARK: - Connect
 
-    func connect() async throws {
-        switch connectDecision() {
+    func connect(origin: ConnectOrigin = .automatic) async throws {
+        switch connectDecision(origin: origin) {
         case .alreadyConnected, .abort:
             return
         case .waitOnExisting:
@@ -390,7 +454,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     /// isolation is reentrant, so a suspension between the `_connecting` check
     /// and the `_connecting = true` commit would let a second caller take the
     /// same decision and open a second socket.
-    private func connectDecision() -> ConnectDecision {
+    private func connectDecision(origin: ConnectOrigin) -> ConnectDecision {
         // Already connected
         if task != nil && _connected {
             logger.debug("[WSM][debug] connect aborted: already connected")
@@ -420,6 +484,14 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
         if !delegate.webSocketManagerHasAccessToken() {
             logger.debug("[CONNECT] Skipping connect: no access token present")
+            return .abort
+        }
+
+        // After the server refused this client as outdated, nothing the client
+        // starts on its own reconnects until a policy fetch releases it. The
+        // standing wish (`shouldConnect`) is kept, so the release reconnects.
+        if origin == .automatic && delegate.webSocketManagerAutomaticConnectHeld() {
+            logger.debug("[CONNECT] Skipping connect: held after an update-required refusal")
             return .abort
         }
 
@@ -467,9 +539,9 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         let oldSession = session
         session = newSession
         let newTask = newSession.webSocketTask(with: request)
-        // #3436 — a reconnect must not silently drop back to Foundation's
-        // 1 MiB: the document that needed the larger limit is still open, and
-        // its `epoch.info` is the frame that would be refused.
+        // A reconnect must not silently drop back to Foundation's 1 MiB: the
+        // document that needed the larger limit is still open, and its next
+        // large frame is the one that would be refused.
         applyMaximumMessageSize(to: newTask)
         task = newTask
         _connecting = true
@@ -531,7 +603,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     ///
     /// Built from `JsBaoNetworkError(transport:)` — the client's one
     /// error-to-(message, code) mapping — so the WS and HTTP failure paths
-    /// cannot report the same underlying failure differently (#2367).
+    /// cannot report the same underlying failure differently.
     private nonisolated static func transportFailure(from error: Error) -> WebSocketError {
         let normalized = JsBaoNetworkError(transport: error)
         return .transportFailure(message: normalized.message, code: normalized.urlErrorCode)
@@ -588,6 +660,10 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         case .receiveLoopFailed(let taskId, let code, let failure):
             guard currentTask(matching: taskId, "receive loop") != nil else { return }
             handleConnectionClosed(code: code, reason: failure.localizedDescription, error: failure)
+
+        case .ready(let taskId):
+            guard currentTask(matching: taskId, "ready") != nil else { return }
+            handshakeReady()
         }
     }
 
@@ -602,10 +678,32 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         return current
     }
 
+    /// #5578 — open is not connected. The server registers the socket on its
+    /// user's channel behind the 101 and sends `ready` once it has; until then
+    /// a user event can miss this client. The manager stays `.connecting`,
+    /// `connect()` keeps waiting, and the readiness deadline bounds the wait.
     private func handleSocketOpened(_ openedTask: URLSessionWebSocketTask) {
+        snapshot.markOpened()
+        awaitingReady = true
+        logger.debug("[WSM][debug] socket open (didOpenWithProtocol); awaiting ready", connectionId)
+        delegate?.webSocketManagerOnSocketOpened()
+        startReceiveLoop(openedTask)
+        armReadyDeadline(for: ObjectIdentifier(openedTask))
+    }
+
+    /// The connected transition, for the current task's `ready` only (the pump
+    /// has checked the task). A second `ready`, or one for a task the manager
+    /// has started closing, changes nothing.
+    private func handshakeReady() {
+        guard awaitingReady, snapshot.opened, !_connected else {
+            logger.debug("[WSM][debug] ignoring ready: not awaiting one")
+            return
+        }
+        awaitingReady = false
+        cancelReadyDeadline()
         setTransportState(connected: true, connecting: false)
         reconnectAttempts = 0
-        logger.debug("[WSM][debug] socket open (didOpenWithProtocol)", connectionId)
+        logger.debug("[WSM][debug] socket ready", connectionId)
 
         let continuation = connectContinuation
         connectContinuation = nil
@@ -616,8 +714,38 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         delegate?.webSocketManagerOnConnected()
         continuation?.resume()
         for waiter in waiters { waiter.resume() }
+    }
 
-        startReceiveLoop(openedTask)
+    // MARK: - Readiness deadline (#5578)
+
+    private func armReadyDeadline(for taskId: ObjectIdentifier) {
+        cancelReadyDeadline()
+        guard let readyTimeoutMs, readyTimeoutMs > 0 else { return }
+        readyDeadlineTask = makeReadyDeadline(taskId: taskId, delayMs: readyTimeoutMs)
+    }
+
+    private func cancelReadyDeadline() {
+        readyDeadlineTask?.cancel()
+        readyDeadlineTask = nil
+    }
+
+    private nonisolated func makeReadyDeadline(taskId: ObjectIdentifier, delayMs: Int) -> Task<Void, Never> {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+            guard !Task.isCancelled, let self = self else { return }
+            await self.fireReadyDeadline(taskId: taskId)
+        }
+    }
+
+    /// A socket that opened and heard no `ready` in time is closed, as the JS
+    /// client's connect deadline closes it: `connect()` throws, and the close
+    /// that follows reaches the pump like any other and schedules the retry.
+    /// A deadline for a task that is no longer current does nothing.
+    private func fireReadyDeadline(taskId: ObjectIdentifier) {
+        readyDeadlineTask = nil
+        guard currentTask(matching: taskId, "ready deadline") != nil, !_connected else { return }
+        logger.warn("[WSM] no ready within the handshake budget; closing the socket", readyTimeoutMs ?? 0)
+        closeSocketNow(initiator: "readyTimeout")
     }
 
     // MARK: - Receive Loop
@@ -645,6 +773,12 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
                     switch message {
                     case .string(let text):
+                        // The manager's own frame (#5578), tagged with the task
+                        // it arrived on and never forwarded.
+                        if Self.isReadyFrame(text) {
+                            self.emit(.ready(task: ObjectIdentifier(wsTask)))
+                            continue
+                        }
                         await self.delegate?.webSocketManagerOnMessage(text)
                     case .data(let data):
                         await self.delegate?.webSocketManagerOnMessage(data)
@@ -673,6 +807,18 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
+    /// Whether a text frame is the server's `{"type":"ready"}`. Only a short
+    /// frame is parsed, so every other frame costs a length check.
+    nonisolated static func isReadyFrame(_ text: String) -> Bool {
+        guard text.utf8.count <= readyFrameMaxLength, text.contains("\"ready\"") else { return false }
+        return (try? JSONDecoder().decode(FrameType.self, from: Data(text.utf8)))?.type == "ready"
+    }
+
+    /// Just a frame's `type`, for recognising `ready`.
+    private struct FrameType: Decodable {
+        let type: String
+    }
+
     // MARK: - Connection Closed Handler
 
     /// Reached **only** from `handle(_:)` — every terminal path funnels through
@@ -685,6 +831,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         let wasTask = task
         task = nil
         setTransportState(connected: false, connecting: false)
+        cancelReadyDeadline()
 
         receiveLoopTask?.cancel()
         receiveLoopTask = nil
@@ -759,7 +906,8 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
         if manualPending {
             logger.debug("[WSM][debug] manual reconnect trigger fired")
-            Task { try? await self.connect() }
+            let origin = manualReconnectOrigin
+            Task { [weak self] in try? await self?.connect(origin: origin) }
             return
         }
 
@@ -873,6 +1021,8 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         _connecting = false
         reconnectTask?.cancel()
         reconnectTask = nil
+        cancelReadyDeadline()
+        awaitingReady = false
 
         let hadTask = task != nil
         let currentTask = task
@@ -955,8 +1105,8 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     ///
     /// Callers that need a particular outcome must order the calls themselves
     /// — await one before making the next. The JS client's `setShouldConnect`
-    /// follows the same rule, coalescing exception included (#2568).
-    func setDesiredConnection(shouldConnect: Bool) async {
+    /// follows the same rule, coalescing exception included.
+    func setDesiredConnection(shouldConnect: Bool, origin: ConnectOrigin = .automatic) async {
         logger.debug(
             "[WSM][debug] setDesiredConnection", shouldConnect,
             "connected:", _connected, "connecting:", _connecting
@@ -972,7 +1122,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
             // connected, registers on the `pendingConnectWaiters` list if a
             // connect is already in flight, or starts a fresh connect.
             do {
-                try await connect()
+                try await connect(origin: origin)
             } catch {
                 logger.debug("[WSM][debug] connect failed in setDesiredConnection:", error.localizedDescription)
             }
@@ -984,12 +1134,13 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
 
     // MARK: - Force Reconnect
 
-    func forceReconnect() {
-        manualReconnectPending = true
+    func forceReconnect(origin: ConnectOrigin = .automatic) {
         shouldConnect = true
         reconnectAttempts = 0
 
         if task != nil {
+            manualReconnectPending = true
+            manualReconnectOrigin = origin
             closeSocketNow(initiator: "forceReconnect")
             // The close lands as a channel event (`didCloseWith` /
             // `didCompleteWithError`, or the receive loop's failure), and the
@@ -998,7 +1149,9 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
             return
         }
 
-        Task { try? await self.connect() }
+        // No socket, so no close is coming to spend a pending flag on: setting
+        // it here would make the next unrelated close reconnect as this one.
+        Task { [weak self] in try? await self?.connect(origin: origin) }
     }
 
     // MARK: - Send
@@ -1010,6 +1163,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         guard let currentTask = snapshot.sendableTask else {
             throw WebSocketError.notConnected
         }
+        snapshot.sentForTest?(text)
         try await currentTask.send(.string(text))
     }
 
@@ -1017,7 +1171,19 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
         guard let currentTask = snapshot.sendableTask else {
             throw WebSocketError.notConnected
         }
+        snapshot.sentForTest?(String(decoding: data, as: UTF8.self))
         try await currentTask.send(.data(data))
+    }
+
+    /// Send on the open socket, before the server's `ready` too. Only
+    /// the in-band token refresh uses it: the server holds a frame that early
+    /// until the handshake's session is stored, then answers it.
+    nonisolated func sendOnOpenSocket(_ text: String) async throws {
+        guard let currentTask = snapshot.openTask else {
+            throw WebSocketError.notConnected
+        }
+        snapshot.sentForTest?(text)
+        try await currentTask.send(.string(text))
     }
 
     // MARK: - Close Socket
@@ -1031,6 +1197,7 @@ actor WebSocketManager: NSObject, URLSessionWebSocketDelegate {
     /// held" contract; actor isolation makes the contract structural.)
     private func closeSocketNow(initiator: String) {
         lastCloseInitiator = initiator
+        awaitingReady = false
         receiveLoopTask?.cancel()
         task?.cancel(with: .goingAway, reason: initiator.data(using: .utf8))
 

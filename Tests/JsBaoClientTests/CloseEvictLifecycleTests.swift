@@ -17,6 +17,7 @@ import YSwift
 /// Server-free: an in-process loopback WebSocket server records the frames the
 /// client sends, and the storage-facing tests drive a bare `DocumentManager`
 /// over a temp-file `SQLiteStorageProvider`.
+@available(*, deprecated)
 final class CloseEvictLifecycleTests: XCTestCase {
     var tempDir: String!
 
@@ -278,6 +279,7 @@ final class CloseEvictLifecycleTests: XCTestCase {
         )
     }
 
+    @available(*, deprecated)
     func test_documentsCloseReportsEvictedFalseWhenTheServerHasNotConfirmed() async throws {
         // `documents.close` forwards to `client.closeDocument`, which owns the
         // guard since #2668; this pins the reported verdict through that path.

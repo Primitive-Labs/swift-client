@@ -1,0 +1,23 @@
+{
+  "name": "groups.listMembers.profiles",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "GET",
+  "path": "/app/<appId>/api/groups/team/baseline/members?include=profiles",
+  "caller": "owner",
+  "request": null,
+  "status": 200,
+  "body": {
+    "items": [
+      {
+        "userId": "<ulid>",
+        "addedAt": "<iso>",
+        "addedBy": "<ulid>",
+        "userName": "<name>",
+        "userEmail": "<email>",
+        "avatarUrl": "https://example.com/avatar.png"
+      }
+    ],
+    "hasMore": false
+  }
+}

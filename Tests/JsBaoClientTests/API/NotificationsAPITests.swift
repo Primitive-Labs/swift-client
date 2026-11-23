@@ -81,6 +81,9 @@ final class NotificationsAPITests: XCTestCase {
         ]
     }
 
+    // The inbox and push-device methods are experimental and compile only
+    // under the condition; the event case below stays in every build.
+    #if PRIMITIVE_EXPERIMENTAL_APIS
     // MARK: - Inbox routes
 
     func test_list_GET_noParams() async throws {
@@ -211,6 +214,7 @@ final class NotificationsAPITests: XCTestCase {
         XCTAssertEqual(r.path, "/me/push-tokens/tok%20with%20space")
         XCTAssertTrue(result.deleted)
     }
+    #endif
 
     // MARK: - WS event dispatch
 

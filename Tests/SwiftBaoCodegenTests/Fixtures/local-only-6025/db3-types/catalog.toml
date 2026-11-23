@@ -1,0 +1,9 @@
+[type]
+name = "catalog6025"
+
+[models.tag6025]
+class_name = "Tag6025"
+
+[models.tag6025.fields.label]
+type = "string"
+indexed = true

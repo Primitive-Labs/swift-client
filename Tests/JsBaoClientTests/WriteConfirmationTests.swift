@@ -16,6 +16,7 @@ import XCTest
 /// `(false, false)` while the socket is closed, which is exactly the
 /// "connection down after initial sync" case the bug got wrong, and the
 /// outbound-state tracking is exercised directly on `DocumentManager`.
+@available(*, deprecated)
 final class WriteConfirmationTests: XCTestCase {
 
     /// A client that never opens a socket (`autoNetwork: false`, no `connect`),

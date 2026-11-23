@@ -8,6 +8,7 @@ import XCTest
 /// bodyless call stays bodyless, and whether the two additive response fields
 /// decode. The answer itself is the platform's, and the live suites in
 /// `tests/api/http/` pin that.
+@available(*, deprecated)
 final class DocumentAccessSubjectHermeticTests: XCTestCase {
 
     private func makeAPI(_ transport: RecordingTransport) -> DocumentsAPI {

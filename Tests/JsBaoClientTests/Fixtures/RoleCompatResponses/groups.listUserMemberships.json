@@ -1,0 +1,20 @@
+{
+  "name": "groups.listUserMemberships",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "GET",
+  "path": "/app/<appId>/api/users/<ulid>/memberships?type=team",
+  "caller": "owner",
+  "request": null,
+  "status": 200,
+  "body": [
+    {
+      "groupType": "team",
+      "groupId": "baseline",
+      "name": "Baseline Team Renamed",
+      "addedAt": "<iso>",
+      "addedBy": "<ulid>",
+      "description": "Compatibility baseline"
+    }
+  ]
+}

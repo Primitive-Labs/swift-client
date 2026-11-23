@@ -22,17 +22,16 @@ public struct AuthUser: Decodable, Sendable, Equatable {
     public let name: String?
 }
 
-// MARK: Magic link
+// MARK: Email sign-in
 
-/// Parameters for `auth.magicLinkRequest(...)`. Mirrors JS
-/// `magicLinkRequest({ email, redirectUri })`.
-/// Parameters for `auth.emailSignInRequest(...)` (#2884). Mirrors JS
+/// Parameters for `auth.emailSignInRequest(...)`. Mirrors JS
 /// `emailSignInRequest({ email, redirectUri })`.
 ///
-/// `redirectUri` is optional, and omitting it is how a code-only email is
-/// requested — the server issues one from the same unified template. A target
-/// that IS supplied must match the app's non-empty `emailRedirectUris`
-/// allow-list, or the request is rejected 400 `Invalid redirect URI` (#2967).
+/// `redirectUri` is where the link lands. `nil` (or an empty string) lets
+/// `emailSignInLinkTarget` choose; ask for a code-only email with
+/// `emailSignInRequest(email:target: .codeOnly)`. A target that is sent must
+/// match the app's non-empty `emailRedirectUris` allow-list, or the request is
+/// rejected 400 `Invalid redirect URI`.
 public struct EmailSignInRequestParams: Sendable {
     public var email: String
     public var redirectUri: String?
@@ -48,20 +47,67 @@ public struct EmailSignInRequestResult: Decodable, Sendable, Equatable {
     public let success: Bool
 }
 
-public struct MagicLinkRequestParams: Sendable {
-    public var email: String
-    public var redirectUri: String
+/// Where an emailed sign-in link should land. Mirrors JS
+/// `emailSignInRequest(email, { redirectUri })`, where `null` asks for code only.
+public enum EmailSignInTarget: Sendable, Equatable {
+    /// Let `emailSignInLinkTarget` choose: `options.auth.oauthRedirectUri`,
+    /// else `links.appBaseURL`'s origin + `/oauth/callback`, else code only.
+    case automatic
+    /// An email that carries the 6-digit code alone.
+    case codeOnly
+    /// This target. An empty string counts as `.automatic`.
+    case uri(String)
+}
 
-    public init(email: String, redirectUri: String) {
-        self.email = email
-        self.redirectUri = redirectUri
+/// What `auth.handleSignInCallback(_:inviteToken:)` returns once the client is
+/// signed in from a callback URL. Mirrors JS `SignInCallbackResult`.
+public struct SignInCallbackResult: Sendable, Equatable {
+    /// How the URL signed the user in.
+    public enum Method: String, Sendable {
+        /// An emailed link's `magic_token`.
+        case magicLink = "magic-link"
+        /// An OAuth redirect's `code` + `state`.
+        case oauth
+    }
+
+    public let method: Method
+    /// The signed-in user's id.
+    public let userId: String
+    /// Magic link only: the user the verify call returned.
+    public let user: AuthUser?
+    /// Magic link only: whether the verify call created the user.
+    public let isNewUser: Bool?
+    /// Magic link only: whether the server suggests adding a passkey.
+    public let promptAddPasskey: Bool?
+    /// `"login-add-passkey"` when the URL carries `purpose=login-add-passkey`.
+    public let purpose: String?
+    /// The state bag's `continueUrl`, when it holds a string there.
+    public let continueUrl: String?
+    /// The decoded `state` bag, when the URL carries one.
+    public let state: [String: JSONValue]?
+
+    public init(
+        method: Method,
+        userId: String,
+        user: AuthUser? = nil,
+        isNewUser: Bool? = nil,
+        promptAddPasskey: Bool? = nil,
+        purpose: String? = nil,
+        continueUrl: String? = nil,
+        state: [String: JSONValue]? = nil
+    ) {
+        self.method = method
+        self.userId = userId
+        self.user = user
+        self.isNewUser = isNewUser
+        self.promptAddPasskey = promptAddPasskey
+        self.purpose = purpose
+        self.continueUrl = continueUrl
+        self.state = state
     }
 }
 
-/// Result of `auth.magicLinkRequest(...)`. Mirrors JS `{ success: boolean }`.
-public struct MagicLinkRequestResult: Decodable, Sendable, Equatable {
-    public let success: Bool
-}
+// MARK: Magic link
 
 /// Result of `auth.magicLinkVerify(...)`. Mirrors JS
 /// `{ user, promptAddPasskey?, isNewUser? }`. On success the SDK has already
@@ -76,17 +122,12 @@ public struct MagicLinkVerifyResult: Decodable, Sendable, Equatable {
 
 // MARK: OTP
 
-/// Result of `auth.otpRequest(...)`. Mirrors JS `{ success: boolean }`.
-public struct OtpRequestResult: Decodable, Sendable, Equatable {
-    public let success: Bool
-}
-
 /// Parameters for `auth.otpVerify(...)`. Mirrors JS
 /// `otpVerify(email, code, { inviteToken })`.
 public struct OtpVerifyParams: Sendable {
     public var email: String
     public var code: String
-    /// Optional invitation token (#466): when present, the server accepts
+    /// Optional invitation token: when present, the server accepts
     /// the named invitation during verify and resolves deferred grants to
     /// the signing-in user — even when the signup email differs from the
     /// invited email. Mirrors JS `otpVerify(email, code, { inviteToken })`.
@@ -109,7 +150,7 @@ public struct OtpVerifyResult: Decodable, Sendable, Equatable {
 
 // MARK: Auth config
 
-/// One Google client, as `/oauth-config` publishes it (#2891).
+/// One Google client, as `GET settings/sign-in` publishes it.
 ///
 /// A projection of the stored entry, not the entry itself: no `clientSecret`
 /// is ever published, and `usable` is the server's SHAPE verdict — a client id,
@@ -139,7 +180,7 @@ public struct GoogleClientConfig: Decodable, Sendable, Equatable {
     }
 }
 
-/// The Google client map, keyed by client type (#2891).
+/// The Google client map, keyed by client type.
 ///
 /// Google registers a client PER PLATFORM — `web`, `ios`, `android`,
 /// `desktop`, `chrome-extension` — so there is no single "is Google available"
@@ -169,17 +210,17 @@ let nativeGoogleClientType = "ios"
 
 /// The app's auth configuration, returned by `auth.getAuthConfig()`. Mirrors
 /// the object JS `AuthController.getAuthConfig()` resolves to (the
-/// `GET /oauth-config` envelope). The passkey fields pair with the native
-/// passkey flows (#929 — see `AuthAPI+NativePasskeys.swift`); the OAuth
-/// fields pair with native Google sign-in (#928); the Apple fields pair
-/// with `signInWithApple` (#409 port).
+/// `GET settings/sign-in` envelope). The passkey fields pair with the native
+/// passkey flows (see `AuthAPI+NativePasskeys.swift`); the OAuth
+/// fields pair with native Google sign-in; the Apple fields pair
+/// with `signInWithApple`.
 public struct AuthConfigInfo: Decodable, Sendable, Equatable {
     public let appId: String
     public let name: String
     public let mode: String
     public let waitlistEnabled: Bool
     public let googleOAuthEnabled: Bool
-    /// The typed client map (#2891). `nil` only against a server that predates
+    /// The typed client map. `nil` only against a server that predates
     /// it — which reports unavailable, the documented client-version floor.
     public let googleClients: GoogleClientsConfig?
     public let passkeyEnabled: Bool
@@ -187,21 +228,15 @@ public struct AuthConfigInfo: Decodable, Sendable, Equatable {
     /// because the shape is configuration data the SDK never introspects.
     public let passkeyRpConfig: JSONValue?
     public let hasPasskey: Bool
-    /// Sign in with Apple (#409): enabled flag + the fully-configured
+    /// Sign in with Apple: enabled flag + the fully-configured
     /// gate (`appleAudiences` present AND not explicitly disabled).
     /// `false` against servers that predate the Apple port.
     public let appleSignInEnabled: Bool
     public let hasApple: Bool
-    /// Is email sign-in available at all (#2884)? ONE flag: one request sends
+    /// Is email sign-in available at all? ONE flag: one request sends
     /// one email carrying a code and, when a link can be issued, a link, so
     /// there is no per-method availability to report.
     public let emailSignInEnabled: Bool
-    /// - Warning: Deprecated by #2884. A server that has the unified flow
-    ///   reports both of these equal to `emailSignInEnabled`; they exist so
-    ///   already-published clients keep reading a value that matches
-    ///   behavior. New code reads `emailSignInEnabled`.
-    public let magicLinkEnabled: Bool
-    public let otpEnabled: Bool
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -216,23 +251,14 @@ public struct AuthConfigInfo: Decodable, Sendable, Equatable {
         hasPasskey = try c.decodeIfPresent(Bool.self, forKey: .hasPasskey) ?? false
         appleSignInEnabled = try c.decodeIfPresent(Bool.self, forKey: .appleSignInEnabled) ?? false
         hasApple = try c.decodeIfPresent(Bool.self, forKey: .hasApple) ?? false
-        magicLinkEnabled = try c.decodeIfPresent(Bool.self, forKey: .magicLinkEnabled) ?? false
-        otpEnabled = try c.decodeIfPresent(Bool.self, forKey: .otpEnabled) ?? false
-        // A server that predates #2884 sends no `emailSignInEnabled` at all,
-        // so derive it from the pair it replaced: email sign-in is off only
-        // when BOTH legacy flags are explicitly false. Reading the absent key
-        // as `false` would black out the email button against every older
-        // server.
-        emailSignInEnabled =
-            try c.decodeIfPresent(Bool.self, forKey: .emailSignInEnabled)
-            ?? (magicLinkEnabled || otpEnabled)
+        emailSignInEnabled = try c.decodeIfPresent(Bool.self, forKey: .emailSignInEnabled) ?? false
     }
 
     private enum CodingKeys: String, CodingKey {
         case appId, name, mode, waitlistEnabled, googleOAuthEnabled, googleClients
         case passkeyEnabled
         case passkeyRpConfig, hasPasskey, appleSignInEnabled, hasApple
-        case emailSignInEnabled, magicLinkEnabled, otpEnabled
+        case emailSignInEnabled
     }
 }
 
@@ -259,7 +285,7 @@ extension AuthConfigInfo {
 
 /// The app-launch config subset returned by `auth.getAppConfig()` /
 /// `client.getAppConfig()`. Mirrors the typed 7-field object JS
-/// `getAppConfig()` resolves to — the projection of the `/oauth-config`
+/// `getAppConfig()` resolves to — the projection of the sign-in settings
 /// envelope used to decide which login affordances to show before a session
 /// exists. (`getAuthConfig()` returns the typed superset `AuthConfigInfo`.)
 public struct AppConfigInfo: Decodable, Sendable, Equatable {
@@ -271,12 +297,14 @@ public struct AppConfigInfo: Decodable, Sendable, Equatable {
     public let mode: String
     public let waitlistEnabled: Bool
     /// Whether THIS (native) client can start Google sign-in — the provider
-    /// enabled and the `ios` entry usable (#2891). It replaced the server's
+    /// enabled and the `ios` entry usable. It replaced the server's
     /// `hasOAuth`, which could not tell a web-configured app from a
     /// native-configured one and so was wrong in one direction or the other.
     public let googleAvailable: Bool
     public let hasPasskey: Bool
-    public let magicLinkEnabled: Bool
+    /// Is email sign-in available? One flag: one request sends one email
+    /// carrying a code and, when a link can be issued, a link.
+    public let emailSignInEnabled: Bool
 
     public init(
         appId: String,
@@ -285,7 +313,7 @@ public struct AppConfigInfo: Decodable, Sendable, Equatable {
         waitlistEnabled: Bool,
         googleAvailable: Bool,
         hasPasskey: Bool,
-        magicLinkEnabled: Bool
+        emailSignInEnabled: Bool
     ) {
         self.appId = appId
         self.name = name
@@ -293,7 +321,7 @@ public struct AppConfigInfo: Decodable, Sendable, Equatable {
         self.waitlistEnabled = waitlistEnabled
         self.googleAvailable = googleAvailable
         self.hasPasskey = hasPasskey
-        self.magicLinkEnabled = magicLinkEnabled
+        self.emailSignInEnabled = emailSignInEnabled
     }
 
     /// Project the launch-UI subset out of the full envelope.
@@ -308,12 +336,12 @@ public struct AppConfigInfo: Decodable, Sendable, Equatable {
             waitlistEnabled: config.waitlistEnabled,
             googleAvailable: config.googleSignInAvailable,
             hasPasskey: config.hasPasskey,
-            magicLinkEnabled: config.magicLinkEnabled
+            emailSignInEnabled: config.emailSignInEnabled
         )
     }
 
     public init(from decoder: Decoder) throws {
-        // The `/oauth-config` envelope carries no `googleAvailable` key — it is
+        // The sign-in settings carry no `googleAvailable` key — it is
         // a client-side predicate over the map — so decoding goes through the
         // full type and projects, rather than restating the rule here.
         self.init(from: try AuthConfigInfo(from: decoder))

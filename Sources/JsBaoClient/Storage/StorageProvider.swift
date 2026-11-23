@@ -204,3 +204,12 @@ public protocol StorageProvider: AnyObject, Sendable {
     /// Check whether a key exists in a store.
     func has(store: String, key: String) async throws -> Bool
 }
+
+/// A provider that can name the stores it holds. A `wipeLocal` logout uses
+/// it to find the other users' metadata stores in a file every user of the
+/// app shares, so it keeps the content of the documents they stored.
+protocol StoreNameListing: StorageProvider {
+    /// The name of every store holding at least one record and starting with
+    /// `prefix`.
+    func storeNames(withPrefix prefix: String) async throws -> [String]
+}

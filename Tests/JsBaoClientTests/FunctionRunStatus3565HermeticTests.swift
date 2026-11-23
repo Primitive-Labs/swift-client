@@ -221,8 +221,10 @@ final class FunctionRunStatus3565HermeticTests: XCTestCase {
         XCTAssertNil(flat.error?.name)
     }
 
-    func testIsTerminalIsExactlyTheThreeSettledStatuses() {
-        for terminal in ["completed", "failed", "terminated"] {
+    func testIsTerminalIsExactlyTheFourSettledStatuses() {
+        // #4726 — `denied`: a trigger fire a flagged version's `authorize`
+        // refused, settled before the handler ran.
+        for terminal in ["completed", "failed", "terminated", "denied"] {
             XCTAssertTrue(FunctionRunStatus(status: terminal).isTerminal, terminal)
         }
         for open in ["queued", "running", "missing", "skipped", "apply_pending", "apply_claimed"] {
@@ -230,12 +232,13 @@ final class FunctionRunStatus3565HermeticTests: XCTestCase {
         }
         XCTAssertTrue(FunctionRunStatus(status: "failed").isFailure)
         XCTAssertFalse(FunctionRunStatus(status: "completed").isFailure)
+        XCTAssertFalse(FunctionRunStatus(status: "denied").isFailure)
     }
 
-    func testTheStatusVocabularyIsSixWords() {
+    func testTheStatusVocabularyIsSevenWords() {
         XCTAssertEqual(
             FunctionRunStatus.statusValues,
-            ["queued", "running", "completed", "failed", "terminated", "missing"]
+            ["queued", "running", "completed", "failed", "terminated", "missing", "denied"]
         )
     }
 
@@ -272,7 +275,7 @@ final class FunctionRunStatus3565HermeticTests: XCTestCase {
         let (api, transport) = makeApi(json: Self.rowSettledFailure)
         let status = try await api.getStatus(runId: "run f")
         XCTAssertEqual(transport.lastCall?.method, .get)
-        XCTAssertEqual(transport.lastCall?.path, "/workflows/runs/run%20f/status")
+        XCTAssertEqual(transport.lastCall?.path, "/functions/runs/run%20f/status")
         XCTAssertEqual(status.error?.code, "OUTPUT_SCHEMA_VIOLATION")
 
         let typed: FunctionRunResult<[String: String]> = try await makeApi(
@@ -454,6 +457,19 @@ final class FunctionRunStatus3565HermeticTests: XCTestCase {
         XCTAssertEqual(transport.calls.count, 1)
     }
 
+    /// #4726 — a denied run has settled: the wait returns it rather than
+    /// refusing a status it does not know.
+    func testWaitForReturnsADeniedRun() async throws {
+        let (api, transport) = makeApi(
+            json: #"{"status":{"status":"denied","error":{"message":"FORBIDDEN"}}}"#
+        )
+        api.sleepForTest = { _ in }
+        let settled = try await api.waitFor(runId: "rid", options: FunctionWaitOptions(timeout: 30))
+        XCTAssertEqual(settled.status, "denied")
+        XCTAssertTrue(settled.isTerminal)
+        XCTAssertEqual(transport.calls.count, 1)
+    }
+
     func testWaitForTimesOutWithTheFunctionWordedMessage() async throws {
         let (api, _) = makeApi(json: #"{"status":{"status":"running"}}"#)
         api.sleepForTest = { _ in }
@@ -463,7 +479,7 @@ final class FunctionRunStatus3565HermeticTests: XCTestCase {
             )
             XCTFail("the wait must time out")
         } catch let error as JsBaoError {
-            XCTAssertEqual(error.code, .workflowWaitTimeout)
+            XCTAssertEqual(error.code, .functionWaitTimeout)
             XCTAssertTrue(
                 error.message.contains("waiting for function run rid"),
                 "got \(error.message)"

@@ -22,7 +22,7 @@ public enum DefaultValue: Equatable, Hashable, Sendable {
             return s
         case let .scalar(.date(s)):
             return s
-        case .scalar(.stringset), .scalar(.json):
+        case .scalar(.stringset), .scalar(.json), .scalar(.vector):
             // These field types don't serialize as primitive scalars on the
             // meta layer; js-bao has no precedent for them as defaults.
             return NSNull()
@@ -87,6 +87,17 @@ public struct FieldDescriptor: Equatable, Hashable, Sendable {
     /// write path (`DynamicModel.save`) to stamp `Date.now()`-style epoch
     /// milliseconds on insert / update, mirroring js-bao's `BaseModel.save`.
     public var autoStamp: AutoStamp?
+    /// A vector field's number of numbers; `nil` on any other field.
+    public var dims: Int?
+    /// How each number of a vector field is stored; `nil` on any other field.
+    public var element: VectorElement?
+    /// The generated model reads this field as a default where a db3 record
+    /// does not hold it, though the descriptor declares no `default`: a string
+    /// set's default, which a create does not write. A
+    /// save counts such a field the record does not hold as present for the
+    /// required check, as it counts a field with a `default`. Not written to
+    /// `_meta`.
+    public var defaultOnRead: Bool
 
     public init(
         type: PrimitiveFieldType,
@@ -97,7 +108,10 @@ public struct FieldDescriptor: Equatable, Hashable, Sendable {
         maxLength: Int? = nil,
         maxCount: Int? = nil,
         default: DefaultValue? = nil,
-        autoStamp: AutoStamp? = nil
+        autoStamp: AutoStamp? = nil,
+        dims: Int? = nil,
+        element: VectorElement? = nil,
+        defaultOnRead: Bool = false
     ) {
         self.type = type
         self.indexed = indexed
@@ -108,6 +122,16 @@ public struct FieldDescriptor: Equatable, Hashable, Sendable {
         self.maxCount = maxCount
         self.default = `default`
         self.autoStamp = autoStamp
+        self.dims = dims
+        self.element = element
+        self.defaultOnRead = defaultOnRead
+    }
+
+    /// A vector field's encoding: its `dims` and `element`, or `nil` when the
+    /// field is not a well-formed vector field.
+    public var vectorEncoding: VectorEncoding? {
+        guard type == .vector, let dims, dims >= 1, let element else { return nil }
+        return VectorEncoding(dims: dims, element: element)
     }
 }
 
@@ -216,17 +240,48 @@ public struct PrimitiveSchema: Equatable, Sendable {
     public var fields: [String: FieldDescriptor]
     public var constraints: [String: ConstraintDescriptor]
     public var relationships: [String: RelationshipDescriptor]
+    /// Each renamed field's current name (the Swift property, the type
+    /// file's key) to its stored name (`storedAs`), the key `fields` and
+    /// records hold. Empty for a model that renames nothing. Not written to
+    /// `_meta_`.
+    public var fieldNames: [String: String]
+    /// The db3 types the generated declaration comes from: `client.db3.records`
+    /// translates `fieldNames` only on a db3 of one of them. Empty when
+    /// `fieldNames` is.
+    public var fieldNameTypes: [String]
 
+    /// A model that renames no field. Every generated model before renamed
+    /// fields calls this initializer, so it stays beside the one below.
     public init(
         name: String,
         fields: [String: FieldDescriptor],
         constraints: [String: ConstraintDescriptor] = [:],
         relationships: [String: RelationshipDescriptor] = [:]
     ) {
+        self.init(
+            name: name, fields: fields, constraints: constraints, relationships: relationships,
+            fieldNames: [:], fieldNameTypes: []
+        )
+    }
+
+    /// A model that renames fields: `fields` is keyed by stored names,
+    /// `fieldNames` maps each renamed field's current name to its stored
+    /// name, and `fieldNameTypes` lists the db3 types the declaration comes
+    /// from.
+    public init(
+        name: String,
+        fields: [String: FieldDescriptor],
+        constraints: [String: ConstraintDescriptor] = [:],
+        relationships: [String: RelationshipDescriptor] = [:],
+        fieldNames: [String: String],
+        fieldNameTypes: [String] = []
+    ) {
         self.name = name
         self.fields = fields
         self.constraints = constraints
         self.relationships = relationships
+        self.fieldNames = fieldNames
+        self.fieldNameTypes = fieldNameTypes
     }
 
     /// The constraint list that actually gets ENFORCED at runtime —
@@ -239,7 +294,7 @@ public struct PrimitiveSchema: Equatable, Sendable {
     /// itself as `unique = true`). But both are enforced at write time
     /// via `_uniqueIdx_{modelName}_{constraintName}` indexes.
     ///
-    /// A constraint over a stringset field is never resolved (#3719): no
+    /// A constraint over a stringset field is never resolved: no
     /// writer can build that key consistently, so one recorded by an older
     /// client is ignored rather than enforced.
     public var resolvedUniqueConstraints: [ConstraintDescriptor] {
@@ -263,7 +318,7 @@ public struct PrimitiveSchema: Equatable, Sendable {
 
     /// The first unique constraint this schema declares over a stringset
     /// field, with the sentence js-bao's `uniqueStringsetMessage` answers —
-    /// or `nil` when it declares none (#3719).
+    /// or `nil` when it declares none.
     ///
     /// The one rule the three Swift declaration boundaries share: the TOML
     /// loader throws it, and `DynamicModel` refuses a write for it before any
@@ -293,5 +348,111 @@ public struct PrimitiveSchema: Equatable, Sendable {
             )
         }
         return nil
+    }
+}
+
+/// A model's renamed fields (`PrimitiveSchema.fieldNames`) at the edge where
+/// app code writes or reads a field name: a name the app writes (current or
+/// stored) is translated to the stored name, and a stored key answered is
+/// translated to the current name. Every function answers its input
+/// unchanged for a schema with no renamed field.
+public enum PrimitiveFieldNames {
+    /// `name`'s stored name: itself when it names no renamed field.
+    public static func stored(_ name: String, in fieldNames: [String: String]) -> String {
+        fieldNames[name] ?? name
+    }
+
+    /// `stored`'s current name: itself when it names no renamed field.
+    public static func current(_ stored: String, in fieldNames: [String: String]) -> String {
+        guard !fieldNames.isEmpty else { return stored }
+        for (current, wire) in fieldNames where wire == stored { return current }
+        return stored
+    }
+
+    /// A dictionary's keys as stored names.
+    public static func storedKeys<V>(_ values: [String: V], in fieldNames: [String: String]) -> [String: V] {
+        guard !fieldNames.isEmpty else { return values }
+        var out: [String: V] = [:]
+        for (key, value) in values { out[stored(key, in: fieldNames)] = value }
+        return out
+    }
+
+    /// A row's keys as current names. A renamed field's stored value always
+    /// answers under its current name: a stray stored key spelled like that
+    /// current name is left out.
+    public static func currentKeys<V>(_ row: [String: V], in fieldNames: [String: String]) -> [String: V] {
+        guard !fieldNames.isEmpty else { return row }
+        var out: [String: V] = [:]
+        let owned = Set(fieldNames.filter { row[$0.value] != nil }.keys)
+        for (key, value) in row {
+            let currentName = current(key, in: fieldNames)
+            if currentName == key, owned.contains(key), fieldNames[key] != key { continue }
+            out[currentName] = value
+        }
+        return out
+    }
+
+    /// A query filter's field names as stored names: every key that does
+    /// not start with `$`, inside `$and`, `$or` and `$not` too, `$near`'s
+    /// `field` and `filter`, and `$search`'s `fields`. Values are kept.
+    /// Two keys that name one field (its current and its stored name) are
+    /// both kept, joined under `$and`, as js-bao's `mapFilterFields` joins them.
+    public static func storedFilter(_ filter: [String: JSONValue], in fieldNames: [String: String]) -> [String: JSONValue] {
+        guard !fieldNames.isEmpty else { return filter }
+        var out: [String: JSONValue] = [:]
+        var both: [JSONValue] = []
+        // Keys in a fixed order, so which spelling lands first never depends on hashing.
+        for key in filter.keys.sorted() {
+            let value = filter[key]!
+            if !key.hasPrefix("$") {
+                let wire = stored(key, in: fieldNames)
+                if let earlier = out[wire] {
+                    both.append(.object([wire: earlier]))
+                    both.append(.object([wire: value]))
+                    out[wire] = nil
+                } else if both.contains(where: { $0.objectValue?[wire] != nil }) {
+                    both.append(.object([wire: value]))
+                } else {
+                    out[wire] = value
+                }
+                continue
+            }
+            switch (key, value) {
+            case ("$and", .array(let branches)), ("$or", .array(let branches)):
+                out[key] = .array(branches.map { branch in
+                    if case .object(let inner) = branch { return .object(storedFilter(inner, in: fieldNames)) }
+                    return branch
+                })
+            case ("$not", .object(let inner)):
+                out[key] = .object(storedFilter(inner, in: fieldNames))
+            case ("$near", .object(var near)):
+                if case .string(let field)? = near["field"] { near["field"] = .string(stored(field, in: fieldNames)) }
+                if case .object(let inner)? = near["filter"] { near["filter"] = .object(storedFilter(inner, in: fieldNames)) }
+                out[key] = .object(near)
+            case ("$search", .object(var search)):
+                if case .array(let fields)? = search["fields"] {
+                    search["fields"] = .array(fields.map { field in
+                        if case .string(let name) = field { return .string(stored(name, in: fieldNames)) }
+                        return field
+                    })
+                }
+                out[key] = .object(search)
+            default:
+                out[key] = value
+            }
+        }
+        guard !both.isEmpty else { return out }
+        var and: [JSONValue] = []
+        if case .array(let existing)? = out["$and"] { and = existing }
+        out["$and"] = .array(and + both)
+        return out
+    }
+
+    /// An upsert target as the room resolves it: a unique constraint's name
+    /// first (so a constraint named like a renamed field keeps addressing
+    /// the constraint), else the field's stored name.
+    public static func upsertTarget(_ name: String, constraintNames: [String], in fieldNames: [String: String]) -> String {
+        if fieldNames.isEmpty || constraintNames.contains(name) { return name }
+        return stored(name, in: fieldNames)
     }
 }

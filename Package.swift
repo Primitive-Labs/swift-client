@@ -11,6 +11,16 @@
 // `PluginDeprecationHermeticTests` keeps the two in step.
 import PackageDescription
 
+// The experimental APIs (`- Stability: experimental` in `Sources/`) compile
+// only under the `PRIMITIVE_EXPERIMENTAL_APIS` condition. It is defined unless
+// the build environment sets `PRIMITIVE_EXPERIMENTAL_APIS=0` (only the literal
+// `0`), which makes a production build: `PRIMITIVE_EXPERIMENTAL_APIS=0 swift
+// build`. The published mirrors carry this line patched to a constant
+// (`scripts/publish-swift-packages.sh`): `false` on the production branch,
+// `true` on every other channel.
+let experimentalApis = false
+let experimentalApiSettings: [SwiftSetting] = experimentalApis ? [.define("PRIMITIVE_EXPERIMENTAL_APIS")] : []
+
 let package = Package(
     name: "JsBaoClient",
     platforms: [
@@ -21,6 +31,24 @@ let package = Package(
         .library(
             name: "JsBaoClient",
             targets: ["JsBaoClient"]
+        ),
+        // SwiftUI views over the client: `BlobImage` shows a db3 blob as
+        // `AsyncImage` shows a URL. A product of its own so the client
+        // library itself never imports SwiftUI.
+        .library(
+            name: "JsBaoClientUI",
+            targets: ["JsBaoClientUI"]
+        ),
+        // The SQLite every connection in this package opens (#4700): the
+        // release sqlite-wasm carries for the JS client, built from source, so
+        // the store answers the same SQL on every OS it runs on. A product so
+        // a package that reads the client's database file (the debug
+        // inspector in PrimitiveApp) opens it with the same library: two
+        // SQLite builds on one file in one process do not see each other's
+        // locks.
+        .library(
+            name: "JsBaoSQLite",
+            targets: ["JsBaoSQLite"]
         ),
         // Build-time codegen tool that turns a TOML schema (same shape
         // `TomlSchemaLoader` accepts) into one Swift file per model. Use
@@ -67,15 +95,88 @@ let package = Package(
         .package(url: "https://github.com/LebJe/TOMLKit.git", from: "0.6.0"),
     ],
     targets: [
+        // The SQLite amalgamation and SQLite's vec1 extension, vendored
+        // unmodified beside `Sources/` as `yswift-fork` is
+        // (`Vendor/JsBaoSQLite/VERSION` names both releases and their hashes).
+        // `BundledSQLiteHermeticTests` holds the release and vec1's version to
+        // js-bao's own sqlite-wasm build, packages/js-bao/vendor/sqlite-wasm/VERSION,
+        // and `vec1.c` to packages/primitive-vec1-node/src/vec1.c byte for byte.
+        //
+        // SQLite's options are `.define`s. JSON functions are built in since
+        // 3.38; the double-quoted-string default is left as SQLite ships it,
+        // as the room's engine has it. FTS5 keeps a db3's device text index (a
+        // contentless table kept by FTS5's 'delete' command).
+        //
+        // vec1 is compiled in (`VEC1_STATIC`) and SQLite sets it up itself:
+        // `SQLITE_EXTRA_AUTOEXT` puts the hook in `jsbao_init.c` on SQLite's
+        // list of compiled-in extensions (FTS5's list), which every connection
+        // runs as it opens, so every connection the library opens has vec1,
+        // with no loadable-extension path and nothing registered globally.
+        // Not an initialization hook: `SQLITE_EXTRA_INIT_MUTEXED`, the wasm
+        // build's, deadlocks under `THREADSAFE=1` (registering an
+        // auto-extension allocates while it holds the static main mutex, and
+        // the allocation re-enters initialization, which takes that mutex
+        // again), and `SQLITE_EXTRA_INIT` runs after SQLite counts itself
+        // initialized, so a concurrent first connection, or one opened while
+        // SQLite re-initializes after `sqlite3_shutdown`, could miss vec1.
+        .target(
+            name: "JsBaoSQLite",
+            path: "Vendor/JsBaoSQLite",
+            exclude: ["VERSION"],
+            sources: ["sqlite3.c", "vec1.c", "jsbao_init.c"],
+            publicHeadersPath: "include",
+            cSettings: [
+                .define("SQLITE_THREADSAFE", to: "1"),
+                .define("SQLITE_OMIT_LOAD_EXTENSION"),
+                .define("SQLITE_ENABLE_MATH_FUNCTIONS"),
+                .define("SQLITE_OMIT_DEPRECATED"),
+                .define("SQLITE_ENABLE_FTS5"),
+                // `dbstat` reads each table's and index's pages, so a measurement
+                // splits a store's bytes by what holds them (a device vector
+                // index's flat and ANN tables beside the records), as js-bao's
+                // sqlite-wasm build can.
+                .define("SQLITE_ENABLE_DBSTAT_VTAB"),
+                .define("VEC1_STATIC"),
+                .define("SQLITE_EXTRA_AUTOEXT", to: "jsbao_sqlite3_vec1_autoext"),
+                // A debug build compiles C at -O0, which makes SQLite's JSON
+                // functions about 2.7 times slower than the OS's optimized
+                // build (an unindexed `json_extract` scan of 100,000 rows: 92
+                // ms against 34 ms), so an app's debug build would read its
+                // store far slower than it ships. Optimized in every
+                // configuration instead. `unsafeFlags` bars a dependency
+                // resolved by version, and this package has none: apps depend
+                // on a branch of the mirror or on a path (CHANGELOG.md, "How
+                // this package is versioned"), and SwiftPM allows both.
+                .unsafeFlags(["-O2"], .when(configuration: .debug)),
+                // Keeps the release sources' warnings out of every app's build
+                // log, without editing files `BundledSQLiteHermeticTests` holds
+                // byte for byte. `-fno-modules` removes the cause of the
+                // `MIN`/`MAX` conflict (`-Wambiguous-macro`): the build systems
+                // compile this target with clang modules on, which makes the
+                // SDK's `sys/param.h` macros visible in `sqlite3.c`, a file that
+                // never includes it; no warning is suppressed for it. The two
+                // `-Wno-` flags name exactly the families the release sources
+                // trip (`sqlite3.c`'s 64-to-32 narrowing, `vec1.c`'s `&&` within
+                // `||`), which only an edit could fix. `jsbao_init.c`, ours,
+                // keeps every other family; no `-w`. A target's own flags
+                // follow the build system's under `swiftbuild`, `native` and
+                // Xcode, so these take effect. `unsafeFlags`: see `-O2` above.
+                // `BundledSQLiteWarningsHermeticTests` compiles each source
+                // with these flags and requires no warning.
+                .unsafeFlags(["-fno-modules", "-Wno-shorten-64-to-32", "-Wno-logical-op-parentheses"]),
+            ]
+        ),
         .target(
             name: "JsBaoClient",
             dependencies: [
+                "JsBaoSQLite",
                 .product(name: "YSwift", package: "yswift-fork"),
                 .product(name: "TOMLKit", package: "TOMLKit"),
             ],
             path: "Sources/JsBaoClient",
-            // No `swiftSettings:` here any more — the whole package is in the
-            // Swift 6 language mode via `swiftLanguageModes: [.v6]` at the
+            // The only setting is the experimental-API condition above; no
+            // language-mode setting here any more — the whole package is in
+            // the Swift 6 language mode via `swiftLanguageModes: [.v6]` at the
             // bottom of this manifest (#2310). This target carried the only
             // per-target opt-in between #1946 and #2310.
             //
@@ -86,9 +187,12 @@ let package = Package(
             // `--require-zero`. `run-tests.sh` runs it that way before the
             // suite. Its first check is that the committed mode is still `.v6`
             // — a silent revert would otherwise read as "zero sites".
-            linkerSettings: [
-                .linkedLibrary("sqlite3"),
-            ]
+            swiftSettings: experimentalApiSettings
+        ),
+        .target(
+            name: "JsBaoClientUI",
+            dependencies: ["JsBaoClient"],
+            path: "Sources/JsBaoClientUI"
         ),
         .executableTarget(
             name: "swift-bao-codegen",
@@ -114,15 +218,46 @@ let package = Package(
         ),
         .testTarget(
             name: "JsBaoClientTests",
-            dependencies: ["JsBaoClient"],
+            dependencies: ["JsBaoClient", "JsBaoClientUI", "JsBaoSQLite"],
             path: "Tests/JsBaoClientTests",
             // The cross-language E2E mini-app lives under this test
             // target's path tree but compiles as its own executable
             // target (`E2EMiniApp`) — exclude here so SwiftPM
             // doesn't pull the same Swift sources into both target
-            // compilations. The session-row fixtures (#3802) are JSON the
-            // JS and Swift suites both read by path, not bundle resources.
-            exclude: ["CrossPlatform/E2E", "Fixtures/AgentSessionRows"]
+            // compilations. The session-row fixtures (#3802), the bulk-load
+            // chunk fixtures (#4475) and the role-compatibility response
+            // fixtures (#4727) and the vector codec and rule fixtures (#5225)
+            // are JSON the JS and Swift suites both read by path, not bundle
+            // resources; the vector codegen golden's TOML is read by path the
+            // same way, and so are the shared-enum model fixture's TOMLs
+            // (#5896), the JSON-field model fixture's (#5899) and the read-defaulted
+            // model fixture's and the read-default parity fixture's
+            // with its object def (#6304), and so is the backend
+            // override fixture the JS suite also reads (#6185). `JsBaoSQLiteProbe` is its own executable target too,
+            // and the store the earlier bundled SQLite wrote (#5227) is read
+            // by path.
+            exclude: [
+                "BundledSQLite/Probe",
+                "CrossPlatform/E2E",
+                "Fixtures/AgentSessionRows",
+                "Fixtures/BackendOverrides",
+                "Fixtures/BundledSQLite",
+                "Fixtures/Db3Enums",
+                "Fixtures/Db3Json",
+                "Fixtures/Db3Vectors",
+                "Fixtures/DocumentIngestChunks",
+                "Fixtures/RoleCompatResponses",
+                "Schema/CodegenVector/vector-note.toml",
+                "Schema/CodegenSharedEnum/db3-types",
+                "Schema/CodegenSharedEnum/schemas",
+                "Schema/CodegenSharedEnum/functions",
+                "Schema/CodegenJson/db3-types",
+                "Schema/CodegenReadDefaults/db3-types",
+                "Schema/CodegenReadDefaultParity/db3-types",
+                "Schema/CodegenReadDefaultParity/schemas",
+                "Schema/CodegenJson/schemas",
+            ],
+            swiftSettings: experimentalApiSettings
         ),
         .testTarget(
             name: "SwiftBaoCodegenTests",
@@ -142,6 +277,16 @@ let package = Package(
             dependencies: ["JsBaoClient"],
             path: "Tests/JsBaoClientTests/CrossPlatform/E2E/swift",
             plugins: [.plugin(name: "JsBaoCodegenPlugin")]
+        ),
+        // The bundled SQLite's first use in a fresh process: `sqlite3_config`
+        // before first use, then two threads open the process's first
+        // connections at once and each asks for vec1, again after a
+        // `sqlite3_shutdown`. Spawned by `BundledSQLiteFreshProcessHermeticTests`,
+        // since the test process itself initialized SQLite long before.
+        .executableTarget(
+            name: "JsBaoSQLiteProbe",
+            dependencies: ["JsBaoSQLite"],
+            path: "Tests/JsBaoClientTests/BundledSQLite/Probe"
         ),
     ],
     // Package-wide: every target compiles in the Swift 6 language mode, so

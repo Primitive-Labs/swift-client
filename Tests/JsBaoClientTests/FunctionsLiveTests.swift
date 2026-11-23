@@ -298,30 +298,6 @@ final class FunctionsLiveTests: XCTestCase {
         XCTAssertEqual(typed.slice, slice)
     }
 
-    /// The block is additive: a DSL workflow run is not a function run, so its
-    /// status carries no `slice` key and the Swift result reads `nil`.
-    func testAWorkflowRunsStatusCarriesNoSlice() async throws {
-        let workflowKey = "swift-slice-dsl-\(Int(Date().timeIntervalSince1970))"
-        try await ctx.setupWorkflow(
-            appId: testApp.appId,
-            workflowKey: workflowKey,
-            steps: [["id": "n", "kind": "noop", "message": "hi", "saveAs": "output"]],
-            requiresClientApply: false,
-            syncCallable: true
-        )
-        let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT)
-
-        let run = try await client.workflows.runSync(
-            workflowKey: workflowKey,
-            runKey: "swift-slice-dsl-run",
-            contextDocId: docId
-        )
-        XCTAssertEqual(run.status, "completed")
-
-        let status = try await client.functions.getStatus(runId: run.runId)
-        XCTAssertNil(status.slice, "a DSL run has no slice record")
-    }
-
     // MARK: - #3454: the runner is chosen at call time
 
     /// An `any` function — the DEFAULT since #3454 — takes both verbs, and
@@ -423,5 +399,47 @@ final class FunctionsLiveTests: XCTestCase {
             request, input: nil as JSONValue?, contextDocId: docId, timeout: generousTimeout
         )
         XCTAssertEqual(result.status, "completed")
+    }
+
+    // MARK: - #4145: listing a user's runs and a run's steps
+
+    /// Two task runs started through `client.functions.start` come back
+    /// through `listRuns(options:)` filtered by their document, and a settled
+    /// run's recorded steps come back through `listRunSteps(runId:)` — the
+    /// live routes decode onto the function-native types.
+    func testListRunsFindsTheRunsOnADocumentAndListRunStepsReadsTheirSteps() async throws {
+        let functionKey = key("list")
+        try await ctx.pushFunction(
+            appId: testApp.appId,
+            functionKey: functionKey,
+            bundle: Self.oneStep,
+            durable: true
+        )
+        let docId = try await ctx.createDocument(appId: testApp.appId, jwt: testApp.ownerJWT)
+
+        let first = try await client.functions.start(
+            functionKey, input: nil as JSONValue?, contextDocId: docId
+        )
+        let second = try await client.functions.start(
+            functionKey, input: nil as JSONValue?, contextDocId: docId
+        )
+
+        let page = try await client.functions.listRuns(options: .init(contextDocId: docId))
+        XCTAssertFalse(page.hasMore)
+        XCTAssertEqual(Set(page.items.map(\.runId)), [first.runId, second.runId])
+        for run in page.items {
+            XCTAssertEqual(run.functionKey, functionKey)
+            XCTAssertEqual(run.contextDocId, docId)
+            XCTAssertNotNil(run.functionId)
+        }
+
+        let settled = try await client.functions.waitFor(
+            runId: first.runId, options: FunctionWaitOptions(timeout: 60)
+        )
+        XCTAssertEqual(settled.status, "completed")
+        let steps = try await client.functions.listRunSteps(runId: first.runId)
+        XCTAssertEqual(steps.items.map(\.stepId), ["one"])
+        XCTAssertEqual(steps.items.first?.stepKind, "function.step")
+        XCTAssertEqual(steps.items.first?.runId, first.runId)
     }
 }

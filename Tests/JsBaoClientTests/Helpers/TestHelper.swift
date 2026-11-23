@@ -12,7 +12,8 @@ func createTestClient(
     storageConfig: StorageConfig = .memory,
     autoNetwork: Bool = false,
     logLevel: LogLevel = .warn,
-    analyticsAutoEvents: AnalyticsAutoEventsConfig = AnalyticsAutoEventsConfig()
+    analyticsAutoEvents: AnalyticsAutoEventsConfig = AnalyticsAutoEventsConfig(),
+    deviceIndexes: Db3DeviceIndexes = .all
 ) -> JsBaoClient {
     JsBaoClient(options: JsBaoClientOptions(
         apiUrl: TestConfig.httpUrl,
@@ -25,7 +26,8 @@ func createTestClient(
         logLevel: logLevel,
         storageConfig: storageConfig,
         autoNetwork: autoNetwork,
-        analyticsAutoEvents: analyticsAutoEvents
+        analyticsAutoEvents: analyticsAutoEvents,
+        deviceIndexes: deviceIndexes
     ))
 }
 
@@ -43,6 +45,7 @@ func waitForConnection(client: JsBaoClient, timeout: TimeInterval = 5) async thr
 }
 
 /// Wait for a document to be synced.
+@available(*, deprecated)
 func waitForSync(client: JsBaoClient, documentId: String, timeout: TimeInterval = 10) async throws {
     if client.isSynced(documentId) { return }
 
@@ -124,6 +127,7 @@ func delay(_ seconds: TimeInterval) async throws {
 
 // MARK: - createDocument test convenience (#1108)
 
+@available(*, deprecated)
 extension JsBaoClient {
     /// Test convenience over the JS-parity `createDocument` (which returns
     /// `{ metadata }` only, like js-bao — #1108): extracts the documentId from
@@ -170,4 +174,23 @@ func XCTAssertThrowsErrorAsync<T>(
     } catch {
         // expected
     }
+}
+
+/// The `HttpError` an async call is refused with, failing the test when the
+/// call succeeds or throws something else. The role suites (#4737) assert a
+/// refusal's `status` and `serverCode` on what this returns.
+func httpRefusal<T>(
+    _ expression: @autoclosure () async throws -> T,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async -> HttpError? {
+    do {
+        _ = try await expression()
+        XCTFail("expected an HTTP refusal, the call succeeded", file: file, line: line)
+    } catch let error as HttpError {
+        return error
+    } catch {
+        XCTFail("expected an HttpError, got \(error)", file: file, line: line)
+    }
+    return nil
 }

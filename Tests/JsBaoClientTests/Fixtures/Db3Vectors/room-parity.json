@@ -1,0 +1,184 @@
+{
+ "vectors": {
+  "Note": {
+   "embedding": {
+    "dims": 3,
+    "element": "f32"
+   },
+   "small": {
+    "dims": 3,
+    "element": "i8"
+   }
+  }
+ },
+ "cases": [
+  {
+   "label": "a correct value",
+   "mutations": [
+    {
+     "model": "Note",
+     "id": "01JA5225SW1FTPAR1TYXXXXXXX",
+     "kind": "create",
+     "fields": {
+      "embedding": "AACAPwAAAMAAAAA/"
+     }
+    }
+   ],
+   "expected": null
+  },
+  {
+   "label": "null",
+   "mutations": [
+    {
+     "model": "Note",
+     "id": "01JA5225SW1FTPAR1TYXXXXXXX",
+     "kind": "create",
+     "fields": {
+      "embedding": null
+     }
+    }
+   ],
+   "expected": null
+  },
+  {
+   "label": "the wrong length",
+   "mutations": [
+    {
+     "model": "Note",
+     "id": "01JA5225SW1FTPAR1TYXXXXXXX",
+     "kind": "create",
+     "fields": {
+      "embedding": "AACAPw=="
+     }
+    }
+   ],
+   "expected": "m: Note id=01JA5225SW1FTPAR1TYXXXXXXX: field \"embedding\" is declared 3 × f32, 16 base64 characters; the write is a string of 8 characters that is not that encoding's canonical base64"
+  },
+  {
+   "label": "the right length, url-safe",
+   "mutations": [
+    {
+     "model": "Note",
+     "id": "01JA5225SW1FTPAR1TYXXXXXXX",
+     "kind": "patch",
+     "fields": {
+      "embedding": "AACAPwAAAMAAAAA_"
+     }
+    }
+   ],
+   "expected": "m: Note id=01JA5225SW1FTPAR1TYXXXXXXX: field \"embedding\" is declared 3 × f32, 16 base64 characters; the write is a string of 16 characters that is not that encoding's canonical base64"
+  },
+  {
+   "label": "a number",
+   "mutations": [
+    {
+     "model": "Note",
+     "id": "01JA5225SW1FTPAR1TYXXXXXXX",
+     "kind": "create",
+     "fields": {
+      "embedding": 3
+     }
+    }
+   ],
+   "expected": "m: Note id=01JA5225SW1FTPAR1TYXXXXXXX: field \"embedding\" is declared 3 × f32, 16 base64 characters; the write is a number"
+  },
+  {
+   "label": "a boolean",
+   "mutations": [
+    {
+     "model": "Note",
+     "id": "01JA5225SW1FTPAR1TYXXXXXXX",
+     "kind": "create",
+     "fields": {
+      "small": false
+     }
+    }
+   ],
+   "expected": "m: Note id=01JA5225SW1FTPAR1TYXXXXXXX: field \"small\" is declared 3 × i8, 12 base64 characters; the write is a boolean"
+  },
+  {
+   "label": "an array",
+   "mutations": [
+    {
+     "model": "Note",
+     "id": "01JA5225SW1FTPAR1TYXXXXXXX",
+     "kind": "create",
+     "fields": {
+      "small": [
+       "a"
+      ]
+     }
+    }
+   ],
+   "expected": "m: Note id=01JA5225SW1FTPAR1TYXXXXXXX: field \"small\" is declared 3 × i8, 12 base64 characters; the write is an array"
+  },
+  {
+   "label": "a set change",
+   "mutations": [
+    {
+     "model": "Note",
+     "id": "01JA5225SW1FTPAR1TYXXXXXXX",
+     "kind": "patch",
+     "fields": {},
+     "stringSetDeltas": {
+      "embedding": {
+       "a": true
+      }
+     }
+    }
+   ],
+   "expected": "m: Note id=01JA5225SW1FTPAR1TYXXXXXXX: field \"embedding\" is declared 3 × f32, 16 base64 characters; the write is a string-set change"
+  },
+  {
+   "label": "an increment",
+   "mutations": [
+    {
+     "model": "Note",
+     "id": "01JA5225SW1FTPAR1TYXXXXXXX",
+     "kind": "increment",
+     "fields": {
+      "embedding": 1
+     }
+    }
+   ],
+   "expected": "m: Note id=01JA5225SW1FTPAR1TYXXXXXXX: field \"embedding\" is declared 3 × f32, 16 base64 characters; the write is an increment"
+  },
+  {
+   "label": "another field's base64",
+   "mutations": [
+    {
+     "model": "Note",
+     "id": "01JA5225SW1FTPAR1TYXXXXXXX",
+     "kind": "create",
+     "fields": {
+      "title": "AACAPw=="
+     }
+    }
+   ],
+   "expected": null
+  },
+  {
+   "label": "also[0] breaks it",
+   "mutations": [
+    {
+     "model": "Note",
+     "id": "01JA5225SW1FTPAR1TYXXXXXXX",
+     "kind": "create",
+     "fields": {
+      "title": "ok"
+     }
+    },
+    {
+     "model": "Note",
+     "id": "01JA5225SW1FTPAR1TYXXXXXXX",
+     "kind": "patch",
+     "fields": {
+      "small": "AAAA"
+     }
+    }
+   ],
+   "expected": "also[0]: Note id=01JA5225SW1FTPAR1TYXXXXXXX: field \"small\" is declared 3 × i8, 12 base64 characters; the write is a string of 4 characters that is not that encoding's canonical base64"
+  }
+ ],
+ "source": "The room's vector rule (js-bao vectorMutationsProblem, which the room and the JS device run) over these declarations, one answer per case."
+}

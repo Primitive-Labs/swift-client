@@ -1,0 +1,98 @@
+# A db3 type whose fields declare literal defaults (#6304). The models'
+# generated files are committed beside this directory and compiled by the
+# client test target; `ReadDefaultedModelHermeticTests` holds them to what
+# swift-bao-codegen writes for this file.
+#
+# `marks` declares a read-defaulted field of each scalar kind: `label`,
+# `score`, `on` (default true), `off` (default false), `due` (a date) and
+# `rank` (required as well). `title` and `count` have no default, `made` a
+# generator default and `tags` a string set default, so none of them is
+# read-defaulted.
+#
+# `marksBare` declares the same fields with no default: the model a build
+# regenerates once a push removed the defaults.
+#
+# `marksKeyed` declares `slug`, required, unique and defaulted, so an upsert
+# on it can be tried from a value whose `slug` the model supplied.
+
+[type]
+name = "marks"
+
+[models.marks]
+class_name = "MarkRecord"
+
+[models.marks.fields.title]
+type = "string"
+
+[models.marks.fields.label]
+type = "string"
+default = "none"
+
+[models.marks.fields.score]
+type = "number"
+default = 7
+
+[models.marks.fields.on]
+type = "boolean"
+default = true
+
+[models.marks.fields.off]
+type = "boolean"
+default = false
+
+[models.marks.fields.due]
+type = "date"
+default = "2026-01-01T00:00:00.000Z"
+
+[models.marks.fields.rank]
+type = "number"
+required = true
+default = 1
+
+[models.marks.fields.made]
+type = "date"
+default = "$now"
+
+[models.marks.fields.count]
+type = "number"
+
+[models.marks.fields.tags]
+type = "stringset"
+default = ["a"]
+
+[models.marksBare]
+class_name = "MarkBareRecord"
+
+[models.marksBare.fields.title]
+type = "string"
+
+[models.marksBare.fields.label]
+type = "string"
+
+[models.marksBare.fields.score]
+type = "number"
+
+[models.marksBare.fields.on]
+type = "boolean"
+
+[models.marksBare.fields.off]
+type = "boolean"
+
+[models.marksBare.fields.due]
+type = "date"
+
+[models.marksBare.fields.rank]
+type = "number"
+required = true
+
+[models.marksKeyed]
+class_name = "MarkKeyRecord"
+
+[models.marksKeyed.fields.title]
+type = "string"
+
+[models.marksKeyed.fields.slug]
+type = "string"
+required = true
+unique = true
+default = "main"

@@ -97,7 +97,7 @@ enum AppleSignInHelpers {
     /// Build the JSON body for `POST /auth/apple/callback`. Required fields
     /// `identityToken` / `nonce` (raw) / `user`; the email/name hints are
     /// included only when Apple provided them (first authorization only).
-    /// `inviteToken` (#1467) rides along only when non-empty — same omission
+    /// `inviteToken` rides along only when non-empty — same omission
     /// rule as the hints — so the server accepts the invitation and resolves
     /// its deferred grants during signup.
     static func callbackBody(
@@ -146,7 +146,7 @@ extension JsBaoClient {
     /// Native Sign in with Apple: presents the system Apple ID sheet,
     /// exchanges the identity token with the server
     /// (`POST /auth/apple/callback`), and lands the session — one call,
-    /// like `signInWithGoogle` (#928).
+    /// like `signInWithGoogle`.
     ///
     /// ```swift
     /// let result = try await client.signInWithApple(presentationAnchor: window)
@@ -159,7 +159,7 @@ extension JsBaoClient {
     /// - Parameters:
     ///   - presentationAnchor: The window to present the sheet from. Pass
     ///     `nil` to let the system pick a default anchor.
-    ///   - inviteToken: Optional invitation token (#1467) — parity with
+    ///   - inviteToken: Optional invitation token — parity with
     ///     `signInWithGoogle(..., inviteToken:)`. When present, the server
     ///     accepts the named invitation during a first sign-in and resolves
     ///     its deferred grants to the new user, so no follow-up

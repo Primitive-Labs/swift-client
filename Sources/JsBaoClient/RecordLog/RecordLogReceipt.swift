@@ -1,0 +1,465 @@
+import CryptoKit
+import Foundation
+
+// The vocabulary of a receipt of chunks: a bulk load's or a checkpoint
+// segment's rows, read from the room's artifacts rather than paged as rows.
+// A port of the receipt types of js-bao's `record-log-client/types.ts`; every
+// stored and wire shape is the JS one, field for field.
+
+/// What a receipt of chunks is: a bulk load's, or a segment's.
+enum RecordLogReceiptKind: String, Sendable, Equatable {
+    case load
+    case segment
+}
+
+/// How a bulk load applies: a merge sets what its lines name; a refresh also
+/// removes every record of its models no line named.
+enum RecordLogLoadMode: String, Sendable, Equatable {
+    case merge
+    case refresh
+}
+
+/// A receipt of chunks that began and has not completed: committed chunks may
+/// hold rows the room does not have, so the next catch-up must be a pointer
+/// receipt or a full replacement.
+struct RecordLogReceipt: Equatable, Sendable {
+    var kind: RecordLogReceiptKind
+    /// The load's session id, or the segment's id.
+    var id: String
+    /// As the marks show a receipt that can be continued (it recorded its
+    /// chunk list's fingerprint): how many chunks it has done, and whether it
+    /// completed them. `nil` otherwise.
+    var done: Int? = nil
+    var completed: Bool? = nil
+}
+
+/// One receipt of chunks begun in a store and not completed, with the store's
+/// count at its last change.
+struct RecordLogReceiptAttempt: Equatable, Sendable {
+    var kind: RecordLogReceiptKind
+    var id: String
+    /// The id the store gave it; its commands carry it.
+    var attempt: String
+    /// The store's change count when the attempt last changed a row.
+    var last: Int
+    /// The fingerprint of the chunk list it receives; `nil` on an attempt an
+    /// earlier build wrote, which is never resumed.
+    var fingerprint: String? = nil
+    /// How many chunks of the list, in list order, it applied or kept.
+    var done: Int? = nil
+    /// A load's completion (the refresh's removal) ran, or a segment's corrections applied.
+    var completed: Bool = false
+    /// The generation its rows are written under; its progress counts only while that generation holds them.
+    var generation: Int? = nil
+    /// The earlier ids this attempt took over: a command naming one is refused.
+    var replaced: [String]? = nil
+
+    /// The attempt as the JS store keeps it in `record_log_state.receipt`.
+    var json: JSONValue {
+        var object: [String: JSONValue] = [
+            "kind": .string(kind.rawValue), "id": .string(id), "attempt": .string(attempt), "last": .number(Double(last)),
+        ]
+        if let fingerprint { object["fingerprint"] = .string(fingerprint) }
+        if let done { object["done"] = .number(Double(done)) }
+        if completed { object["completed"] = .bool(true) }
+        if let generation { object["generation"] = .number(Double(generation)) }
+        if let replaced { object["replaced"] = .array(replaced.map(JSONValue.string)) }
+        return .object(object)
+    }
+}
+
+/// A receipt attempt taken over (``RecordLogRules/resumeReceipt(_:fingerprint:chunks:)``):
+/// its new id and how far it got.
+struct RecordLogReceiptResume: Equatable, Sendable {
+    /// The new id; the old one is refused from now.
+    var attempt: String
+    /// The chunks of the list it applied or kept, in list order.
+    var done: Int
+    /// The chunks and the load's completion or the segment's corrections are done.
+    var completed: Bool
+    /// The generation its rows are written under.
+    var generation: Int
+}
+
+/// What a store answers when a receipt begins: the attempt's id, and how far
+/// it already got when it was resumed (the JS store's `RecordLogReceiptStart`).
+struct RecordLogReceiptStart: Equatable, Sendable {
+    var cursor: Int
+    var attempt: String
+    /// The chunks of the list already applied or kept, in list order: 0 for a fresh attempt.
+    var done: Int = 0
+    /// Only the remainder pages are left.
+    var completed: Bool = false
+    /// For a resumed segment, the replacement generation it continues under.
+    var generation: Int? = nil
+    /// For a resumed segment, the segment the rows were last replaced from, read in the same transaction.
+    var held: RecordLogHeldSegment? = nil
+}
+
+/// The receipts of chunks a store has begun and not completed, persisted with
+/// the document. Each attempt's changes are made right by its own completion,
+/// a later completion of the same load or segment, or a full replacement that
+/// began after its last change; until then the confirmed rows may hold what
+/// the room does not.
+struct RecordLogReceiptState: Equatable, Sendable {
+    /// Counts the changes receipts made; each attempt keeps the count at its last.
+    var n: Int
+    /// The count when the full replacement in progress began, or `nil`.
+    var since: Int?
+    var attempts: [RecordLogReceiptAttempt]
+
+    /// The JSON the JS store keeps in `record_log_state.receipt`.
+    var json: JSONValue {
+        .object([
+            "n": .number(Double(n)),
+            "since": since.map { .number(Double($0)) } ?? .null,
+            "attempts": .array(attempts.map(\.json)),
+        ])
+    }
+
+    init(n: Int = 0, since: Int? = nil, attempts: [RecordLogReceiptAttempt] = []) {
+        self.n = n
+        self.since = since
+        self.attempts = attempts
+    }
+
+    /// The stored state; a bare `{kind, id}` an earlier build wrote is one
+    /// attempt nothing completes but a full replacement.
+    init?(json: JSONValue?) {
+        guard let json, case .object = json else { return nil }
+        if let attempts = json["attempts"]?.arrayValue {
+            self.init(
+                n: json["n"]?.wholeNumber ?? 0,
+                since: json["since"]?.wholeNumber,
+                attempts: attempts.compactMap { item in
+                    guard let kind = item["kind"]?.stringValue.flatMap(RecordLogReceiptKind.init(rawValue:)),
+                          let id = item["id"]?.stringValue
+                    else { return nil }
+                    return RecordLogReceiptAttempt(
+                        kind: kind, id: id, attempt: item["attempt"]?.stringValue ?? "", last: item["last"]?.wholeNumber ?? 0,
+                        fingerprint: item["fingerprint"]?.stringValue, done: item["done"]?.wholeNumber,
+                        completed: item["completed"]?.boolValue == true, generation: item["generation"]?.wholeNumber,
+                        replaced: item["replaced"]?.arrayValue?.compactMap(\.stringValue)
+                    )
+                }
+            )
+            return
+        }
+        guard let kind = json["kind"]?.stringValue.flatMap(RecordLogReceiptKind.init(rawValue:)),
+              let id = json["id"]?.stringValue, !id.isEmpty
+        else { return nil }
+        self.init(attempts: [RecordLogReceiptAttempt(kind: kind, id: id, attempt: "", last: 0)])
+    }
+
+    /// The latest attempt begun and not completed.
+    var latest: RecordLogReceipt? {
+        attempts.last.map { RecordLogReceipt(kind: $0.kind, id: $0.id) }
+    }
+
+    /// The latest attempt begun and not completed, as the marks show it: with
+    /// its progress when it can be continued.
+    var latestMark: RecordLogReceipt? {
+        attempts.last.map { a in
+            a.fingerprint == nil
+                ? RecordLogReceipt(kind: a.kind, id: a.id)
+                : RecordLogReceipt(kind: a.kind, id: a.id, done: a.done ?? 0, completed: a.completed)
+        }
+    }
+}
+
+/// The object a segment's chunk was written as: `{segmentId}/{model}/{index}`
+/// of the segment that wrote it (the chunk's `source`, else the segment's own).
+/// Two segments that list one object list the same rows.
+func recordLogSegmentChunkObject(segmentId: String, model: String, index: Int, source: String?) -> String {
+    "\(source ?? segmentId)/\(model)/\(index)"
+}
+
+/// One chunk of the segment a store last received, as its marker records it.
+struct RecordLogHeldSegmentChunk: Equatable, Sendable {
+    /// The object it was read from (``recordLogSegmentChunkObject(segmentId:model:index:source:)``).
+    var object: String
+    var model: String
+    var index: Int
+    var firstId: String
+    var lastId: String
+    var rows: Int
+    var sha256: String
+}
+
+/// The segment a store's confirmed rows were last replaced from, with its
+/// chunks: a later segment that lists one of the same objects may keep those
+/// rows instead of downloading them again. Stored in
+/// `record_log_state.segment` as the JS store keeps it.
+struct RecordLogHeldSegment: Equatable, Sendable {
+    var segmentId: String
+    var chunks: [RecordLogHeldSegmentChunk]
+
+    /// The JSON the JS store keeps in `record_log_state.segment`.
+    var json: JSONValue {
+        .object([
+            "segmentId": .string(segmentId),
+            "chunks": .array(chunks.map { chunk in
+                .object([
+                    "object": .string(chunk.object), "model": .string(chunk.model), "index": .number(Double(chunk.index)),
+                    "firstId": .string(chunk.firstId), "lastId": .string(chunk.lastId), "rows": .number(Double(chunk.rows)),
+                    "sha256": .string(chunk.sha256),
+                ])
+            }),
+        ])
+    }
+
+    init(segmentId: String, chunks: [RecordLogHeldSegmentChunk]) {
+        self.segmentId = segmentId
+        self.chunks = chunks
+    }
+
+    /// The stored marker, or `nil` when it is not one.
+    init?(json: JSONValue?) {
+        guard let json, let segmentId = json["segmentId"]?.stringValue, let list = json["chunks"]?.arrayValue else { return nil }
+        let chunks = list.compactMap { item -> RecordLogHeldSegmentChunk? in
+            guard let object = item["object"]?.stringValue, let model = item["model"]?.stringValue,
+                  let index = item["index"]?.wholeNumber, let firstId = item["firstId"]?.stringValue,
+                  let lastId = item["lastId"]?.stringValue, let rows = item["rows"]?.wholeNumber,
+                  let sha256 = item["sha256"]?.stringValue
+            else { return nil }
+            return RecordLogHeldSegmentChunk(
+                object: object, model: model, index: index, firstId: firstId, lastId: lastId, rows: rows, sha256: sha256
+            )
+        }
+        guard chunks.count == list.count else { return nil }
+        self.init(segmentId: segmentId, chunks: chunks)
+    }
+}
+
+/// What keeping a chunk of the held segment answers: the rows kept and their
+/// range, or that it kept nothing.
+enum RecordLogKeepOutcome: Equatable, Sendable {
+    case kept(rows: Int, ranges: [RecordLogIdRange])
+    case mismatch
+}
+
+/// One line of a bulk load's chunk: a record id and the merge patch it applies.
+struct RecordLogLoadLine: Equatable, Sendable {
+    var id: String
+    /// The fields it sets (`null` included); `_deleted: true` deletes the record.
+    var patch: [String: JSONValue]
+}
+
+/// One line of a segment's corrections: a record's row after the segment
+/// began, or `nil` when it was deleted.
+struct RecordLogCorrection: Equatable, Sendable {
+    var model: String
+    var id: String
+    var row: RecordLogRow?
+}
+
+/// A command of a receipt whose attempt is no longer the store's: a full
+/// replacement or its own completion already made its changes right, so a
+/// later change of it would go uncorrected.
+struct RecordLogStaleReceiptError: Error, Equatable, CustomStringConvertible {
+    /// The attempt the command carried.
+    let attempt: String
+
+    var description: String { "The receipt attempt \(attempt) is no longer in progress in the store." }
+}
+
+/// A command of a full replacement arrived under a generation the store no
+/// longer replaces under: another session of the store began one of its own.
+/// Nothing of the command was applied.
+struct RecordLogStaleReplacementError: Error, Equatable, CustomStringConvertible {
+    /// The generation the command carried.
+    let generation: Int
+    /// The one the store replaces under now, or `nil`.
+    let current: Int?
+
+    var description: String {
+        "The replacement under generation \(generation) was overtaken (the store is now at \(current.map(String.init) ?? "none"))."
+    }
+}
+
+// MARK: - Pointers
+
+/// Where a pointer's objects are read: an origin-relative grant path (the
+/// grant inside it, no other credential) and when it stops working.
+struct RecordLogDownload: Equatable, Sendable {
+    var path: String
+    var expiresAt: Double?
+
+    init(path: String, expiresAt: Double? = nil) {
+        self.path = path
+        self.expiresAt = expiresAt
+    }
+
+    init?(json: JSONValue?) {
+        guard let path = json?["path"]?.stringValue, !path.isEmpty else { return nil }
+        self.init(path: path, expiresAt: json?["expiresAt"]?.numberValue)
+    }
+}
+
+/// A completed bulk load as the room points a client at it (the `record.load`
+/// `complete` frame, or the `load` catch-up form): its log range and counts,
+/// and the grant its manifest and chunks are read through. The manifest is at
+/// `download.path`; each chunk at `download.path + "/" + chunk.path`.
+struct RecordLogLoadPointer: Equatable, Sendable {
+    var sessionId: String
+    var mode: RecordLogLoadMode
+    var models: [String]
+    var epoch: Int
+    var k: Int
+    /// The first and last log numbers it wrote; `nil` for a load that wrote no row.
+    var firstLsn: Int?
+    var lastLsn: Int?
+    var rows: Int
+    var refusedRows: Int
+    var download: RecordLogDownload?
+    /// How many chunks the manifest lists.
+    var chunkCount: Int
+
+    init?(json: JSONValue?) {
+        guard let json, let sessionId = json["sessionId"]?.stringValue, !sessionId.isEmpty else { return nil }
+        self.sessionId = sessionId
+        mode = RecordLogLoadMode(rawValue: json["mode"]?.stringValue ?? "") ?? .merge
+        models = (json["models"]?.arrayValue ?? []).compactMap(\.stringValue)
+        epoch = json["epoch"]?.wholeNumber ?? RecordLogTransport.firstEpoch
+        k = json["k"]?.wholeNumber ?? 0
+        firstLsn = json["firstLsn"]?.wholeNumber
+        lastLsn = json["lastLsn"]?.wholeNumber
+        rows = json["rows"]?.wholeNumber ?? 0
+        refusedRows = json["refusedRows"]?.wholeNumber ?? 0
+        download = RecordLogDownload(json: json["download"])
+        chunkCount = json["chunkCount"]?.wholeNumber ?? 0
+    }
+}
+
+/// The room's checkpoint segment as it points a far-behind client at it: the
+/// rows at its start `lsn` (B), the corrections through `completedLsn` (C),
+/// and the grant its chunks are read through.
+struct RecordLogSegmentPointer: Equatable, Sendable {
+    var segmentId: String
+    var lsn: Int
+    var completedLsn: Int
+    var rows: Int
+    var download: RecordLogDownload?
+    var chunks: [RecordLogChunkDescriptor]
+    var corrections: RecordLogCorrectionsDescriptor
+
+    /// The pointer, or `nil` when it lacks an id, a log number, or a chunk or
+    /// the corrections lack a field their reader checks.
+    init?(json: JSONValue?) {
+        guard let json, let segmentId = json["segmentId"]?.stringValue, !segmentId.isEmpty,
+              let lsn = json["lsn"]?.wholeNumber, let completedLsn = json["completedLsn"]?.wholeNumber,
+              let list = json["chunks"]?.arrayValue, let corrections = json["corrections"]
+        else { return nil }
+        let chunks = list.enumerated().compactMap { RecordLogChunkDescriptor(json: $1, position: $0) }
+        guard chunks.count == list.count,
+              let rows = corrections["rows"]?.wholeNumber, let bytes = corrections["bytes"]?.wholeNumber,
+              let rawBytes = corrections["rawBytes"]?.wholeNumber, let sha256 = corrections["sha256"]?.stringValue,
+              let path = corrections["path"]?.stringValue
+        else { return nil }
+        self.segmentId = segmentId
+        self.lsn = lsn
+        self.completedLsn = completedLsn
+        self.rows = json["rows"]?.wholeNumber ?? chunks.reduce(0) { $0 + $1.rows }
+        self.download = RecordLogDownload(json: json["download"])
+        self.chunks = chunks
+        self.corrections = RecordLogCorrectionsDescriptor(rows: rows, bytes: bytes, rawBytes: rawBytes, sha256: sha256, path: path)
+    }
+}
+
+extension RecordLogChunkDescriptor {
+    /// A manifest's or a segment pointer's chunk entry, or `nil` when it lacks
+    /// a field the reader checks. `index` defaults to the entry's position.
+    init?(json: JSONValue, position: Int) {
+        guard let model = json["model"]?.stringValue, let path = json["path"]?.stringValue,
+              let rows = json["rows"]?.wholeNumber, rows >= 0, let bytes = json["bytes"]?.wholeNumber, bytes >= 0,
+              let rawBytes = json["rawBytes"]?.wholeNumber, rawBytes >= 0, let sha256 = json["sha256"]?.stringValue,
+              let firstId = json["firstId"]?.stringValue, let lastId = json["lastId"]?.stringValue
+        else { return nil }
+        self.init(
+            model: model, index: json["index"]?.wholeNumber ?? position, path: path, rows: rows, bytes: bytes,
+            rawBytes: rawBytes, sha256: sha256, firstId: firstId, lastId: lastId,
+            source: json["source"]?["segmentId"]?.stringValue
+        )
+    }
+
+    /// Whether the path stays under the grant it is joined to: never absolute,
+    /// never a `..` segment, never empty.
+    var pathIsRelative: Bool {
+        !path.isEmpty && !path.hasPrefix("/") && !path.split(separator: "/", omittingEmptySubsequences: false).contains("..")
+    }
+}
+
+/// Why a receipt of chunks cannot go on: the session opens again from the cursor.
+struct RecordLogReceiptFailure: Error, CustomStringConvertible {
+    let reason: String
+    init(_ reason: String) { self.reason = reason }
+    var description: String { reason }
+}
+
+/// A load's manifest as a receipt reads it: its chunks in manifest order,
+/// checked against the pointer (an ingest manifest of the same session listing
+/// `chunkCount` chunks, every descriptor complete, every path under the grant).
+func recordLogLoadManifest(_ data: Data, pointer: RecordLogLoadPointer) throws -> [RecordLogChunkDescriptor] {
+    guard let manifest = RecordLogJSON.parse(String(decoding: data, as: UTF8.self)), case .object = manifest else {
+        throw RecordLogReceiptFailure("the manifest is not JSON")
+    }
+    guard manifest["kind"]?.stringValue == "ingest" else { throw RecordLogReceiptFailure("the manifest is not a load's") }
+    let sessionId = manifest["sessionId"]?.stringValue ?? "no"
+    guard sessionId == pointer.sessionId else {
+        throw RecordLogReceiptFailure("the manifest is session \(sessionId)'s")
+    }
+    guard let list = manifest["chunks"]?.arrayValue, list.count == pointer.chunkCount else {
+        let listed = manifest["chunks"]?.arrayValue.map { String($0.count) } ?? "no"
+        throw RecordLogReceiptFailure("the manifest lists \(listed) chunks, the pointer \(pointer.chunkCount)")
+    }
+    return try list.enumerated().map { position, item in
+        guard let chunk = RecordLogChunkDescriptor(json: item, position: position) else {
+            throw RecordLogReceiptFailure("a manifest chunk lacks its descriptor")
+        }
+        guard chunk.pathIsRelative else {
+            throw RecordLogReceiptFailure("a manifest chunk's path leaves the grant")
+        }
+        return chunk
+    }
+}
+
+// MARK: - Fingerprint
+
+/// The chunk list a receipt receives: a load's manifest chunks, or a
+/// segment's chunks and corrections.
+enum RecordLogFingerprintInput: Sendable {
+    case load([RecordLogChunkDescriptor])
+    case segment(segmentId: String, chunks: [RecordLogChunkDescriptor], corrections: RecordLogCorrectionsDescriptor)
+}
+
+/// The canonical text a fingerprint digests, as js-bao's
+/// `recordLogReceiptFingerprintText` writes it: `load` or `segment`, then one
+/// line per chunk in list order with every field its reader checks or the
+/// held segment keeps, joined by tabs (a segment's lines lead with the chunk's
+/// object), then for a segment a line of its corrections.
+func recordLogReceiptFingerprintText(_ input: RecordLogFingerprintInput) -> String {
+    switch input {
+    case let .load(chunks):
+        let lines = chunks.map { c in
+            [c.model, c.path, String(c.rows), String(c.bytes), String(c.rawBytes), c.sha256, c.firstId, c.lastId].joined(separator: "\t")
+        }
+        return "load\n" + lines.joined(separator: "\n")
+    case let .segment(segmentId, chunks, k):
+        let lines = chunks.map { c in
+            [
+                recordLogSegmentChunkObject(segmentId: segmentId, model: c.model, index: c.index, source: c.source), c.model,
+                String(c.index), c.path, String(c.rows), String(c.bytes), String(c.rawBytes), c.sha256, c.firstId, c.lastId,
+            ].joined(separator: "\t")
+        }
+        let corrections = [k.path, String(k.rows), String(k.bytes), String(k.rawBytes), k.sha256].joined(separator: "\t")
+        return "segment\n" + lines.joined(separator: "\n") + "\n" + corrections
+    }
+}
+
+/// The lowercase hex SHA-256 of ``recordLogReceiptFingerprintText(_:)``: two
+/// lists that differ in any field of any chunk, in their order, or in the
+/// corrections have different fingerprints. The JS client answers the same
+/// hex for the same list.
+func recordLogReceiptFingerprint(_ input: RecordLogFingerprintInput) -> String {
+    SHA256.hash(data: Data(recordLogReceiptFingerprintText(input).utf8)).map { String(format: "%02x", $0) }.joined()
+}

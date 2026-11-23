@@ -9,6 +9,7 @@ import XCTest
 /// system groups (`document-group-permissions-controller.ts`) before the
 /// client could ask for them, and the option could not return a system group
 /// at any input. JS has sent the param since #506.
+@available(*, deprecated)
 final class DocumentsGroupPermissionsIncludeSystemTests: XCTestCase {
 
     private func makeAPI(_ transport: RecordingTransport) -> DocumentsAPI {

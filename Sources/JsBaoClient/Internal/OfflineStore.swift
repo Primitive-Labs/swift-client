@@ -3,7 +3,7 @@ import Foundation
 /// Manages offline storage for metadata, grants, analytics, and JWT persistence.
 /// Replaces IndexedDB-based OfflineStore from the JS client with SQLite-backed storage.
 ///
-/// ## An actor since #1993, Phase D2
+/// ## An actor (Phase D2)
 ///
 /// This is one of the async-domain service managers: every operation on it
 /// already awaited the storage provider, so there was nothing synchronous worth
@@ -20,7 +20,13 @@ public actor OfflineStore {
     private var isInitialized = false
 
     // Store names matching JS constants
-    static let storeMetaDocs = "meta"
+    /// The store every user's document metadata shared before per-user
+    /// storage, keyed by document id alone. Quarantined: nothing reads it,
+    /// and only a `wipeLocal` logout (`clearAllDocumentData`) clears it. A row in it
+    /// carries no owner, and the first user to sign in after an upgrade is
+    /// not necessarily the one who wrote it, so loading or adopting it would
+    /// hand one user's pending creates to another.
+    static let legacyStoreMetaDocs = "meta"
     static let storeGrants = "grants"
     static let storeAnalytics = "analytics"
     static let storeAnalyticsMeta = "analyticsMeta"
@@ -48,7 +54,10 @@ public actor OfflineStore {
 
     // MARK: - Initialization
 
-    /// Bind the app+user database, at most once per namespace.
+    /// Bind the storage provider for an app and user, at most once per
+    /// namespace. A `SQLiteStorageProvider` given a path opens that one file
+    /// for every namespace, so binding does not separate users; the
+    /// metadata store name does (`metadataStore(appId:userId:)`).
     ///
     /// The three steps are the same three the `NSLock` version had — read the
     /// decision from isolated state, `await` the provider's `initialize` with
@@ -73,12 +82,34 @@ public actor OfflineStore {
 
     // MARK: - Metadata Operations
 
+    /// The document metadata of one app and user, keyed by document id. The
+    /// app's SQLite file is shared by every user who signs in on the device,
+    /// so the store name is what keeps one user's rows (pending creates
+    /// among them) from loading for another. Same naming as the upload
+    /// queue's stores; the JS client gets the same split from its per-user
+    /// database.
+    ///
+    /// No row is persisted without an owner: with an empty `userId` every
+    /// metadata operation below writes nothing and reads nothing, as the JS
+    /// client's `if (!ctx.userId) return` guard does. A write refused that
+    /// way reports `false`, and `DocumentManager` replays it under the user
+    /// the client binds. The provider is still bound first, as before: the
+    /// document content store and the other stores in the file rely on a
+    /// metadata call having opened it.
+    static func metadataStore(appId: String, userId: String) -> String {
+        "\(metadataStorePrefix)\(appId):\(userId)"
+    }
+
+    /// The prefix every user's metadata store name starts with.
+    static let metadataStorePrefix = "meta:"
+
     public func loadAllMetadata(appId: String, userId: String) async throws -> [LocalMetadataEntry] {
         try await ensureMetadataDb(appId: appId, userId: userId)
+        guard !userId.isEmpty else { return [] }
         guard let provider = storageProvider else { return [] }
 
         var results: [LocalMetadataEntry] = []
-        try await provider.iterate(store: Self.storeMetaDocs) { (record: StorageRecord<LocalMetadataEntry>) in
+        try await provider.iterate(store: Self.metadataStore(appId: appId, userId: userId)) { (record: StorageRecord<LocalMetadataEntry>) in
             results.append(record.value)
         }
         return results
@@ -93,28 +124,34 @@ public actor OfflineStore {
     /// With no provider bound this silently wrote nothing, which on a cold
     /// start is how a `documents.create` — metadata-only since #3200 — could
     /// return successfully and leave no durable trace at all. The caller uses
-    /// the answer to remember the row and replay it when storage binds.
+    /// the answer to remember the row and replay it when storage binds. A
+    /// write with no user is not taken either: the row would have no owner.
     @discardableResult
     public func putMetadataReporting(
         appId: String, userId: String, record: LocalMetadataEntry
     ) async throws -> Bool {
         try await ensureMetadataDb(appId: appId, userId: userId)
+        guard !userId.isEmpty else { return false }
         guard let provider = storageProvider else { return false }
-        try await provider.put(store: Self.storeMetaDocs, key: record.documentId, value: record, metadata: nil)
+        try await provider.put(
+            store: Self.metadataStore(appId: appId, userId: userId), key: record.documentId, value: record, metadata: nil
+        )
         return true
     }
 
     public func putMetadataBatch(appId: String, userId: String, records: [LocalMetadataEntry]) async throws {
         try await ensureMetadataDb(appId: appId, userId: userId)
+        guard !userId.isEmpty else { return }
         guard let provider = storageProvider else { return }
         let items = records.map { (key: $0.documentId, value: $0, metadata: nil as [String: String]?) }
-        try await provider.putBatch(store: Self.storeMetaDocs, records: items)
+        try await provider.putBatch(store: Self.metadataStore(appId: appId, userId: userId), records: items)
     }
 
     public func deleteMetadata(appId: String, userId: String, documentId: String) async throws {
         try await ensureMetadataDb(appId: appId, userId: userId)
+        guard !userId.isEmpty else { return }
         guard let provider = storageProvider else { return }
-        try await provider.delete(store: Self.storeMetaDocs, key: documentId)
+        try await provider.delete(store: Self.metadataStore(appId: appId, userId: userId), key: documentId)
     }
 
     public func getMetadata(appId: String, userId: String, documentId: String) async throws -> LocalMetadataEntry? {
@@ -125,35 +162,72 @@ public actor OfflineStore {
     ///
     /// `nil` means two different things on a cold start: "no row for this
     /// document" and "no provider bound yet, so nothing could be read". The
-    /// local-only classification (#2691) has to tell them apart — the second is
+    /// local-only classification has to tell them apart — the second is
     /// *unknown*, not "ordinary", and a document whose classification is
-    /// unknown may not have its content put on the wire.
+    /// unknown may not have its content put on the wire. With no user bound
+    /// yet there is no store to read, which is unknown in the same way.
     public func readMetadata(
         appId: String,
         userId: String,
         documentId: String
     ) async throws -> (entry: LocalMetadataEntry?, readable: Bool) {
         try await ensureMetadataDb(appId: appId, userId: userId)
+        guard !userId.isEmpty else { return (nil, false) }
         guard let provider = storageProvider else { return (nil, false) }
-        let record: StorageRecord<LocalMetadataEntry>? = try await provider.get(store: Self.storeMetaDocs, key: documentId)
+        let record: StorageRecord<LocalMetadataEntry>? = try await provider.get(
+            store: Self.metadataStore(appId: appId, userId: userId), key: documentId
+        )
         return (record?.value, true)
     }
 
-    /// Store-level purge of ALL locally persisted document data for this
-    /// app's SQLite database: both the metadata store (`meta`) and the Yjs
-    /// CRDT store (`yjs_docs`). Both are truncated directly on disk
-    /// (`clear` → `DELETE FROM …`), independent of any in-memory document
-    /// index — so rows for documents that were never loaded into memory are
-    /// removed too. The single app-wide database keys these stores by
-    /// `documentId` alone (not by `userId`), so a per-document delete driven
-    /// by the current user's in-memory index cannot enforce a fresh-client
-    /// boundary. This does, by clearing the on-disk tables outright. Fast
-    /// no-op on empty tables (`DELETE FROM` an empty table is instant).
+    /// Store-level purge of the locally persisted document data a
+    /// `wipeLocal` logout removes: this user's metadata store, the unscoped
+    /// pre-#4829 `meta` store, and this user's rows in the Yjs CRDT store
+    /// (`yjs_docs`). Each is purged directly on disk, independent of any
+    /// in-memory document index — so rows for documents that were never
+    /// loaded into memory are removed too. Other users' metadata stores are
+    /// left in place, as the JS client's wipe leaves other users' databases.
+    ///
+    /// `yjs_docs` is keyed by `documentId` alone and shared by every user of
+    /// the file, so its rows are told apart by the metadata stores: a row
+    /// another user's store lists is theirs too and stays, and every other
+    /// row goes — the ones only this user listed, and the ones no user lists
+    /// (written before per-user storage, or left without a row), so a prior account's
+    /// content cannot hydrate a reused document id. Clearing the table
+    /// outright took another user's unsynced pending creates with it.
+    /// A failed read of the stores throws before any row is deleted, since a
+    /// partial list would pass another user's rows off as unowned.
     public func clearAllDocumentData(appId: String, userId: String) async throws {
         try await ensureMetadataDb(appId: appId, userId: userId)
         guard let provider = storageProvider else { return }
-        try await provider.clear(store: Self.storeMetaDocs)
-        try await provider.clear(store: YjsSQLitePersistence.store)
+        let ownStore = Self.metadataStore(appId: appId, userId: userId)
+        // The content goes first: until the metadata stores are cleared they
+        // still say which rows this wipe owns, so an interrupted wipe can run
+        // again.
+        for documentId in try await contentRemovedByWipe(of: ownStore, provider: provider) {
+            try await provider.delete(store: YjsSQLitePersistence.store, key: documentId)
+        }
+        try await provider.clear(store: ownStore)
+        try await provider.clear(store: Self.legacyStoreMetaDocs)
+    }
+
+    /// The `yjs_docs` rows a wipe of the metadata store `ownStore` removes:
+    /// every row no other user's metadata store lists. A provider that cannot
+    /// name its stores cannot say what the other users stored, so with one
+    /// only the rows `ownStore` and the legacy store list go.
+    private func contentRemovedByWipe(of ownStore: String, provider: StorageProvider) async throws -> [String] {
+        let content = try await provider.keys(store: YjsSQLitePersistence.store)
+        guard !content.isEmpty else { return [] }
+        guard let lister = provider as? StoreNameListing else {
+            var listed = Set(try await provider.keys(store: ownStore))
+            listed.formUnion(try await provider.keys(store: Self.legacyStoreMetaDocs))
+            return content.filter(listed.contains)
+        }
+        var kept = Set<String>()
+        for store in try await lister.storeNames(withPrefix: Self.metadataStorePrefix) where store != ownStore {
+            kept.formUnion(try await provider.keys(store: store))
+        }
+        return content.filter { !kept.contains($0) }
     }
 
     // MARK: - Grant Operations
@@ -181,8 +255,8 @@ public actor OfflineStore {
 
     /// Persist the buffered analytics events.
     ///
-    /// The payload is `[[String: JSONValue]]`, not `[[String: Any]]` (#1993,
-    /// Phase D2): the events cross this type's new isolation boundary, and an
+    /// The payload is `[[String: JSONValue]]`, not `[[String: Any]]`:
+    /// the events cross this type's new isolation boundary, and an
     /// `Any` cannot do that under Swift 6. `JSONValue` is also what the events
     /// already had to be — they are serialized to JSON on the very next line —
     /// so the type now states a constraint the storage format always imposed.
@@ -230,6 +304,88 @@ public actor OfflineStore {
         return record?.value
     }
 
+    // MARK: - Blob upload queue
+
+    /// The upload records of one app and user: one `PersistedUploadRecord`
+    /// per queue id. The Swift counterpart of the JS client's
+    /// `js-bao:blobs:<app>:<user>` database and its `uploads` store.
+    static func blobUploadsStore(appId: String, userId: String) -> String {
+        "blobUploads:\(appId):\(userId)"
+    }
+
+    /// The queued bytes of one app and user, keyed `<documentId>::<blobId>`.
+    static func blobUploadBytesStore(appId: String, userId: String) -> String {
+        "blobUploadBytes:\(appId):\(userId)"
+    }
+
+    static func blobUploadBytesKey(documentId: String, blobId: String) -> String {
+        "\(documentId)::\(blobId)"
+    }
+
+    /// Bind the database for an upload write or read without re-binding it.
+    ///
+    /// The stores name their app and user, so a write for an upload's owner
+    /// does not need the database bound to that owner, and it must not move
+    /// it: `MemoryStorageProvider.initialize` empties every store, so a
+    /// re-bind for another user would take the signed-in user's rows with it.
+    private func ensureBlobUploadDb(appId: String, userId: String) async throws {
+        if isInitialized { return }
+        try await ensureMetadataDb(appId: appId, userId: userId)
+    }
+
+    /// Write an upload's record, and its bytes when given. The bytes go
+    /// first, so a record is never stored without them.
+    func putBlobUpload(appId: String, userId: String, record: PersistedUploadRecord, bytes: Data?) async throws {
+        try await ensureBlobUploadDb(appId: appId, userId: userId)
+        guard let provider = storageProvider else { return }
+        if let bytes {
+            try await provider.put(
+                store: Self.blobUploadBytesStore(appId: appId, userId: userId),
+                key: Self.blobUploadBytesKey(documentId: record.documentId, blobId: record.blobId),
+                value: bytes,
+                metadata: nil
+            )
+        }
+        try await provider.put(
+            store: Self.blobUploadsStore(appId: appId, userId: userId), key: record.queueId, value: record, metadata: nil
+        )
+    }
+
+    /// Delete an upload's record, then its bytes.
+    func deleteBlobUpload(appId: String, userId: String, queueId: String, documentId: String, blobId: String) async throws {
+        try await ensureBlobUploadDb(appId: appId, userId: userId)
+        guard let provider = storageProvider else { return }
+        try await provider.delete(store: Self.blobUploadsStore(appId: appId, userId: userId), key: queueId)
+        try await provider.delete(
+            store: Self.blobUploadBytesStore(appId: appId, userId: userId),
+            key: Self.blobUploadBytesKey(documentId: documentId, blobId: blobId)
+        )
+    }
+
+    /// Every upload record of one app and user. A row that does not decode
+    /// as a record is skipped; the rest load.
+    func loadBlobUploads(appId: String, userId: String) async throws -> [PersistedUploadRecord] {
+        try await ensureBlobUploadDb(appId: appId, userId: userId)
+        guard let provider = storageProvider else { return [] }
+        let store = Self.blobUploadsStore(appId: appId, userId: userId)
+        var records: [PersistedUploadRecord] = []
+        for key in try await provider.keys(store: store) {
+            let row: StorageRecord<PersistedUploadRecord>? = try? await provider.get(store: store, key: key)
+            if let record = row?.value { records.append(record) }
+        }
+        return records
+    }
+
+    func loadBlobUploadBytes(appId: String, userId: String, documentId: String, blobId: String) async throws -> Data? {
+        try await ensureBlobUploadDb(appId: appId, userId: userId)
+        guard let provider = storageProvider else { return nil }
+        let row: StorageRecord<Data>? = try await provider.get(
+            store: Self.blobUploadBytesStore(appId: appId, userId: userId),
+            key: Self.blobUploadBytesKey(documentId: documentId, blobId: blobId)
+        )
+        return row?.value
+    }
+
     // MARK: - JWT Persistence
 
     public func loadPersistedJwt(appId: String, namespace: String) async throws -> PersistedJwtRecord? {
@@ -259,6 +415,42 @@ public actor OfflineStore {
         let storeKey = "auth:\(appId):\(namespace)"
         try await provider.initialize(namespace: storeKey)
         try await provider.delete(store: Self.storeAuth, key: "session")
+    }
+
+    // MARK: - Client version policy
+
+    /// The store and key of the app's last fetched version policy: beside the
+    /// session in the auth store, which no sign-out clears, because the policy
+    /// is public app-level data and not the user's.
+    private static let clientVersionsKey = "client-versions"
+
+    /// The auth provider, bound for use. The provider is initialized only when
+    /// it is not ready yet: initializing a ready memory provider empties it.
+    private func readyAuthProvider(appId: String) async throws -> StorageProvider? {
+        guard let provider = authStorageProvider ?? storageProvider else { return nil }
+        if !provider.isReady() {
+            try await provider.initialize(namespace: "auth:\(appId):\(Self.clientVersionsKey)")
+        }
+        return provider
+    }
+
+    /// The last version policy stored for `appId`, or `nil`. An entry that
+    /// sets none of the policy keys (stored before such entries were dropped)
+    /// reads as no table.
+    func loadClientVersions(appId: String) async -> ClientVersionPolicyRecord? {
+        guard let provider = try? await readyAuthProvider(appId: appId) else { return nil }
+        let row: StorageRecord<ClientVersionPolicyRecord>? = try? await provider.get(
+            store: Self.storeAuth, key: "\(Self.clientVersionsKey):\(appId)"
+        )
+        return row?.value.droppingEmptyEntries()
+    }
+
+    /// Store `record` as the version policy for `appId`, replacing the last.
+    func persistClientVersions(appId: String, record: ClientVersionPolicyRecord) async {
+        guard let provider = try? await readyAuthProvider(appId: appId) else { return }
+        try? await provider.put(
+            store: Self.storeAuth, key: "\(Self.clientVersionsKey):\(appId)", value: record, metadata: nil
+        )
     }
 
     // MARK: - Lifecycle
@@ -315,16 +507,17 @@ public struct LocalMetadataEntry: Codable, Sendable {
     /// `documents.create({ metadata })` / `createDocument(metadata:)`.
     /// Stashed locally so `commitOfflineCreate` can replay it into the
     /// server POST body instead of dropping it. Mirrors js-bao's
-    /// `LocalMetadataEntry.docMetadata` (#673).
+    /// `LocalMetadataEntry.docMetadata`.
     public var docMetadata: JSONValue?
-    /// The document's format, once this client knows it (#3436): `2` for a
-    /// large document, `1` for an ordinary one.
+    /// The document's format, once this client knows it: `3` for a record-log
+    /// document, `1` for an ordinary one. `2` names a large document, which is
+    /// no longer served: an open of one is refused.
     ///
     /// `nil` is "not known yet" — a document this client has never completed a
     /// handshake for — and it is a THIRD state, not a synonym for 1. The
     /// socket's receive limit is raised for anything that is not known to be
-    /// format 1, because a first open learns the format from `epoch.info`,
-    /// which is the very frame the limit protects. A row written before this
+    /// format 1, because a first open may learn it in a frame the limit
+    /// protects. A row written before this
     /// field existed decodes with it absent, which is the same state.
     public var documentFormat: Int?
 
@@ -359,7 +552,7 @@ public struct LocalMetadataEntry: Codable, Sendable {
     /// Mirrors js-bao `grantedAt`.
     public var grantedAt: String?
     /// ISO-8601 timestamp of when a pending create actually committed to the
-    /// server. Mirrors js-bao `createCommittedAt`, the #1953 GSI-lag bridge:
+    /// server. Mirrors js-bao `createCommittedAt`, the GSI-lag bridge:
     /// the owned-docs merge recency-gates on the later of this and
     /// `createdAt`, so a slow-to-commit offline create is still bridged while
     /// the server's `permissionsForUser` GSI catches up.
@@ -368,6 +561,15 @@ public struct LocalMetadataEntry: Codable, Sendable {
     /// js-bao's `hasIndexedDbSnapshot`; Swift's local store is SQLite, and the
     /// field keeps the JS name so cross-platform consumers read one vocabulary.
     public var hasIndexedDbSnapshot: Bool?
+    /// A db3 `client.db3.create` made on this device: its pending
+    /// create commits through `POST db3` under its id, not `POST /documents`.
+    public var db3Create: Bool?
+    /// The db3 type that commit asks the server to install.
+    public var db3Type: String?
+    /// The server refused this pending db3 create for good (the
+    /// refusal is in `commitError`): reconnects do not repeat it, and
+    /// `commitOfflineCreate(documentId:)` tries again.
+    public var commitRefused: Bool?
 
     public init(
         documentId: String,
@@ -393,7 +595,10 @@ public struct LocalMetadataEntry: Codable, Sendable {
         thumbnailBlobId: String? = nil,
         grantedAt: String? = nil,
         createCommittedAt: String? = nil,
-        hasIndexedDbSnapshot: Bool? = nil
+        hasIndexedDbSnapshot: Bool? = nil,
+        db3Create: Bool? = nil,
+        db3Type: String? = nil,
+        commitRefused: Bool? = nil
     ) {
         self.documentId = documentId
         self.title = title
@@ -419,16 +624,25 @@ public struct LocalMetadataEntry: Codable, Sendable {
         self.grantedAt = grantedAt
         self.createCommittedAt = createCommittedAt
         self.hasIndexedDbSnapshot = hasIndexedDbSnapshot
+        self.db3Create = db3Create
+        self.db3Type = db3Type
+        self.commitRefused = commitRefused
     }
 }
 
 public struct CommitError: Codable, Sendable {
     public var message: String
     public var at: String
+    /// The server's refusal code, for a pending db3 create the server refused.
+    public var code: String?
+    /// The refusal's HTTP status, which a `client.db3` call waiting
+    /// for the create throws with.
+    var status: Int?
 
-    public init(message: String, at: String) {
+    public init(message: String, at: String, code: String? = nil) {
         self.message = message
         self.at = at
+        self.code = code
     }
 }
 
@@ -450,6 +664,121 @@ public struct PersistedJwtRecord: Codable, Sendable {
     public var storedAt: String?
     public var userId: String?
     public var version: Int?
+}
+
+/// One queued upload as the client keeps it across launches: the JS client's
+/// `UploadRecord` (`src/client/internal/blobManager.ts`), field for field, so
+/// both clients describe an upload the same way. Times are ms since the
+/// epoch. `status` is `pending`, `uploading`, `paused` or `failed`;
+/// `uploaded` is never written. `destination` is set for a session upload
+/// and a db3 upload only, and a record without one is a document upload.
+struct PersistedUploadRecord: Codable, Sendable, Equatable {
+    var queueId: String
+    var documentId: String
+    var blobId: String
+    var filename: String
+    var contentType: String
+    var sha256Base64: String
+    var disposition: String?
+    var retainLocal: Bool?
+    var numBytes: Int
+    var status: String
+    var attempts: Int
+    var nextAttemptAt: Double
+    var createdAt: Double
+    var updatedAt: Double
+    var lastError: String?
+    var lastErrorCode: String?
+    var destination: UploadDestination?
+
+    init(
+        queueId: String, documentId: String, blobId: String, filename: String, contentType: String,
+        sha256Base64: String, disposition: String?, retainLocal: Bool?, numBytes: Int, status: String,
+        attempts: Int, nextAttemptAt: Double, createdAt: Double, updatedAt: Double,
+        lastError: String?, lastErrorCode: String?, destination: UploadDestination?
+    ) {
+        self.queueId = queueId
+        self.documentId = documentId
+        self.blobId = blobId
+        self.filename = filename
+        self.contentType = contentType
+        self.sha256Base64 = sha256Base64
+        self.disposition = disposition
+        self.retainLocal = retainLocal
+        self.numBytes = numBytes
+        self.status = status
+        self.attempts = attempts
+        self.nextAttemptAt = nextAttemptAt
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.lastError = lastError
+        self.lastErrorCode = lastErrorCode
+        self.destination = destination
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case queueId, documentId, blobId, filename, contentType, sha256Base64, disposition, retainLocal
+        case numBytes, status, attempts, nextAttemptAt, createdAt, updatedAt, lastError, lastErrorCode, destination
+    }
+
+    /// Tolerant, as JS `hydrateUploadsForIdentity` is: unknown keys are
+    /// ignored, and a missing field takes the default JS gives it.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let now = (Date().timeIntervalSince1970 * 1000).rounded()
+        blobId = try c.decode(String.self, forKey: .blobId)
+        queueId = try c.decodeIfPresent(String.self, forKey: .queueId) ?? blobId
+        documentId = try c.decode(String.self, forKey: .documentId)
+        filename = try c.decodeIfPresent(String.self, forKey: .filename) ?? blobId
+        contentType = try c.decodeIfPresent(String.self, forKey: .contentType) ?? "application/octet-stream"
+        sha256Base64 = try c.decodeIfPresent(String.self, forKey: .sha256Base64) ?? ""
+        disposition = try c.decodeIfPresent(String.self, forKey: .disposition)
+        retainLocal = try c.decodeIfPresent(Bool.self, forKey: .retainLocal)
+        numBytes = try c.decodeIfPresent(Int.self, forKey: .numBytes) ?? 0
+        status = try c.decodeIfPresent(String.self, forKey: .status) ?? "pending"
+        attempts = try c.decodeIfPresent(Int.self, forKey: .attempts) ?? 0
+        nextAttemptAt = try c.decodeIfPresent(Double.self, forKey: .nextAttemptAt) ?? now
+        createdAt = try c.decodeIfPresent(Double.self, forKey: .createdAt) ?? now
+        updatedAt = try c.decodeIfPresent(Double.self, forKey: .updatedAt) ?? now
+        lastError = try c.decodeIfPresent(String.self, forKey: .lastError)
+        lastErrorCode = try c.decodeIfPresent(String.self, forKey: .lastErrorCode)
+        destination = try? c.decodeIfPresent(UploadDestination.self, forKey: .destination)
+    }
+}
+
+/// The JS record's `destination`: `{ kind: "agent-session", sessionId }` for
+/// a session upload, `{ kind: "db3", documentId }` for a db3 upload. A
+/// `document` destination is read but never written, and an unknown kind
+/// reads as one.
+extension UploadDestination: Codable {
+    private enum CodingKeys: String, CodingKey { case kind, sessionId, documentId }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let kind = try c.decode(String.self, forKey: .kind)
+        switch kind {
+        case "agent-session":
+            self = .agentSession(try c.decode(String.self, forKey: .sessionId))
+        case "db3":
+            self = .db3(try c.decode(String.self, forKey: .documentId))
+        default:
+            self = .document
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .document:
+            try c.encode("document", forKey: .kind)
+        case .db3(let documentId):
+            try c.encode("db3", forKey: .kind)
+            try c.encode(documentId, forKey: .documentId)
+        case .agentSession(let sessionId):
+            try c.encode("agent-session", forKey: .kind)
+            try c.encode(sessionId, forKey: .sessionId)
+        }
+    }
 }
 
 public struct AnalyticsMetadataRecord: Codable, Sendable {

@@ -24,6 +24,7 @@ import YSwift
 ///   --input  Tests/JsBaoClientTests/Schema/CodegenAcceptance/fixture.toml \
 ///   --output Tests/JsBaoClientTests/Schema/CodegenAcceptance/Generated
 /// ```
+@available(*, deprecated)
 final class CodegenAcceptanceTests: XCTestCase {
 
     func testGeneratedSchemaMatchesHandConstructed() {

@@ -25,24 +25,32 @@ public enum CursorDirection: Sendable, Equatable {
 /// base64-encoded as the on-wire token.
 ///
 /// A sort field whose value is SQL NULL — absent from the record, or stored as
-/// null — is represented by the ABSENCE of its key in `values` (#3228).
+/// null — is represented by the ABSENCE of its key in `values`.
 /// `PrimitiveValue` has no null case, and it needs none: the payload's null is
 /// written and read off `sortFields`, and `buildPaginationConditions` already
 /// looks values up optionally. On the wire the key is always present and
 /// carries an explicit JSON `null`, byte-compatible with js-bao.
+///
+/// `sortDirections` are the declared per-field directions (1 or -1, one per
+/// `sortFields` entry) the cursor was minted under. A cursor is valid
+/// only under that sort; one without them predates the field and is checked
+/// on `sortFields` alone.
 public struct CursorData: Equatable, Sendable {
     public var values: [String: PrimitiveValue]
     public var sortFields: [String]
     public var direction: Int   // 1 or -1
+    public var sortDirections: [Int]?
 
     public init(
         values: [String: PrimitiveValue],
         sortFields: [String],
-        direction: Int
+        direction: Int,
+        sortDirections: [Int]? = nil
     ) {
         self.values = values
         self.sortFields = sortFields
         self.direction = direction
+        self.sortDirections = sortDirections
     }
 }
 
@@ -69,9 +77,19 @@ public enum CursorManager {
 
     // MARK: - Encode / decode
 
+    /// Keys sorted, so a cursor encodes to one string; slashes unescaped, as
+    /// js-bao writes them.
+    private static let cursorEncoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return encoder
+    }()
+
     /// Serialize a `CursorData` to a base64-encoded JSON string.
-    /// Byte-compatible with js-bao's `encodeCursor` — the JSON is
-    /// UTF-8 and uses standard base64.
+    /// Decodes with js-bao's `decodeCursor` — standard base64 over ASCII
+    /// JSON: every character above 0x7F is written as a `\uXXXX` escape, as
+    /// js-bao writes it, because js-bao decodes with `atob`, which reads each
+    /// byte as one character.
     public static func encodeCursor(_ data: CursorData) throws -> String {
         // The JSON shape is fixed:
         //   {"values":{...},"sortFields":[...],"direction":1|-1}
@@ -79,26 +97,64 @@ public enum CursorManager {
         // SQL NULL and has to reach the wire as an explicit `null` (#3228), the
         // way js-bao's `generateCursor` writes it. Any extra key `values`
         // carries is preserved so the payload stays a superset, as before.
+        try encodePayload(
+            values: data.values.mapValues(primitiveToJSON), sortFields: data.sortFields,
+            direction: data.direction, sortDirections: data.sortDirections
+        )
+    }
+
+    /// ``encodeCursor(_:)`` over values as JSON: a sort field with no value is
+    /// an explicit `null`.
+    private static func encodePayload(
+        values: [String: JSONValue], sortFields: [String], direction: Int, sortDirections: [Int]?
+    ) throws -> String {
         var valueObject: [String: JSONValue] = [:]
-        for field in data.sortFields {
-            valueObject[field] = data.values[field].map(primitiveToJSON) ?? .null
+        for field in sortFields {
+            valueObject[field] = values[field] ?? .null
         }
-        for (k, v) in data.values where valueObject[k] == nil {
-            valueObject[k] = primitiveToJSON(v)
+        for (k, v) in values where valueObject[k] == nil {
+            valueObject[k] = v
         }
-        let payload: JSONValue = .object([
+        var fields: [String: JSONValue] = [
             "values":     .object(valueObject),
-            "sortFields": .array(data.sortFields.map { .string($0) }),
-            "direction":  .number(Double(data.direction)),
-        ])
-        guard let jsonData = try? JSONCoding.encodeData(payload) else {
+            "sortFields": .array(sortFields.map { .string($0) }),
+            "direction":  .number(Double(direction)),
+        ]
+        if let directions = sortDirections {
+            fields["sortDirections"] = .array(directions.map { .number(Double($0)) })
+        }
+        guard let jsonData = try? cursorEncoder.encode(JSONValue.object(fields)),
+              let json = String(data: jsonData, encoding: .utf8) else {
             throw InvalidCursorError(reason: "Unencodable cursor values")
         }
-        return jsonData.base64EncodedString()
+        var ascii = ""
+        for unit in json.utf16 {
+            if unit < 0x80 {
+                ascii.unicodeScalars.append(Unicode.Scalar(UInt8(unit)))
+            } else {
+                ascii += String(format: "\\u%04x", UInt32(unit))
+            }
+        }
+        return Data(ascii.utf8).base64EncodedString()
     }
 
     /// Decode a base64-encoded cursor back into a `CursorData`.
     public static func decodeCursor(_ cursor: String) throws -> CursorData {
+        let payload = try decodePayload(cursor)
+        return CursorData(
+            values: payload.values.mapValues(jsonToPrimitive), sortFields: payload.sortFields,
+            direction: payload.direction, sortDirections: payload.sortDirections
+        )
+    }
+
+    /// ``decodeCursor(_:)`` with the values as the cursor's JSON carries them.
+    /// An explicit JSON `null` is a SQL NULL, recorded as an absent key;
+    /// as a primitive it must NOT go through `jsonToPrimitive`, whose
+    /// fallback would turn it into `.string("")` and compare `field = ''` — a
+    /// js-bao-minted null cursor would then match nothing here.
+    private static func decodePayload(_ cursor: String) throws
+        -> (values: [String: JSONValue], sortFields: [String], direction: Int, sortDirections: [Int]?)
+    {
         guard let raw = Data(base64Encoded: cursor) else {
             throw InvalidCursorError(
                 reason: "Not valid base64",
@@ -136,18 +192,19 @@ public enum CursorManager {
                 cursor: cursor
             )
         }
-        var values: [String: PrimitiveValue] = [:]
-        for (k, v) in rawValues {
-            // An explicit JSON `null` is a SQL NULL, recorded as an absent key
-            // (#3228). It must NOT go through `jsonToPrimitive`, whose fallback
-            // would turn it into `.string("")` and compare `field = ''` — a
-            // js-bao-minted null cursor would then match nothing here.
-            if case .null = v { continue }
-            values[k] = jsonToPrimitive(v)
+        var sortDirections: [Int]?
+        if let raw = dict["sortDirections"] {
+            guard let list = raw.arrayValue,
+                  list.count == sortFields.count,
+                  list.allSatisfy({ $0.numberValue == 1 || $0.numberValue == -1 }) else {
+                throw InvalidCursorError(
+                    reason: "Cursor 'sortDirections' must be 1 or -1 for each sort field",
+                    cursor: cursor
+                )
+            }
+            sortDirections = list.compactMap { $0.numberValue.map(Int.init) }
         }
-        return CursorData(
-            values: values, sortFields: sortFields, direction: Int(rawDirection)
-        )
+        return (rawValues.filter { $0.value != .null }, sortFields, Int(rawDirection), sortDirections)
     }
 
     // MARK: - Lexicographic WHERE
@@ -164,10 +221,10 @@ public enum CursorManager {
     /// for that level. Values bound to `?` come from the cursor's
     /// `values` dict.
     ///
-    /// NULL-aware (#3228), matching js-bao rule for rule. SQLite orders NULL
+    /// NULL-aware, matching js-bao rule for rule. SQLite orders NULL
     /// before every value, so absent and null sort values sit at the FRONT of
     /// an ascending output order and at the TAIL of a descending one — here,
-    /// in the Cloudflare DO's SQLite and in better-sqlite3 alike, which is why
+    /// in the server's SQLite and in better-sqlite3 alike, which is why
     /// the ORDER BY does not change. What changes is that a null cursor value
     /// no longer binds `NSNull` into a comparison, which SQLite evaluates as
     /// UNKNOWN so the next page matched nothing:
@@ -183,6 +240,11 @@ public enum CursorManager {
     /// `id` is exempt — a non-null primary key on every engine — so the default
     /// `sort: [id]` SQL and every non-null `>` level are byte-identical to what
     /// they were.
+    ///
+    /// A cursor whose `sortFields`, or whose `sortDirections`, differ from the
+    /// query's throws `InvalidCursorError`: paging from it would skip
+    /// and repeat rows. A cursor without `sortDirections` is checked on its
+    /// fields only.
     public static func buildPaginationConditions(
         cursor: CursorData,
         currentSortFields: [String],
@@ -190,42 +252,73 @@ public enum CursorManager {
         direction: CursorDirection,
         fieldFormatter: (String) -> String = { $0 }
     ) throws -> (sql: String, params: [Any]) {
-        guard cursor.sortFields == currentSortFields else {
+        try paginationConditions(
+            cursorSortFields: cursor.sortFields, cursorDirections: cursor.sortDirections,
+            currentSortFields: currentSortFields, sortDirections: sortDirections, direction: direction,
+            fieldFormatter: fieldFormatter, value: { cursor.values[$0].map(sqlValue) }
+        )
+    }
+
+    /// ``buildPaginationConditions(cursor:currentSortFields:sortDirections:direction:fieldFormatter:)``
+    /// over a lookup of each sort field's bound value, `nil` for SQL NULL.
+    private static func paginationConditions(
+        cursorSortFields: [String],
+        cursorDirections: [Int]?,
+        currentSortFields: [String],
+        sortDirections: [Int],
+        direction: CursorDirection,
+        fieldFormatter: (String) -> String,
+        nonNullFields: [String] = [],
+        value: (String) -> Any?
+    ) throws -> (sql: String, params: [Any]) {
+        guard cursorSortFields == currentSortFields else {
             throw InvalidCursorError(
                 reason:
-                    "Cursor sort fields [\(cursor.sortFields.joined(separator: ", "))] "
+                    "Cursor sort fields [\(cursorSortFields.joined(separator: ", "))] "
                     + "don't match query sort fields "
                     + "[\(currentSortFields.joined(separator: ", "))]"
             )
+        }
+        if let cursorDirections {
+            let declared = currentSortFields.indices.map { sortDirections[safe: $0] ?? 1 }
+            guard cursorDirections == declared else {
+                throw InvalidCursorError(
+                    reason:
+                        "Cursor sort directions [\(cursorDirections.map(String.init).joined(separator: ", "))] "
+                        + "don't match query sort directions "
+                        + "[\(declared.map(String.init).joined(separator: ", "))]"
+                )
+            }
         }
 
         var conditions: [String] = []
         var params: [Any] = []
 
         // `id` is the always-appended tiebreaker and a non-null primary key on
-        // every engine, so it never receives NULL handling.
-        func nullable(_ field: String) -> Bool { field != "id" }
+        // every engine, so it never receives NULL handling; nor does a column
+        // the caller names as never NULL.
+        func nullable(_ field: String) -> Bool { field != "id" && !nonNullFields.contains(field) }
         func isNull(_ field: String) -> Bool {
-            nullable(field) && cursor.values[field] == nil
+            nullable(field) && value(field) == nil
         }
 
-        for i in 0..<cursor.sortFields.count {
+        for i in 0..<cursorSortFields.count {
             var parts: [String] = []
             var levelParams: [Any] = []
 
             // Equality on every earlier field.
             for j in 0..<i {
-                let f = cursor.sortFields[j]
+                let f = cursorSortFields[j]
                 if isNull(f) {
                     parts.append("\(fieldFormatter(f)) IS NULL")
                     continue
                 }
                 parts.append("\(fieldFormatter(f)) = ?")
-                levelParams.append(sqlValue(cursor.values[f]))
+                levelParams.append(value(f) ?? NSNull())
             }
 
             // Comparison on the current field.
-            let currentField = cursor.sortFields[i]
+            let currentField = cursorSortFields[i]
             let currentSql = fieldFormatter(currentField)
             let fieldDir = sortDirections[safe: i] ?? 1
             let forwardOp = fieldDir == 1 ? ">" : "<"
@@ -253,10 +346,10 @@ public enum CursorManager {
                 // this level also carries equality conditions to AND it with.
                 let disjunction = "\(currentSql) < ? OR \(currentSql) IS NULL"
                 parts.append(parts.isEmpty ? disjunction : "(\(disjunction))")
-                levelParams.append(sqlValue(cursor.values[currentField]))
+                levelParams.append(value(currentField) ?? NSNull())
             } else {
                 parts.append("\(currentSql) \(op) ?")
-                levelParams.append(sqlValue(cursor.values[currentField]))
+                levelParams.append(value(currentField) ?? NSNull())
             }
 
             conditions.append("(" + parts.joined(separator: " AND ") + ")")
@@ -282,16 +375,19 @@ public enum CursorManager {
     /// - `hasMore`: `nextCursor` is only emitted when there could be
     ///   another page.
     /// - `aliasedSortFields`: the sort fields this SELECT carried under an
-    ///   internal alias because the projection omits them (#3228). Only these
+    ///   internal alias because the projection omits them. Only these
     ///   are read from their alias, so nothing a caller stored under a
     ///   similar-looking name is mistaken for a sort value.
+    /// - `sortDirections`: the query's declared per-field directions, written
+    ///   into each cursor so another sort refuses it.
     public static func generateResultCursors(
         rows: [[String: JSONValue]],
         sortFields: [String],
         direction: CursorDirection,
         hasMore: Bool,
         isFirstPage: Bool,
-        aliasedSortFields: [String] = []
+        aliasedSortFields: [String] = [],
+        sortDirections: [Int]? = nil
     ) throws -> (next: String?, prev: String?) {
         guard let first = rows.first, let last = rows.last else {
             return (nil, nil)
@@ -302,7 +398,8 @@ public enum CursorManager {
                 last,
                 sortFields: sortFields,
                 direction: direction,
-                aliasedSortFields: aliased
+                aliasedSortFields: aliased,
+                sortDirections: sortDirections
               )
             : nil
         let prev: String? = isFirstPage
@@ -311,7 +408,8 @@ public enum CursorManager {
                 first,
                 sortFields: sortFields,
                 direction: direction == .forward ? .backward : .forward,
-                aliasedSortFields: aliased
+                aliasedSortFields: aliased,
+                sortDirections: sortDirections
               )
         return (next, prev)
     }
@@ -319,7 +417,7 @@ public enum CursorManager {
     /// Build a cursor from one result row.
     ///
     /// A sort field the row does not carry is a SQL NULL and is recorded as
-    /// such (#3228) instead of throwing: `executeQuery` omits NULL columns from
+    /// such instead of throwing: `executeQuery` omits NULL columns from
     /// its row dictionaries, so every record that never wrote the sort field
     /// arrives here with no key, and a page that had already been read was
     /// failing at cursor-minting time.
@@ -333,7 +431,8 @@ public enum CursorManager {
         _ row: [String: JSONValue],
         sortFields: [String],
         direction: CursorDirection,
-        aliasedSortFields: Set<String> = []
+        aliasedSortFields: Set<String> = [],
+        sortDirections: [Int]? = nil
     ) throws -> String {
         var values: [String: PrimitiveValue] = [:]
         for f in sortFields {
@@ -345,8 +444,76 @@ public enum CursorManager {
         return try encodeCursor(CursorData(
             values: values,
             sortFields: sortFields,
-            direction: direction.jsBaoValue
+            direction: direction.jsBaoValue,
+            sortDirections: sortDirections
         ))
+    }
+
+    // MARK: - JSON-valued cursors (the record-log view)
+
+    /// ``generateResultCursors(rows:sortFields:direction:hasMore:isFirstPage:aliasedSortFields:sortDirections:)``
+    /// for rows whose sort values are compared as stored JSON (the record-log
+    /// view's `json_extract`): each value travels as the row holds it, a
+    /// string set as its array of members in the row's order with each member
+    /// kept by its bytes, as js-bao's cursor carries it. A `PrimitiveValue`
+    /// would make the array a `Set<String>`, losing its order and merging
+    /// canonically equal members.
+    static func generateJSONResultCursors(
+        rows: [[String: JSONValue]],
+        sortFields: [String],
+        direction: CursorDirection,
+        hasMore: Bool,
+        isFirstPage: Bool,
+        sortDirections: [Int]
+    ) throws -> (next: String?, prev: String?) {
+        guard let first = rows.first, let last = rows.last else { return (nil, nil) }
+        func cursor(_ row: [String: JSONValue], _ direction: CursorDirection) throws -> String {
+            var values: [String: JSONValue] = [:]
+            for field in sortFields {
+                if let value = row[field], value != .null { values[field] = value }
+            }
+            return try encodePayload(
+                values: values, sortFields: sortFields, direction: direction.jsBaoValue, sortDirections: sortDirections
+            )
+        }
+        let next = hasMore ? try cursor(last, direction) : nil
+        let prev = isFirstPage ? nil : try cursor(first, direction == .forward ? .backward : .forward)
+        return (next, prev)
+    }
+
+    /// ``buildPaginationConditions(cursor:currentSortFields:sortDirections:direction:fieldFormatter:)``
+    /// for a cursor over stored JSON: each value is bound as `json_extract`
+    /// yields it, an array or object as its JSON text (js-bao's
+    /// `convertCursorValueForSQLite`), so a page sorted by a string set
+    /// continues after the cursor's row.
+    ///
+    /// `nonNullFields` names further fields that are never NULL (the view's
+    /// document tie-break), compared as `id` is.
+    static func buildJSONPaginationConditions(
+        cursor: String,
+        currentSortFields: [String],
+        sortDirections: [Int],
+        direction: CursorDirection,
+        fieldFormatter: (String) -> String,
+        nonNullFields: [String] = []
+    ) throws -> (sql: String, params: [Any]) {
+        let payload = try decodePayload(cursor)
+        return try paginationConditions(
+            cursorSortFields: payload.sortFields, cursorDirections: payload.sortDirections,
+            currentSortFields: currentSortFields, sortDirections: sortDirections, direction: direction,
+            fieldFormatter: fieldFormatter, nonNullFields: nonNullFields,
+            value: { field in
+                payload.values[field].map { value -> Any in
+                    switch value {
+                    case .string(let text): return text
+                    case .number(let number): return number
+                    case .bool(let flag): return flag
+                    case .null: return NSNull()
+                    case .array, .object: return RecordLogJSON.text(value)
+                    }
+                }
+            }
+        )
     }
 
     // MARK: - Internal sort-value aliases (#3228)
@@ -400,6 +567,7 @@ public enum CursorManager {
         case let .date(s):      return .string(s)
         case let .stringset(s): return .array(Array(s).sorted().map { .string($0) })
         case let .json(d):      return .string(String(data: d, encoding: .utf8) ?? "")
+        case let .vector(v):    return .array(v.map { .number(Double($0)) })
         }
     }
 
@@ -430,6 +598,7 @@ public enum CursorManager {
         case let .date(s):      return s
         case let .stringset(s): return Array(s).joined(separator: ",")
         case let .json(d):      return String(data: d, encoding: .utf8) ?? ""
+        case .vector:           return NSNull()
         }
     }
 }

@@ -13,8 +13,8 @@ import Foundation
 ///   asynchronous and changed the timing every consumer sees, so both shapes
 ///   fan out from the same `emit` instead.
 ///
-/// The untyped `on` / `onAny` shim this registry also used to serve was removed
-/// in #2367; only the typed shapes above remain.
+/// The untyped `on` / `onAny` shim this registry also used to serve was
+/// removed; only the typed shapes above remain.
 public final class EventEmitter: @unchecked Sendable {
     private struct CallbackEntry {
         let id: UInt64
@@ -102,7 +102,7 @@ public final class EventEmitter: @unchecked Sendable {
     /// that cancels its subscriptions re-enters the emitter through
     /// ``removeClosure(event:id:)`` — on the same thread, against the same
     /// non-recursive `NSLock`. Doing that inside the critical section parks the
-    /// thread forever (issue #2574). This is the same discipline
+    /// thread forever. This is the same discipline
     /// `EventSubscription.cancel()` and `finishAllStreams()` already follow.
     public func removeAll() {
         let claimed = lock.withLock { () -> [String: [CallbackEntry]] in
@@ -497,8 +497,8 @@ final class StreamMeter: @unchecked Sendable {
 ///
 /// Construct one directly when wrapping a non-`EventEmitter` cancel
 /// closure — most commonly `DynamicModel.subscribe()`'s unsubscribe
-/// block — for use with `BaoDataLoader`'s `.custom` trigger
-/// (issue #854). Owns the closure and cancels exactly once on
+/// block — for use with `BaoDataLoader`'s `.custom` trigger.
+/// Owns the closure and cancels exactly once on
 /// `cancel()` or `deinit`.
 public final class EventSubscription: @unchecked Sendable {
     /// Guards `cancellation` so `cancel()` racing `deinit` (or two concurrent
@@ -599,7 +599,7 @@ final class SubscriptionHolder: @unchecked Sendable {
     /// Store a teardown closure run once, however the wait settles.
     ///
     /// For state a wait registers OUTSIDE itself and must withdraw whichever
-    /// way it ends — the `openDocument` refusal registration (#3436). Runs
+    /// way it ends — the `openDocument` refusal registration. Runs
     /// immediately when the wait has already settled, so a late registration
     /// cannot leave the entry behind.
     func set(onSettled: @escaping @Sendable () -> Void) {
@@ -705,6 +705,146 @@ extension EventEmitter {
                     eventKey: E.eventKey.rawValue,
                     continuation: continuation
                 ))
+            }
+        } onCancel: {
+            cancellation.cancel()
+        }
+    }
+
+    /// Wait for one pending create to commit — the wait behind
+    /// `documents.validateAccess` on a document whose create has not reached
+    /// the server yet.
+    ///
+    /// Built like `waitForNextEvent`, with one addition: inside the
+    /// continuation body it subscribes FIRST and only then asks `stillPending`,
+    /// so a commit that lands between the caller's check and the subscription
+    /// is seen by the recheck rather than missed (`nextEvent` does not replay).
+    ///
+    /// Returns on a `PendingCreateCommittedEvent` for `documentId`, or at once
+    /// when `stillPending` answers false. Throws `JsBaoError(.pendingCreate)`
+    /// when `isOffline` answers true, when a `NetworkModeEvent` reports
+    /// `.offline`, or when `timeout` elapses; `CancellationError` when the
+    /// calling task is cancelled. Commit-failure events do not end the wait:
+    /// the client retries a failed commit, and the retry's success emits the
+    /// commit event.
+    func waitForPendingCreateCommit(
+        documentId: String,
+        timeout: TimeInterval,
+        stillPending: @escaping @Sendable () -> Bool,
+        isOffline: @escaping @Sendable () -> Bool
+    ) async throws {
+        let wait = SubscriptionHolder()
+        let cancellation = CancellationBridge()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                cancellation.onCancelResume {
+                    guard wait.claim() else { return }
+                    continuation.resume(throwing: CancellationError())
+                }
+                let refuse: @Sendable () -> Void = {
+                    guard wait.claim() else { return }
+                    continuation.resume(throwing: JsBaoError(
+                        code: .pendingCreate,
+                        message: "Document create has not reached the server yet",
+                        details: ["documentId": .string(documentId)]
+                    ))
+                }
+                wait.set(subscribe(PendingCreateCommittedEvent.self) { payload in
+                    guard payload.documentId == documentId, wait.claim() else { return }
+                    continuation.resume()
+                })
+                let modeSubscription = subscribe(NetworkModeEvent.self) { payload in
+                    if payload.mode == .offline { refuse() }
+                }
+                wait.set(onSettled: { modeSubscription.cancel() })
+
+                if !stillPending() {
+                    guard wait.claim() else { return }
+                    continuation.resume()
+                    return
+                }
+                if isOffline() {
+                    refuse()
+                    return
+                }
+                wait.set(timeoutTask: Task {
+                    try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                    refuse()
+                })
+            }
+        } onCancel: {
+            cancellation.cancel()
+        }
+    }
+
+    /// Wait until a pending db3 create has committed: resolved by its
+    /// `PendingCreateCommittedEvent`, or at once when `stillPending` answers
+    /// false. Throws `refusal()`'s error once the server refused the create
+    /// (its `Db3CreateFailedEvent`, or a refusal already recorded), and
+    /// `JsBaoError(.pendingCreate)` (`details["db3Id"]`) when `isOffline`
+    /// answers true, a `NetworkModeEvent` reports `.offline`, or `timeout`
+    /// elapses; `CancellationError` when the calling task is cancelled.
+    /// `commit` runs once the listeners are on, to join or start the commit.
+    func waitForPendingDb3Create(
+        db3Id: String,
+        timeout: TimeInterval,
+        stillPending: @escaping @Sendable () -> Bool,
+        isOffline: @escaping @Sendable () -> Bool,
+        refusal: @escaping @Sendable () -> Error?,
+        commit: @escaping @Sendable () -> Void
+    ) async throws {
+        let wait = SubscriptionHolder()
+        let cancellation = CancellationBridge()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                cancellation.onCancelResume {
+                    guard wait.claim() else { return }
+                    continuation.resume(throwing: CancellationError())
+                }
+                let fail: @Sendable (Error) -> Void = { error in
+                    guard wait.claim() else { return }
+                    continuation.resume(throwing: error)
+                }
+                let pendingCreate = JsBaoError(
+                    code: .pendingCreate,
+                    message: "The db3's create has not reached the server yet",
+                    details: ["db3Id": .string(db3Id)]
+                )
+                wait.set(subscribe(PendingCreateCommittedEvent.self) { payload in
+                    guard payload.documentId == db3Id, wait.claim() else { return }
+                    continuation.resume()
+                })
+                let failedSubscription = subscribe(Db3CreateFailedEvent.self) { payload in
+                    guard payload.id == db3Id else { return }
+                    fail(refusal() ?? pendingCreate)
+                }
+                let modeSubscription = subscribe(NetworkModeEvent.self) { payload in
+                    if payload.mode == .offline { fail(pendingCreate) }
+                }
+                wait.set(onSettled: {
+                    failedSubscription.cancel()
+                    modeSubscription.cancel()
+                })
+
+                if !stillPending() {
+                    guard wait.claim() else { return }
+                    continuation.resume()
+                    return
+                }
+                if isOffline() {
+                    fail(pendingCreate)
+                    return
+                }
+                // A refused create is not retried by the backoff: its refusal ends the wait.
+                if let refused = refusal() {
+                    fail(refused)
+                    return
+                }
+                wait.set(timeoutTask: Task {
+                    try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                    fail(pendingCreate)
+                })
+                commit()
             }
         } onCancel: {
             cancellation.cancel()

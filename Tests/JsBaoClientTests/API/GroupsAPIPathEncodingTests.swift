@@ -11,6 +11,10 @@ import XCTest
 /// URL-reserved character in one of those values can't produce a malformed
 /// path. `GroupsAPI` takes an injected `Transport`, which lets us capture the
 /// path each method builds without a live server.
+///
+/// The typed labels are deprecated since #4737 (groups are addressed by
+/// `groupId` alone), so these pins are deprecated test methods; the id
+/// labels are pinned in `RoleSurfacesHermeticTests`.
 final class GroupsAPIPathEncodingTests: XCTestCase {
 
     /// A transport that records the path it is handed and returns a canned
@@ -25,6 +29,7 @@ final class GroupsAPIPathEncodingTests: XCTestCase {
     private let reservedType = "team space#1"
     private let reservedTypeEncoded = "team%20space%231"
 
+    @available(*, deprecated)
     func test_delete_percentEncodesGroupTypeAndId() async throws {
         let transport = successTransport()
         let groups = GroupsAPI(transport: transport)
@@ -32,6 +37,7 @@ final class GroupsAPIPathEncodingTests: XCTestCase {
         XCTAssertEqual(transport.lastCall?.path, "/groups/\(reservedTypeEncoded)/b%232")
     }
 
+    @available(*, deprecated)
     func test_removeMember_percentEncodesUserIdSegment() async throws {
         let transport = successTransport()
         let groups = GroupsAPI(transport: transport)
@@ -44,6 +50,7 @@ final class GroupsAPIPathEncodingTests: XCTestCase {
         )
     }
 
+    @available(*, deprecated)
     func test_slugAndUlid_passThroughUnchanged() async throws {
         // The common case: a slug type + ULID id carry no reserved characters,
         // so encoding is a no-op and the path is byte-for-byte the raw form.

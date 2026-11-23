@@ -1,0 +1,22 @@
+{
+  "name": "groups.listMembers",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "GET",
+  "path": "/app/<appId>/api/groups/team/baseline/members",
+  "caller": "owner",
+  "request": null,
+  "status": 200,
+  "body": {
+    "items": [
+      {
+        "userId": "<ulid>",
+        "addedAt": "<iso>",
+        "addedBy": "<ulid>",
+        "userName": "<name>",
+        "userEmail": "<email>"
+      }
+    ],
+    "hasMore": false
+  }
+}

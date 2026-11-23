@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-merge-e2e.test.ts
 /// Tests document merge scenarios between multiple clients.
+@available(*, deprecated)
 final class MergeTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

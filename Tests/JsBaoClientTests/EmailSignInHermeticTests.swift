@@ -5,7 +5,8 @@ import XCTest
 ///
 /// The Swift client's half of that change is a single `emailSignInRequest`
 /// against `POST /auth/email/request` (no method to select any more) and one
-/// `emailSignInEnabled` flag on the auth config.
+/// `emailSignInEnabled` flag on the auth config. The request aliases and the
+/// `magicLinkEnabled` / `otpEnabled` pair are gone (#3993).
 ///
 /// Server-free (`*HermeticTests`): the request shape is captured by a stubbed
 /// `URLProtocol` wired into this suite's session only, and the config half is
@@ -22,9 +23,9 @@ final class EmailSignInHermeticTests: XCTestCase {
         super.tearDown()
     }
 
-    private func wire() -> AuthController {
+    private func wire(token: String = "") -> AuthController {
         let (auth, _) = makeWiredClients(
-            initialToken: "",
+            initialToken: token,
             protocolClass: EmailSignInCaptureURLProtocol.self
         )
         return auth
@@ -67,6 +68,45 @@ final class EmailSignInHermeticTests: XCTestCase {
         XCTAssertNil(call.jsonBody?["redirectUri"])
     }
 
+    /// The request is unauthenticated credential issuance: an access token
+    /// inside the 120s expiry window must not make it pre-refresh.
+    func testEmailSignInRequestDoesNotPreflightRefreshWithAnExpiringToken() async throws {
+        let expiring = makeTestJwt(
+            userId: "u1",
+            exp: Int(Date().timeIntervalSince1970) + 30
+        )
+        let auth = wire(token: expiring)
+
+        _ = try await auth.emailSignInRequest(email: "someone@example.test")
+
+        XCTAssertNotNil(
+            EmailSignInCaptureURLProtocol.firstCall(containing: "/auth/email/request")
+        )
+        XCTAssertEqual(
+            EmailSignInCaptureURLProtocol.count(containing: "/auth/refresh"),
+            0,
+            "an unauthenticated auth endpoint must not run the expiry preflight"
+        )
+    }
+
+    func testEmailSignInRequestThrowsUnavailableBeforeATransportIsInstalled() async throws {
+        let controller = AuthController(
+            appId: "test-app",
+            apiUrl: "http://stub.local",
+            logger: Logger(level: .error),
+            offlineStore: OfflineStore(),
+            emitter: EventEmitter(),
+            refreshProxy: nil,
+            persistConfig: AuthConfig()
+        )
+        do {
+            _ = try await controller.emailSignInRequest(email: "a@b.c")
+            XCTFail("expected an unavailable error before setTransport")
+        } catch let error as JsBaoError {
+            XCTAssertEqual(error.code, .unavailable)
+        }
+    }
+
     // MARK: - The one config flag
 
     private func decodeConfig(_ json: String) throws -> AuthConfigInfo {
@@ -85,19 +125,32 @@ final class EmailSignInHermeticTests: XCTestCase {
         XCTAssertFalse(disabled.emailSignInEnabled)
     }
 
-    /// Against a server that predates #2884 there is no `emailSignInEnabled`
-    /// key at all, so the flag is derived from the pair it replaced: email
-    /// sign-in is off only when BOTH legacy flags are explicitly false.
-    func testAuthConfigFallsBackToTheLegacyPairAgainstAnOlderServer() throws {
-        let onlyOtp = try decodeConfig(
-            #"{ "appId": "a", "magicLinkEnabled": false, "otpEnabled": true }"#
+    /// The flag decodes from its own key alone: a payload carrying only the
+    /// retired pair reads as off, as does one with no email keys at all.
+    func testAuthConfigReadsTheOneFlagAndIgnoresTheRetiredPair() throws {
+        let legacyOnly = try decodeConfig(
+            #"{ "appId": "a", "magicLinkEnabled": true, "otpEnabled": true }"#
         )
-        XCTAssertTrue(onlyOtp.emailSignInEnabled)
+        XCTAssertFalse(legacyOnly.emailSignInEnabled)
 
-        let bothOff = try decodeConfig(
-            #"{ "appId": "a", "magicLinkEnabled": false, "otpEnabled": false }"#
-        )
-        XCTAssertFalse(bothOff.emailSignInEnabled)
+        let bare = try decodeConfig(#"{ "appId": "a" }"#)
+        XCTAssertFalse(bare.emailSignInEnabled)
+        XCTAssertNil(bare.googleClients)
+    }
+
+    func testAppConfigCarriesTheEmailSignInFlag() throws {
+        for enabled in [true, false] {
+            let config = try decodeConfig(
+                #"{ "appId": "a", "emailSignInEnabled": \#(enabled) }"#
+            )
+            XCTAssertEqual(AppConfigInfo(from: config).emailSignInEnabled, enabled)
+
+            let decoded = try JSONDecoder().decode(
+                AppConfigInfo.self,
+                from: #"{ "appId": "a", "emailSignInEnabled": \#(enabled) }"#.data(using: .utf8)!
+            )
+            XCTAssertEqual(decoded.emailSignInEnabled, enabled)
+        }
     }
 }
 
@@ -123,6 +176,10 @@ final class EmailSignInCaptureURLProtocol: URLProtocol {
 
     static func firstCall(containing fragment: String) -> Call? {
         calls.value.first { $0.url.contains(fragment) }
+    }
+
+    static func count(containing fragment: String) -> Int {
+        calls.value.filter { $0.url.contains(fragment) }.count
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }

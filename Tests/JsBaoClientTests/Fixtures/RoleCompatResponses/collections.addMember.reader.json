@@ -1,0 +1,22 @@
+{
+  "name": "collections.addMember.reader",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "POST",
+  "path": "/app/<appId>/api/collections/<ulid>/members",
+  "caller": "owner",
+  "request": {
+    "userId": "<ulid>",
+    "permission": "reader"
+  },
+  "status": 201,
+  "body": {
+    "status": "added",
+    "userId": "<ulid>",
+    "permission": "reader",
+    "addedAt": "<iso>",
+    "addedBy": "<ulid>",
+    "userName": "<name>",
+    "userEmail": "<email>"
+  }
+}

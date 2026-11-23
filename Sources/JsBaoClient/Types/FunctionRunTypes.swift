@@ -30,7 +30,7 @@ public struct FunctionRunError: Decodable, Sendable, Equatable {
     public let name: String?
     /// What went wrong. A failure the client publishes is one it can describe,
     /// so this is never absent. A platform refusal leads its message with its
-    /// code (`OUTPUT_SCHEMA_VIOLATION: …`).
+    /// code (`FUNCTION_OUTPUT_INVALID: …`).
     public let message: String
     /// The platform's classification, when it made one. The same value as
     /// ``FunctionRunInfo/errorCode``.
@@ -68,7 +68,7 @@ public struct FunctionRunError: Decodable, Sendable, Equatable {
 
     /// Read a raw `status.error` value, or `nil` when there is none to publish.
     ///
-    /// NEVER throws and never fails the read around it — the #3449 rule, and
+    /// NEVER throws and never fails the read around it — the same rule, and
     /// the whole reason that child existed. Delegates to
     /// ``RunErrorEnvelope/read(_:)``, which is the one parser for this field,
     /// and adds the two function-side projections: the wire's `code` key is
@@ -101,9 +101,9 @@ public struct FunctionRunError: Decodable, Sendable, Equatable {
 ///
 /// `workflowId`, `workflowKey`, `revisionId`, `skipReason` and the three
 /// `failedStep*` fields are DSL vocabulary the server never sets for a function
-/// row, so they are not declared and do not reach a caller. `executionMode` is
-/// left out for a different reason: the row still stores the pre-#3482
-/// spelling of it, and phase 7 is where that moves.
+/// row, so they are not declared and do not reach a caller. The retired
+/// `executionMode` is not declared either: ``runtime`` is what the server
+/// sends in its place.
 public struct FunctionRunInfo: Decodable, Sendable, Equatable {
     public let runId: String
     public let runKey: String
@@ -113,6 +113,11 @@ public struct FunctionRunInfo: Decodable, Sendable, Equatable {
     /// surface, which is not refused — the route is shared by design.
     public let functionId: String?
     public let functionKey: String?
+    /// How the run executed: `"request"` for a run that answered within one
+    /// request (a webhook fire), `"task"` for a started run. `nil` when the
+    /// server did not report it. A plain `String` so a value the server adds
+    /// never turns a read into a decode failure.
+    public let runtime: String?
     /// Who the run executed AS — `sys:<appId>` for a trigger-fired root.
     public let executionPrincipal: String?
     /// The function that started this one, for a nested start.
@@ -135,7 +140,7 @@ public struct FunctionRunInfo: Decodable, Sendable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case runId, runKey, instanceId, contextDocId
-        case functionId, functionKey, executionPrincipal
+        case functionId, functionKey, runtime, executionPrincipal
         case parentFunctionKey, parentRunId, nestDepth
         case status, startedAt, executionStartedAt, queueDelayMs
         case createCallDurationMs, endedAt
@@ -149,6 +154,7 @@ public struct FunctionRunInfo: Decodable, Sendable, Equatable {
         contextDocId: String? = nil,
         functionId: String? = nil,
         functionKey: String? = nil,
+        runtime: String? = nil,
         executionPrincipal: String? = nil,
         parentFunctionKey: String? = nil,
         parentRunId: String? = nil,
@@ -170,6 +176,7 @@ public struct FunctionRunInfo: Decodable, Sendable, Equatable {
         self.contextDocId = contextDocId
         self.functionId = functionId
         self.functionKey = functionKey
+        self.runtime = runtime
         self.executionPrincipal = executionPrincipal
         self.parentFunctionKey = parentFunctionKey
         self.parentRunId = parentRunId
@@ -188,15 +195,16 @@ public struct FunctionRunInfo: Decodable, Sendable, Equatable {
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        // The `WorkflowRunInfo` defaults, for the same reason: a run block the
-        // client cannot fully read is still a run block, and the three fields
-        // the server always fills default rather than throwing.
+        // A run block the client cannot fully read is still a run block, and
+        // the three fields the server always fills default rather than
+        // throwing.
         runId = try c.decodeIfPresent(String.self, forKey: .runId) ?? ""
         runKey = try c.decodeIfPresent(String.self, forKey: .runKey) ?? ""
         instanceId = try c.decodeIfPresent(String.self, forKey: .instanceId)
         contextDocId = try c.decodeIfPresent(String.self, forKey: .contextDocId)
         functionId = try c.decodeIfPresent(String.self, forKey: .functionId)
         functionKey = try c.decodeIfPresent(String.self, forKey: .functionKey)
+        runtime = try c.decodeIfPresent(String.self, forKey: .runtime)
         executionPrincipal = try c.decodeIfPresent(String.self, forKey: .executionPrincipal)
         parentFunctionKey = try c.decodeIfPresent(String.self, forKey: .parentFunctionKey)
         parentRunId = try c.decodeIfPresent(String.self, forKey: .parentRunId)
@@ -216,15 +224,13 @@ public struct FunctionRunInfo: Decodable, Sendable, Equatable {
 
 /// The raw shape every `status.error` arrives in, parsed once.
 ///
-/// OWNED BY THIS SURFACE, for the same reason ``FunctionRunSlice`` is: the
-/// workflow surface is being retired and this parser has to outlive it.
-/// ``WorkflowRunError`` reads through this until then, so deleting that type
-/// deletes a wrapper rather than the one parser for the field.
+/// OWNED BY THIS SURFACE, as ``FunctionRunSlice`` is: the workflow surface it
+/// once shared the field with retired with the DSL engine.
 ///
-/// NEVER throws and never fails the read around it — the #3449 rule. A value
+/// NEVER throws and never fails the read around it — this rule. A value
 /// of another JSON kind, and an object whose `message` is not a string, are
 /// both "no error the client can describe", the same reading the `slice`
-/// block takes (#3388): a status is an answer about a run, and a field the
+/// block takes: a status is an answer about a run, and a field the
 /// client cannot vouch for must not cost the caller the answer.
 struct RunErrorEnvelope {
     let name: String?
@@ -261,15 +267,13 @@ struct RunErrorEnvelope {
     }
 }
 
-/// The task slice's record on a function run (#3381). Mirrors the JS client's
+/// The task slice's record on a function run. Mirrors the JS client's
 /// status `slice` field for field.
 ///
 /// OWNED BY THIS SURFACE. Only a function run has a slice record, so the block
-/// takes a function name and the retiring workflow surface reads it through
-/// `typealias WorkflowSliceInfo = FunctionRunSlice`. The custom `init(from:)`
-/// below is the reason this is a move and not a copy: its throw semantics —
-/// a non-numeric count drops the whole block rather than fabricating a `0` —
-/// are pinned by tests, and two copies of them would drift.
+/// takes a function name. The custom `init(from:)` below carries the throw
+/// semantics — a non-numeric count drops the whole block rather than
+/// fabricating a `0` — that tests pin.
 ///
 /// A task run executes as a series of SLICES: the engine runs the handler until
 /// it returns or hibernates, and each wake is a new slice with its own
@@ -314,7 +318,7 @@ public struct FunctionRunSlice: Decodable, Sendable, Equatable {
     /// instead of yielding. `0` for a run short enough never to need one.
     public let refreshCount: Int
     /// How many of this run's slices the platform tore down and restarted — a
-    /// platform deploy resets the engine's Durable Object under every executing
+    /// platform deploy resets the engine's runtime under every executing
     /// slice, and an isolate eviction does the same.
     ///
     /// The engine re-runs the interrupted step as a further attempt, so a run
@@ -327,15 +331,34 @@ public struct FunctionRunSlice: Decodable, Sendable, Equatable {
     public let lastResetAt: Int?
     /// What named the most recent reset: `"code-updated"` when the platform
     /// build changed underneath the run, `"evicted"` when the runtime said the
-    /// isolate was reset, `"unknown"` when the platform saw a teardown it could
-    /// not attribute. `nil` until there has been one. A plain `String` for the
+    /// isolate was reset, `"storage-reset"` when the task runtime's own storage
+    /// was reset, `"unknown"` when the platform saw a teardown it could not
+    /// attribute. `nil` until there has been one. A plain `String` for the
     /// same reason `settledStatus` is one.
     public let lastResetCause: String?
+    /// The newest instant the platform saw this run's slice do anything — its
+    /// start, a credential refresh, a wait, a step starting or finishing —
+    /// epoch ms. A run reading `running` whose last progress is long past has
+    /// stopped making progress; the platform ends such a run with
+    /// `FUNCTION_STALLED`, so a caller never needs a timeout of its own. `nil`
+    /// from a server that predates the field.
+    public let lastProgressAt: Int?
+    /// The step the slice is inside, as `name#occurrence` (`"charge#0"` is the
+    /// first `step.do("charge", …)`); `nil` between steps and once the slice
+    /// has settled.
+    public let openStep: String?
+    /// When the open step began, epoch ms; `nil` between steps.
+    public let openStepStartedAt: Int?
+    /// When the slice began waiting rather than working — a `step.sleep`, an
+    /// event wait, or the delay before a failed step's retry — epoch ms; `nil`
+    /// while it is working.
+    public let parkedAt: Int?
 
     private enum CodingKeys: String, CodingKey {
         case sliceId, startedAt, ceilingAt, settledAt, settledStatus
         case lastRefreshAt, refreshCount
         case resets, lastResetAt, lastResetCause
+        case lastProgressAt, openStep, openStepStartedAt, parkedAt
     }
 
     public init(
@@ -348,7 +371,11 @@ public struct FunctionRunSlice: Decodable, Sendable, Equatable {
         refreshCount: Int = 0,
         resets: Int = 0,
         lastResetAt: Int? = nil,
-        lastResetCause: String? = nil
+        lastResetCause: String? = nil,
+        lastProgressAt: Int? = nil,
+        openStep: String? = nil,
+        openStepStartedAt: Int? = nil,
+        parkedAt: Int? = nil
     ) {
         self.sliceId = sliceId
         self.startedAt = startedAt
@@ -360,6 +387,10 @@ public struct FunctionRunSlice: Decodable, Sendable, Equatable {
         self.resets = resets
         self.lastResetAt = lastResetAt
         self.lastResetCause = lastResetCause
+        self.lastProgressAt = lastProgressAt
+        self.openStep = openStep
+        self.openStepStartedAt = openStepStartedAt
+        self.parkedAt = parkedAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -385,6 +416,13 @@ public struct FunctionRunSlice: Decodable, Sendable, Equatable {
         resets = try c.decodeIfPresent(Int.self, forKey: .resets) ?? 0
         lastResetAt = try Self.epochMillis(c, .lastResetAt)
         lastResetCause = try c.decodeIfPresent(String.self, forKey: .lastResetCause)
+        // #3766 — the run's last progress. Absent (a server that predates it)
+        // and `null` alike read `nil`; a value that is not what it says THROWS
+        // and drops the block, as every other field here does.
+        lastProgressAt = try Self.epochMillis(c, .lastProgressAt)
+        openStep = try c.decodeIfPresent(String.self, forKey: .openStep)
+        openStepStartedAt = try Self.epochMillis(c, .openStepStartedAt)
+        parkedAt = try Self.epochMillis(c, .parkedAt)
     }
 
     /// One epoch-millisecond field: absent and `null` alike read `nil`, and a
@@ -405,8 +443,8 @@ public struct FunctionRunSlice: Decodable, Sendable, Equatable {
 
 /// What `functions.getStatus` answers.
 ///
-/// Decoded FIELD BY FIELD through the nested `status` container, the #3449
-/// rule: a surprise in one field cannot cost the caller the read, so a
+/// Decoded FIELD BY FIELD through the nested `status` container, following
+/// this rule: a surprise in one field cannot cost the caller the read, so a
 /// malformed `error` or `slice` drops to `nil` with the status kept. An
 /// already-flattened payload decodes by the same rule.
 public struct FunctionRunStatus: Decodable, Sendable, Equatable {
@@ -476,18 +514,20 @@ public struct FunctionRunStatus: Decodable, Sendable, Equatable {
         slice = try? c.decodeIfPresent(FunctionRunSlice.self, forKey: .slice)
     }
 
-    /// The three statuses a function run can have SETTLED on.
+    /// The four statuses a function run can have SETTLED on. `denied` is a
+    /// webhook or cron fire the function's `authorize` refused before its
+    /// handler ran.
     ///
     /// `missing` is NOT one: that run's execution can no longer be resolved,
     /// which is a not-found rather than an ending. Neither are the DSL-only
     /// states, which a function run never enters.
     public static let terminalStatuses: Set<String> = [
-        "completed", "failed", "terminated",
+        "completed", "failed", "terminated", "denied",
     ]
 
     /// Every status a function run can report.
     public static let statusValues: Set<String> = [
-        "queued", "running", "completed", "failed", "terminated", "missing",
+        "queued", "running", "completed", "failed", "terminated", "missing", "denied",
     ]
 
     /// Has this run settled?
@@ -529,15 +569,175 @@ public struct FunctionRunResult<Output: Decodable & Sendable>: Sendable {
     public var isFailure: Bool { status == "failed" }
 }
 
+// MARK: - Listing runs and a run's steps (#4145)
+
+/// Filters and paging for `functions.listRuns(options:)`. Mirrors JS
+/// `FunctionRunListOptions`. Every field is optional, and the filters combine.
+public struct FunctionRunListOptions: Sendable, Equatable {
+    /// Only this function's runs. Matched exactly, case included.
+    public var functionKey: String?
+    /// Only runs started against this document. The page is then ordered by
+    /// status, then newest first within a status.
+    public var contextDocId: String?
+    /// Only runs in this status: one of ``FunctionRunStatus/statusValues``.
+    public var status: String?
+    /// Page size. Defaults to 50; the server caps it at 200.
+    public var limit: Int?
+    /// The previous page's `nextCursor`. Send the same filters with it.
+    public var cursor: String?
+    /// `true` reverses the order. Sent only when `true`.
+    public var forward: Bool?
+
+    public init(
+        functionKey: String? = nil,
+        contextDocId: String? = nil,
+        status: String? = nil,
+        limit: Int? = nil,
+        cursor: String? = nil,
+        forward: Bool? = nil
+    ) {
+        self.functionKey = functionKey
+        self.contextDocId = contextDocId
+        self.status = status
+        self.limit = limit
+        self.cursor = cursor
+        self.forward = forward
+    }
+}
+
+/// One page of `functions.listRuns`. Mirrors JS `FunctionRunPage`.
+///
+/// An item this client cannot decode is dropped rather than failing the page
+/// (the same rule): a listing is many answers, and one field the client
+/// cannot vouch for must not cost the caller the rest.
+public struct FunctionRunPage: Decodable, Sendable, Equatable {
+    public let items: [FunctionRunInfo]
+    /// True when a next page exists. Derived from `nextCursor` when the
+    /// server leaves it out.
+    public let hasMore: Bool
+    /// Pass back as `cursor`, with the same filters, for the next page.
+    public let nextCursor: String?
+    /// Runs the server examined, on a read without `contextDocId`. A
+    /// `nextCursor` with fewer items than the `limit` asked for means the
+    /// server stopped on its scan budget rather than at the end. `nil` when
+    /// the server did not report it — "unknown", never zero.
+    public let scanned: Int?
+
+    private enum CodingKeys: String, CodingKey {
+        case items, hasMore, nextCursor, scanned
+    }
+
+    public init(
+        items: [FunctionRunInfo] = [],
+        hasMore: Bool = false,
+        nextCursor: String? = nil,
+        scanned: Int? = nil
+    ) {
+        self.items = items
+        self.hasMore = hasMore
+        self.nextCursor = nextCursor
+        self.scanned = scanned
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        items = (try c.decodeIfPresent([Lossy<FunctionRunInfo>].self, forKey: .items) ?? [])
+            .compactMap(\.value)
+        let next = try c.decodeIfPresent(String.self, forKey: .nextCursor)
+        nextCursor = next
+        hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (next != nil)
+        scanned = try c.decodeIfPresent(Int.self, forKey: .scanned)
+    }
+}
+
+/// One step a function run recorded: a `step.do`, a `step.sleep`, and so on.
+/// Mirrors JS `FunctionStepRun`.
+///
+/// Only the fields a function step has. The workflow step record's rendered
+/// `config`, `rawConfig`, `context`, `templateWarnings` and token counts
+/// describe a DSL step and are not declared here.
+public struct FunctionStepRun: Decodable, Sendable, Equatable {
+    public let stepRunId: String
+    public let runId: String
+    /// Position in the run, from 0.
+    public let stepIndex: Int?
+    /// The name the function gave the step.
+    public let stepId: String?
+    /// `function.step` for a `step.do`, `function.sleep` for a `step.sleep`.
+    public let stepKind: String?
+    /// `running`, `completed` or `failed`. A step still executing is listed
+    /// as `running`, and its `endedAt` / `durationMs` are placeholders until
+    /// it ends.
+    public let status: String
+    public let input: JSONValue?
+    /// What the step's body returned.
+    public let output: JSONValue?
+    /// Why the step failed, when it did.
+    public let error: String?
+    public let errorDetails: JSONValue?
+    public let startedAt: String?
+    public let endedAt: String?
+    public let durationMs: Double?
+    public let retryCount: Int?
+
+    private enum CodingKeys: String, CodingKey {
+        case stepRunId, runId, stepIndex, stepId, stepKind, status
+        case input, output, error, errorDetails
+        case startedAt, endedAt, durationMs, retryCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        stepRunId = try c.decodeIfPresent(String.self, forKey: .stepRunId) ?? ""
+        runId = try c.decodeIfPresent(String.self, forKey: .runId) ?? ""
+        stepIndex = try c.decodeIfPresent(Int.self, forKey: .stepIndex)
+        stepId = try c.decodeIfPresent(String.self, forKey: .stepId)
+        stepKind = try c.decodeIfPresent(String.self, forKey: .stepKind)
+        status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""
+        input = try c.decodeIfPresent(JSONValue.self, forKey: .input)
+        output = try c.decodeIfPresent(JSONValue.self, forKey: .output)
+        error = try c.decodeIfPresent(String.self, forKey: .error)
+        errorDetails = try c.decodeIfPresent(JSONValue.self, forKey: .errorDetails)
+        startedAt = try c.decodeIfPresent(String.self, forKey: .startedAt)
+        endedAt = try c.decodeIfPresent(String.self, forKey: .endedAt)
+        durationMs = try c.decodeIfPresent(Double.self, forKey: .durationMs)
+        retryCount = try c.decodeIfPresent(Int.self, forKey: .retryCount)
+    }
+}
+
+/// What `functions.listRunSteps` answers: every step, oldest first. Mirrors
+/// JS `FunctionRunSteps`. An undecodable step is dropped, as on the page.
+public struct FunctionRunSteps: Decodable, Sendable, Equatable {
+    public let items: [FunctionStepRun]
+
+    private enum CodingKeys: String, CodingKey { case items }
+
+    public init(items: [FunctionStepRun] = []) {
+        self.items = items
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        items = (try c.decodeIfPresent([Lossy<FunctionStepRun>].self, forKey: .items) ?? [])
+            .compactMap(\.value)
+    }
+}
+
+/// One array element decoded on its own: `nil` when it does not decode, so
+/// the element costs itself and never the array around it.
+private struct Lossy<Value: Decodable>: Decodable {
+    let value: Value?
+
+    init(from decoder: Decoder) throws {
+        value = try? Value(from: decoder)
+    }
+}
+
 /// How long `functions.waitFor` may wait.
 ///
-/// Structurally what `WaitForWorkflowOptions` carries, and nominally its own:
-/// a function caller names a function type. The rename is declared in
-/// `swift-client/CHANGELOG.md`, which is the whole mitigation for a break on a
-/// client with no versions (its own words).
 public struct FunctionWaitOptions: Sendable {
     /// Maximum time to wait for the run to settle before throwing
-    /// `.workflowWaitTimeout`. Defaults to 15 minutes; `0` or a negative value
+    /// `.functionWaitTimeout`. Defaults to 15 minutes; `0` or a negative value
     /// waits indefinitely.
     public var timeout: TimeInterval?
 
@@ -550,7 +750,7 @@ public struct FunctionWaitOptions: Sendable {
 
 /// What a terminate 404 actually said.
 ///
-/// `POST /workflows/{key}/instances/{runKey}/terminate` answers
+/// `POST /functions/{key}/instances/{runKey}/terminate` answers
 /// `404 { status: "missing", error }` for THREE different things: a row that
 /// does not exist, a row with no instance id, and ANY exception out of
 /// `instance.terminate()` with the engine's own message as `error`. Folding
@@ -603,7 +803,7 @@ public enum FunctionTerminateClassifier {
 
 /// What a run-status 404 actually said.
 ///
-/// `GET /workflows/runs/{runId}/status` answers 404 for two unrelated facts,
+/// `GET /functions/runs/{runId}/status` answers 404 for two unrelated facts,
 /// and folding them together is what made `functions.waitFor` report a live
 /// run missing:
 ///

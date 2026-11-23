@@ -4,7 +4,7 @@
 import Foundation
 import JsBaoClient
 
-public struct TaskRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable {
+public struct TaskRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashable, Codable, TypedQueryModel {
     public static let modelName = "tasks"
     public static let primitiveSchema = PrimitiveSchema(
         name: "tasks",
@@ -16,6 +16,19 @@ public struct TaskRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hash
             "createdAt": FieldDescriptor(type: .date),
         ]
     )
+
+    /// One typed token per field, for the checked reads
+    /// (`query(where:)`, `count(where:)`, `aggregate(groupBy:operations:)`).
+    public struct Fields: Sendable {
+        public let id: TaskRecord._IdFieldToken = .init("id")
+        public let title: TaskRecord._StringFieldToken = .init("title")
+        public let priority: TaskRecord._NumberFieldToken = .init("priority")
+        public let tags: TaskRecord._StringSetFieldToken = .init("tags")
+        public let createdAt: TaskRecord._DateFieldToken = .init("createdAt")
+    }
+
+    /// The model's field tokens.
+    public static let fields = Fields()
 
     public var id: String {
         didSet { _changedFields.insert("id") }
@@ -228,7 +241,8 @@ public extension TaskRecord {
             data: PrimitiveRowDecoder.decodeAll(page.data, as: TaskRecord.self),
             nextCursor: page.nextCursor,
             prevCursor: page.prevCursor,
-            hasMore: page.hasMore
+            hasMore: page.hasMore,
+            drift: page.drift
         )
     }
 
@@ -240,13 +254,15 @@ public extension TaskRecord {
             data: PrimitiveRowDecoder.decodeAll(page.data, as: TaskRecord.self),
             nextCursor: page.nextCursor,
             prevCursor: page.prevCursor,
-            hasMore: page.hasMore
+            hasMore: page.hasMore,
+            drift: page.drift
         )
     }
 
-    /// Count across all open documents.
-    static func count(_ filter: DocumentFilter? = nil) throws -> Int {
-        try JsBaoClient.requireDefault().codegen.count(primitiveSchema, filter: filter)
+    /// Count across all open documents. `options.maxDrift` refuses a
+    /// db3's count `DB3_DRIFT_EXCEEDED` as a page is.
+    static func count(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> Int {
+        try JsBaoClient.requireDefault().codegen.count(primitiveSchema, filter: filter, options: options)
     }
 
     /// Every record across all open documents. Synchronous like the
@@ -432,5 +448,62 @@ public extension TaskRecord {
     /// Delete this record from document `documentId`. Throws if the doc isn't open.
     func delete(in documentId: String) throws {
         try JsBaoClient.requireDefault().codegen.delete(Self.primitiveSchema, id: id, in: documentId)
+    }
+
+    /// `save(in:)` with a db3 write's guards. On a db3 the room judges
+    /// them: `options.condition` (the record must match it, in the
+    /// query filter grammar) and `options.ifNotExists` (the save lands
+    /// only as a create, while no live record has this id). A guarded
+    /// save shows on this device only once the room accepts it. With
+    /// `options.confirm` the call returns once the room accepted the
+    /// save and throws its refusal: `.db3ConditionNotMet`, with the
+    /// record as it is now under `details["current"]`. While the db3
+    /// is not subscribed, a confirmed save waits for the next subscribe.
+    ///
+    /// Returns the record as this device then shows it, with no pending
+    /// changes left: with `confirm`, as saved; without it, a guarded
+    /// save's values are not shown yet. On a document that is not a db3
+    /// the options are ignored and it saves as `save(in:)` does.
+    @discardableResult
+    func save(in documentId: String, options: JsBaoClient.Db3WriteOptions) async throws -> TaskRecord {
+        let record = try await JsBaoClient.requireDefault().codegen.save(Self.primitiveSchema, id: id, values: primitiveValues(), in: documentId, changedFields: _changedFields, options: options)
+        guard var saved = TaskRecord(record: record) else {
+            var fallback = self
+            fallback.discardChanges()
+            return fallback
+        }
+        // Carried over, not persisted: query-time includes and the
+        // caller-pinned-id flag have no representation in the stored
+        // record, and this path never changes the record's id.
+        saved.related = related
+        saved._explicitId = _explicitId
+        return saved
+    }
+
+    /// Delete this record from db3 `documentId` only if it matches
+    /// `options.condition`, which the room judges. With
+    /// `options.confirm` the call returns once the room accepted the
+    /// delete and throws its refusal (`.db3ConditionNotMet`); while the
+    /// db3 is not subscribed, it waits for the next subscribe. With
+    /// neither, and on a document that is not a db3, it deletes as
+    /// `delete(in:)` does.
+    func delete(in documentId: String, options: JsBaoClient.Db3WriteOptions) async throws {
+        try await JsBaoClient.requireDefault().codegen.delete(Self.primitiveSchema, id: id, in: documentId, options: options)
+    }
+
+    /// Add each of `fields` to record `id`'s number fields in db3
+    /// `documentId`: a negative delta subtracts, and a missing field
+    /// starts at 0. Increments made offline or on several devices at
+    /// once all count. Answers each field's new value as this device
+    /// shows it; with `options.confirm` or an `options.condition`, the
+    /// room's values once it applied the increment, throwing its
+    /// refusal (`.db3ConditionNotMet`, or `.db3RecordNotFound` for a
+    /// record deleted meanwhile). A record this device does not hold
+    /// throws `.db3RecordNotFound` and nothing is sent; a document that
+    /// is not a db3 throws `.invalidArgument`. Mirrors the JS client's
+    /// `Model.increment(id, fields, options)`.
+    @discardableResult
+    static func increment(id: String, fields: [String: Double], in documentId: String, options: JsBaoClient.Db3WriteOptions = JsBaoClient.Db3WriteOptions()) async throws -> [String: Double] {
+        try await JsBaoClient.requireDefault().codegen.increment(primitiveSchema, id: id, fields: fields, in: documentId, options: options)
     }
 }

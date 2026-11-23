@@ -78,41 +78,32 @@ public struct CreateInvitationParams: Encodable, Sendable {
 }
 
 /// A page of app invitations with an optional pagination cursor. Mirrors JS
-/// `InvitationListResult` (`{ items, cursor }`).
+/// `InvitationListResult` (`{ items, hasMore, nextCursor? }`).
 public struct InvitationListResult: Decodable, Sendable, Equatable {
     public let items: [AppInvitationInfo]
-    /// Continuation token for the next page (#1316).
+    /// Continuation token for the next page.
     public let nextCursor: String?
-    /// True when a next page exists (#1316).
+    /// True when a next page exists.
     public let hasMore: Bool
-    /// Deprecated alias of `nextCursor` kept for one deprecation window
-    /// (#1316, #1982). Computed from `nextCursor` so the type's own
-    /// initializers never reference the deprecated declaration.
-    @available(*, deprecated, message: "Use nextCursor.")
-    public var cursor: String? { nextCursor }
 
     private enum CodingKeys: String, CodingKey {
-        case items, cursor, nextCursor, hasMore
+        case items, nextCursor, hasMore
     }
 
     public init(
         items: [AppInvitationInfo],
-        cursor: String? = nil,
         nextCursor: String? = nil,
         hasMore: Bool? = nil
     ) {
         self.items = items
-        let next = nextCursor ?? cursor
-        self.nextCursor = next
-        self.hasMore = hasMore ?? (next != nil)
+        self.nextCursor = nextCursor
+        self.hasMore = hasMore ?? (nextCursor != nil)
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         items = try c.decodeIfPresent([AppInvitationInfo].self, forKey: .items) ?? []
-        // #1316: prefer `nextCursor`; `cursor` is the deprecated alias.
         let next = try c.decodeIfPresent(String.self, forKey: .nextCursor)
-            ?? c.decodeIfPresent(String.self, forKey: .cursor)
         nextCursor = next
         hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (next != nil)
     }
@@ -124,7 +115,7 @@ public struct InvitationDeleteResult: Decodable, Sendable, Equatable {
     public let message: String
 }
 
-/// Result of `invitations.accept` (#466). The invitation is marked accepted
+/// Result of `invitations.accept`. The invitation is marked accepted
 /// (write-once) and all linked deferred grants resolve to the authenticated
 /// user. Mirrors JS `AcceptInviteResult`.
 public struct AcceptInviteResult: Decodable, Sendable, Equatable {
@@ -158,7 +149,7 @@ public struct DeferredDocumentGrant: Decodable, Sendable, Equatable {
     public let type: DeferredGrantType
     public let email: String
     public let documentId: String
-    public let permission: String
+    public let permission: DocumentGrantLevel
     public let grantedBy: String
     public let createdAt: String
     public let expiresAt: String
@@ -212,26 +203,18 @@ public enum DeferredGrant: Decodable, Sendable, Equatable {
     }
 }
 
-/// A page of deferred grants. Mirrors JS `DeferredGrantListResult`.
-/// As of #1316 the server emits the unified `{ items, hasMore, nextCursor }`
-/// envelope with `grants` kept as a legacy alias of `items` for one
-/// deprecation window; the cursor is a real position token (previously a
-/// non-functional `"more"` sentinel).
+/// A page of deferred grants. Mirrors JS `DeferredGrantListResult`
+/// (`{ items, hasMore, nextCursor? }`). The cursor is a real position token.
 public struct DeferredGrantListResult: Decodable, Sendable, Equatable {
-    /// The page's grants — the unified list key (#1316, #1982). Mirrors JS
-    /// `DeferredGrantListResult.items`.
+    /// The page's grants. Mirrors JS `DeferredGrantListResult.items`.
     public let items: [DeferredGrant]
-    /// Deprecated alias of `items` kept for one deprecation window. Computed
-    /// from `items` so the type's own initializers never reference the
-    /// deprecated declaration.
-    @available(*, deprecated, message: "Use items.")
-    public var grants: [DeferredGrant] { items }
+    /// Continuation token for the next page.
     public let nextCursor: String?
-    /// True when a next page exists (#1316).
+    /// True when a next page exists.
     public let hasMore: Bool
 
     private enum CodingKeys: String, CodingKey {
-        case grants, items, nextCursor, hasMore
+        case items, nextCursor, hasMore
     }
 
     public init(items: [DeferredGrant], nextCursor: String? = nil, hasMore: Bool? = nil) {
@@ -240,16 +223,9 @@ public struct DeferredGrantListResult: Decodable, Sendable, Equatable {
         self.hasMore = hasMore ?? (nextCursor != nil)
     }
 
-    /// Deprecated spelling of ``init(items:nextCursor:hasMore:)``.
-    @available(*, deprecated, message: "Use init(items:nextCursor:hasMore:).")
-    public init(grants: [DeferredGrant], nextCursor: String? = nil, hasMore: Bool? = nil) {
-        self.init(items: grants, nextCursor: nextCursor, hasMore: hasMore)
-    }
-
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        items = try c.decodeIfPresent([DeferredGrant].self, forKey: .items)
-            ?? c.decodeIfPresent([DeferredGrant].self, forKey: .grants) ?? []
+        items = try c.decodeIfPresent([DeferredGrant].self, forKey: .items) ?? []
         nextCursor = try c.decodeIfPresent(String.self, forKey: .nextCursor)
         hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (nextCursor != nil)
     }

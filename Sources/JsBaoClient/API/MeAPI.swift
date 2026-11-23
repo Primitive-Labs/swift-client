@@ -7,7 +7,7 @@ public final class MeAPI: @unchecked Sendable {
     private let cache: CacheFacade?
     /// Snapshot of the local document-metadata cache (`documentId` →
     /// `LocalMetadataEntry`). Drives the offline-first merge in
-    /// `ownedDocuments` / `sharedDocuments` (#938). Defaults to empty when
+    /// `ownedDocuments` / `sharedDocuments`. Defaults to empty when
     /// MeAPI is constructed standalone (e.g. in unit tests), which makes both
     /// methods degrade gracefully to a bare network fetch.
     private let localMetadata: () -> [String: LocalMetadataEntry]
@@ -17,13 +17,13 @@ public final class MeAPI: @unchecked Sendable {
     /// construction so the network path is taken.
     private let isOnline: () -> Bool
     /// Writes a freshly-fetched server list back into the local document
-    /// metadata cache, so the next local-first `ownedDocuments` call sees it
-    /// (#2360). Wired to `DocumentManager.handleServerDocuments` by
+    /// metadata cache, so the next local-first `ownedDocuments` call sees it.
+    /// Wired to `DocumentManager.handleServerDocuments` by
     /// `JsBaoClient.setupSubApis`; a no-op for standalone construction.
     private let syncServerDocuments: ([DocumentInfo]) async -> Void
     /// The token's `rootDocId`, so the local-first paths can apply the same
-    /// root predicate the server applies to `/me/owned-documents` (#848 /
-    /// #2360). Wired to `JsBaoClient.getRootDocId()`; `nil` for standalone
+    /// root predicate the server applies to `/me/owned-documents`.
+    /// Wired to `JsBaoClient.getRootDocId()`; `nil` for standalone
     /// construction, where the `__ROOT_TAG__` sentinel still catches a
     /// tagged root row.
     private let rootDocId: () -> String?
@@ -98,6 +98,7 @@ public final class MeAPI: @unchecked Sendable {
     /// `nil` rather than throwing — the `try?` here is the one intentional
     /// response-body leniency left on the typed path. Non-2xx statuses still
     /// throw, as everywhere else.
+    /// - Stability: production
     public func get(options: FetchCachedOptions? = nil) async throws -> UserProfile? {
         guard let cache = cache else {
             return Self.userProfile(from: try await fetchProfile())
@@ -144,6 +145,7 @@ public final class MeAPI: @unchecked Sendable {
     }
 
     /// Returns cache metadata for the current user's profile entry.
+    /// - Stability: production
     public func cacheInfo() async -> MeCacheInfo {
         guard let cache = cache else { return MeCacheInfo(updatedAt: nil, ageMs: nil) }
         let info = await cache.info(key: "me")
@@ -151,6 +153,7 @@ public final class MeAPI: @unchecked Sendable {
     }
 
     /// Clears the cached profile so the next get() fetches fresh data.
+    /// - Stability: production
     public func clearCache() async {
         guard let cache = cache else { return }
         await cache.clear(key: "me")
@@ -159,20 +162,22 @@ public final class MeAPI: @unchecked Sendable {
     /// List documents the current user has access to but doesn't own
     /// (the "shared with me" filter). Mirrors js-bao's
     /// `client.me.sharedDocuments(options)`. Returns the unified
-    /// `{ items, cursor? }` envelope as a typed `SharedDocumentListResult`.
+    /// `{ items, hasMore, nextCursor? }` envelope as a typed
+    /// `SharedDocumentListResult`.
     ///
     /// - Parameters:
-    ///   - cursor: opaque pagination cursor returned by the previous call
+    ///   - cursor: the `nextCursor` returned by the previous call
     ///   - limit: page size
     ///   - tag: filter to documents bearing this tag
     ///
-    /// Offline-first (#938): when online, fetches the server page AND merges
+    /// Offline-first: when online, fetches the server page AND merges
     /// in non-owner rows from the local metadata cache (deduped by
     /// `documentId`, server rows winning on conflict) so locally-known shares
     /// the server page didn't return still appear. When offline, returns the
     /// non-owner subset of the local cache only. The non-owner predicate is
     /// the discriminator: rows with `permission == "owner"` (or no permission)
     /// belong to `ownedDocuments` and are excluded here.
+    /// - Stability: production
     public func sharedDocuments(
         cursor: String? = nil,
         limit: Int? = nil,
@@ -188,7 +193,7 @@ public final class MeAPI: @unchecked Sendable {
         // Offline: return the local cache subset only — no server call.
         if !isOnline() {
             let items = localShared.map { LocalFirstListing.sharedDocument(from: $0) }
-            return SharedDocumentListResult(items: items, cursor: nil)
+            return SharedDocumentListResult(items: items, hasMore: false)
         }
 
         var query = URLQuery()
@@ -214,14 +219,14 @@ public final class MeAPI: @unchecked Sendable {
     /// List documents the current user owns (live owner, not creator —
     /// ownership transfer is reflected here). Mirrors js-bao's
     /// `client.me.ownedDocuments(options)`, whose default return is a flat
-    /// `DocumentInfo[]`. Accepts both a bare-array response and an
-    /// `{ items, cursor? }` envelope.
+    /// `DocumentInfo[]`. Accepts both a bare-array response and the
+    /// `{ items, hasMore, nextCursor? }` envelope.
     ///
-    /// Offline-first (#938, widened in #2360): the default `waitForLoad`
+    /// Offline-first: the default `waitForLoad`
     /// (`.localIfAvailableElseNetwork`) returns the local metadata cache's
     /// owner rows immediately when it has any and refreshes from the server in
     /// the background, so the next call is fresh — js-bao parity, and a
-    /// freshness change from the pre-#2360 Swift behavior, which always
+    /// freshness change from the earlier Swift behavior, which always
     /// blocked on the server. Pass `waitForLoad: .network` for the old
     /// always-fresh semantics. A server fetch merges its rows with the local
     /// ones (deduped by `documentId`, server rows winning) so freshly-created
@@ -233,6 +238,7 @@ public final class MeAPI: @unchecked Sendable {
     /// pending-create doc (the creator is the owner).
     ///
     /// See `MeOwnedDocumentsOptions` for the full resolution order.
+    /// - Stability: production
     public func ownedDocuments(
         cursor: String? = nil,
         limit: Int? = nil,
@@ -245,21 +251,23 @@ public final class MeAPI: @unchecked Sendable {
         return page.items
     }
 
-    /// `me.ownedDocuments` returning the `{ items, cursor }` page envelope.
+    /// `me.ownedDocuments` returning the `{ items, hasMore, nextCursor? }` page
+    /// envelope.
     /// Mirrors js-bao's `ownedDocuments({ returnPage: true })` overload, which
     /// statically resolves to `Promise<DocumentListPage>`. Swift can't express
     /// the union return of the JS overload set, so the page form is a separate
     /// entry point. Equivalent to passing `options.returnPage = true`.
     ///
     /// The paged form never takes the local-first short-circuit: a local
-    /// answer ignores `limit` and reports `cursor == nil`, which a paginating
+    /// answer ignores `limit` and reports `nextCursor == nil`, which a paginating
     /// caller reads as "no more pages". js-bao carves the paged form out of
     /// that branch for the same reason (`documentsApi.ts:1234-1237`), so under
     /// the default `waitForLoad` this always goes to the server. The
     /// cache-only modes (`localOnly`, `refreshFromServer: false`,
     /// `waitForLoad: .local`) and the offline fallback still answer locally —
     /// they asked for the cache explicitly — returning every matching row with
-    /// `cursor == nil`, which is also what js-bao does.
+    /// `nextCursor == nil`, which is also what js-bao does.
+    /// - Stability: production
     public func ownedDocumentsPage(
         cursor: String? = nil,
         limit: Int? = nil,
@@ -281,13 +289,13 @@ public final class MeAPI: @unchecked Sendable {
     /// declared and never read):
     ///
     /// 1. `localOnly`, `refreshFromServer == false`, or `waitForLoad == .local`
-    ///    → local cache rows only, no HTTP request, `cursor == nil`.
+    ///    → local cache rows only, no HTTP request, `nextCursor == nil`.
     /// 2. Offline → `.network` throws `.listUnavailableOffline`; any other
     ///    mode returns local cache rows.
     /// 3. Default `.localIfAvailableElseNetwork` with a non-empty local
     ///    cache → return the local rows immediately and refresh from the
     ///    server in the background so the next call is fresh (js-bao
-    ///    `_listImpl` parity — sponsor decision on #2360; before this the
+    ///    `_listImpl` parity — sponsor decision; before this the
     ///    default always blocked on the server).
     /// 4. Otherwise (`.network`, or an empty local cache) → blocking server
     ///    fetch merged with the local rows, server rows winning by
@@ -300,7 +308,7 @@ public final class MeAPI: @unchecked Sendable {
     /// that asked to wait for the server is told the server didn't answer.
     ///
     /// `limit` / `cursor` are ignored on every local path — the local cache
-    /// isn't paginated — and the returned `cursor` is `nil` there. Because of
+    /// isn't paginated — and the returned `nextCursor` is `nil` there. Because of
     /// that, `paged` (set by `ownedDocumentsPage`) suppresses step 3: a paged
     /// caller handed a `nil` cursor reads it as "no more pages", so the paged
     /// form goes to the server rather than short-circuiting on a warm cache.
@@ -313,11 +321,11 @@ public final class MeAPI: @unchecked Sendable {
     /// those rows on every page (js-bao returns before its union at
     /// `documentsApi.ts:1338-1340`).
     ///
-    /// The app root document is filtered identically on every path (#848):
+    /// The app root document is filtered identically on every path:
     /// local rows and server rows alike drop it unless `includeRoot` is set,
     /// matched by id (`getRootDocId()`) or the `__ROOT_TAG__` sentinel rather
     /// than by permission, since the root's permission is `read-write` and
-    /// never `owner` (#875). And a local-first call that asked for
+    /// never `owner`. And a local-first call that asked for
     /// `includeRoot` whose cache lacks the root falls through to the server
     /// instead of quietly answering without it — js-bao `_listImpl` parity.
     private func ownedDocumentsImpl(
@@ -369,7 +377,7 @@ public final class MeAPI: @unchecked Sendable {
         func localPage() -> DocumentListPage {
             DocumentListPage(
                 items: localOwned.map { LocalFirstListing.documentInfo(from: $0) },
-                cursor: nil
+                hasMore: false
             )
         }
 
@@ -452,7 +460,7 @@ public final class MeAPI: @unchecked Sendable {
         // a page would push it past `limit` and repeat the same local-only
         // rows on every page a cursor walk visits.
         if paged {
-            return DocumentListPage(items: serverItems, cursor: page.cursor)
+            return DocumentListPage(items: serverItems, nextCursor: page.nextCursor, hasMore: page.hasMore)
         }
 
         // Merge: server rows win on `documentId`; append local-only owned docs
@@ -464,13 +472,13 @@ public final class MeAPI: @unchecked Sendable {
             id: { $0.documentId },
             project: { LocalFirstListing.documentInfo(from: $0) }
         )
-        return DocumentListPage(items: merged, cursor: page.cursor)
+        return DocumentListPage(items: merged, nextCursor: page.nextCursor, hasMore: page.hasMore)
     }
 
     /// One `GET /me/owned-documents`, bounded by `serverTimeoutMs`.
     ///
-    /// Accepts either a bare array or an `{ items, cursor }` (legacy
-    /// `{ documents }`) envelope — matching `documents.list`. `timeoutMs <= 0`
+    /// Accepts either a bare array or the `{ items, hasMore, nextCursor? }`
+    /// envelope — matching `documents.list`. `timeoutMs <= 0`
     /// means unbounded, matching `KvCache`'s reading of the same option.
     private func fetchOwnedDocuments(
         path: String,
@@ -508,6 +516,9 @@ public final class MeAPI: @unchecked Sendable {
             defer { self.refreshLock.withLock { self.refreshInFlight = false } }
             do {
                 let page = try await self.fetchOwnedDocuments(path: path, timeoutMs: timeoutMs)
+                // Cancelled by a logout: these rows belong to the session
+                // that just ended and must not land in the local cache.
+                guard !Task.isCancelled else { return }
                 await self.syncServerDocuments(page.items)
                 // `Logger.debug` isn't autoclosure'd, so the interpolation
                 // would run at every log level without this guard.
@@ -522,6 +533,16 @@ public final class MeAPI: @unchecked Sendable {
         }
     }
 
+    /// Cancel the in-flight background refresh, if any, and wait for it to
+    /// end. Logout calls this before its local cleanup, so a list fetched for
+    /// the session that is ending never lands in the local cache the next
+    /// session reads.
+    func cancelBackgroundRefresh() async {
+        let task = refreshLock.withLock { backgroundRefresh }
+        task?.cancel()
+        await task?.value
+    }
+
     /// Wait for the in-flight background refresh, if any. Test-only hook —
     /// production callers never wait on a refresh by design.
     func awaitBackgroundRefresh() async {
@@ -532,6 +553,7 @@ public final class MeAPI: @unchecked Sendable {
     /// Update the current user's profile (name and/or external avatar URL).
     /// Mirrors js-bao's `me.update(params)` → `UserProfile`. Pass
     /// `avatarUrl: .clear` to remove the current avatar (JS `avatarUrl: null`).
+    /// - Stability: production
     public func update(params: UpdateMeParams) async throws -> UserProfile {
         // The cache is cleared whether or not the response body decodes: on a
         // 2xx the server-side update has already happened, so a cached profile
@@ -568,6 +590,7 @@ public final class MeAPI: @unchecked Sendable {
     ///
     /// Returns a typed `AvatarUploadResult` carrying the new `avatarUrl`,
     /// mirroring js-bao's `{ avatarUrl }`.
+    /// - Stability: production
     public func uploadAvatar(imageData: Data, contentType: AvatarContentType) async throws -> AvatarUploadResult {
         let (body, status) = try await transport.requestData(
             method: .post,

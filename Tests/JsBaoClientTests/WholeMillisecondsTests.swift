@@ -3,12 +3,12 @@ import XCTest
 @testable import JsBaoClient
 
 /// `TimeInterval.wholeMilliseconds` is the one conversion every `TimeInterval`
-/// parameter the #2367 migration introduced passes through — lock TTLs,
-/// workflow timeouts, cache freshness windows. `Int(_:)` traps on a `Double`
-/// that is non-finite or out of `Int`'s range, and the `Int` parameters this
-/// migration replaced could not express those values, so the trap surface is
-/// new: `client.locks.acquire(key:ttl: .infinity)` would have terminated the
-/// process rather than throwing.
+/// parameter the #2367 migration introduced passes through — workflow
+/// timeouts, cache freshness windows (and lock TTLs, until #4959 retired
+/// `client.locks`). `Int(_:)` traps on a `Double` that is non-finite or out of
+/// `Int`'s range, and the `Int` parameters this migration replaced could not
+/// express those values, so the trap surface is new: a `.infinity` lease would
+/// have terminated the process rather than throwing.
 final class WholeMillisecondsTests: XCTestCase {
 
     // MARK: - The floor (pre-existing behavior, pinned)

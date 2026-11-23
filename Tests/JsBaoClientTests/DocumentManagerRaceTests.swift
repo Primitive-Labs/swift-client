@@ -15,6 +15,7 @@ import YSwift
 ///
 /// The fix coalesces concurrent opens for the same `documentId` so all
 /// callers receive **the same** `YDocument` instance (`===`).
+@available(*, deprecated)
 final class DocumentManagerRaceTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

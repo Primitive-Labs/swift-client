@@ -3,25 +3,26 @@ import Foundation
 // MARK: - FunctionsAPI
 
 /// Server functions, available as `client.functions`. Mirrors the JS client's
-/// `client.functions` (`src/client/api/functionsApi.ts`) — #3278.
+/// `client.functions` (`src/client/api/functionsApi.ts`).
 ///
 /// A function is TypeScript an app's team authored in its config tree and
 /// pushed with `primitive config push`. A REQUEST function is invoked and
 /// answers its result; a TASK function is started and answers a run id that
-/// is polled on exactly the routes a DSL workflow run is. The method set is
+/// is polled on the function run routes. The method set is
 /// JS's and nothing more: `invoke`, `start`, `getStatus`, `waitFor`,
-/// `terminate`. The client-apply trio stays on `workflows`, where both
-/// clients keep it — a function run never enters `apply_pending`.
+/// `terminate`, and the run listing's `listRuns` and `listRunSteps`.
+/// There is no client-apply protocol: a function run never enters
+/// `apply_pending`.
 ///
-/// #3565 — the three control methods post the run routes THEMSELVES and
+/// The three control methods post the run routes THEMSELVES and
 /// answer `FunctionRunStatus` / `FunctionRunResult<Output>`. Polling those
 /// routes stays an implementation choice; it used to reach the caller as
 /// vocabulary — a `skipReason` and a `run.workflowId` the server can never set
 /// for a function, and a missing run reported as a missing WORKFLOW run. This
-/// class references no workflow type and holds no `WorkflowsAPI`.
+/// class references no workflow type.
 ///
 /// `waitFor` polls rather than waiting on a frame: a function run broadcasts
-/// no `workflowStatus`, so a listener would have nothing to wake it.
+/// no status frame, so a listener would have nothing to wake it.
 public final class FunctionsAPI: @unchecked Sendable {
     private let transport: any Transport
     private let logger: Logger?
@@ -46,7 +47,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     static let waitDefaultTimeout: TimeInterval = 15 * 60
 
     /// How long a wait keeps polling a run id the platform reports NO ROW for
-    /// — #3661, and the JS client's `FUNCTION_WAIT_NOT_FOUND_GRACE_MS`.
+    /// — matching the JS client's `FUNCTION_WAIT_NOT_FOUND_GRACE_MS`.
     ///
     /// Bounds one thing only: an eventually consistent read that has not
     /// caught up with a committed row. That is a phenomenon of a replica, not
@@ -80,11 +81,11 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// input, `output` decoded into `Output`.
     ///
     /// This is the ONLY way in, and the binding surface the generated per-key
-    /// Swift types use. #3278 shipped an untyped `[String: Any]` twin beside
-    /// it because no per-key types existed yet to express an invocation with;
-    /// #3344 generated them, and the twin went with the reason for it. A
-    /// caller whose function has no declared schema — or who is genuinely
-    /// dynamic — names the witness: `invoke(key, input: nil as JSONValue?)`
+    /// Swift types use. An earlier change shipped an untyped `[String: Any]`
+    /// twin beside it because no per-key types existed yet to express an
+    /// invocation with; a later one generated them, and the twin went with
+    /// the reason for it. A caller whose function has no declared schema —
+    /// or who is genuinely dynamic — names the witness: `invoke(key, input: nil as JSONValue?)`
     /// bound `as FunctionResult<JSONValue>`.
     ///
     /// `input` is named for what it is on this side of the wire; it travels
@@ -95,19 +96,17 @@ public final class FunctionsAPI: @unchecked Sendable {
     ///
     /// A settled invocation never throws, whatever its `status`. A platform
     /// refusal (access, disabled, unpushed, rate, unknown key) throws an
-    /// `HttpError` with the server's `errorCode` on `serverCode`. Calling this
-    /// on a TASK function throws `.functionModeMismatch` — the server answered
-    /// a start envelope, which promises none of what this method's type does.
+    /// `HttpError` with the server's `errorCode` on `serverCode`. Every pushed
+    /// function takes both verbs: the route is the runtime selector.
     ///
     /// The input is encoded once and sent as the JSON value it produces —
     /// object, array, string, number or boolean — unchanged, exactly as the JS
     /// client forwards `input`. A function whose schema declares an array or
-    /// scalar root receives that. This is where the port deliberately does
-    /// NOT follow `WorkflowsAPI`, whose `rootInput` is always an object: a
-    /// non-object lowered to `{}` would silently change what the function
-    /// runs. A `nil` input omits `rootInput` (the server supplies `{}`); an
+    /// scalar root receives that: a non-object lowered to `{}` would silently
+    /// change what the function runs. A `nil` input omits `rootInput` (the server supplies `{}`); an
     /// input that fails to encode throws `.invalidArgument` before any request
     /// is made.
+    /// - Stability: production
     public func invoke<Input: Encodable, Output: Decodable & Sendable>(
         _ functionKey: String,
         input: Input?,
@@ -140,19 +139,17 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// The start envelope is not output-typed on either client, so only the
     /// input is generic here.
     ///
-    /// Same route as `invoke`; the MODE decides what it answers. The run is
-    /// polled on exactly the routes a DSL workflow run is (`getStatus`,
-    /// `waitFor`, `terminate` below). `runKey` makes the start idempotent per
+    /// Posts `functions/{key}/start`: the ROUTE says this call means the task
+    /// runtime. The run is polled with `getStatus`, `waitFor` and `terminate`
+    /// below. `runKey` makes the start idempotent per
     /// `(caller, contextDocId, runKey)`: a repeat answers the run that already
     /// exists with `existing == true`, never a second run. There is no
     /// `forceRerun` and no `timeoutMs` on this route.
     ///
-    /// Calling this on a REQUEST function throws `.functionModeMismatch` — the
-    /// function ran and answered its result, so there is no run to poll.
-    ///
-    /// As with `invoke`, the untyped `[String: Any]` twin #3278 shipped is
-    /// gone (#3344): call a generated `<Key>Function`, or name the witness
+    /// As with `invoke`, the untyped `[String: Any]` twin is
+    /// gone: call a generated `<Key>Function`, or name the witness
     /// (`start(key, input: nil as JSONValue?)`) for a dynamic one.
+    /// - Stability: production
     @discardableResult
     public func start<Input: Encodable>(
         _ functionKey: String,
@@ -184,9 +181,10 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// with `Function run <id> not found`. Every other refusal — a 403 from
     /// the access gate, a 5xx — propagates as it arrived.
     ///
-    /// A task run that has a slice record also carries `slice` (#3388): its
+    /// A task run that has a slice record also carries `slice`: its
     /// refresh count, the current slice's 12-hour ceiling and how the slice
     /// settled. `nil` for a request invocation and for a DSL run.
+    /// - Stability: production
     public func getStatus(runId: String) async throws -> FunctionRunStatus {
         guard !runId.isEmpty else {
             throw JsBaoError(code: .invalidArgument, message: "runId is required for functions.getStatus")
@@ -195,7 +193,7 @@ public final class FunctionsAPI: @unchecked Sendable {
         do {
             return try await transport.request(
                 method: .get,
-                path: "/workflows/runs/\(encoded)/status"
+                path: "/functions/runs/\(encoded)/status"
             )
         } catch {
             // The status route has no other 404: there is one thing it cannot
@@ -225,6 +223,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     }
 
     /// Typed `getStatus`: `output` decoded into `Output`.
+    /// - Stability: production
     public func getStatus<Output: Decodable & Sendable>(
         runId: String
     ) async throws -> FunctionRunResult<Output> {
@@ -234,12 +233,12 @@ public final class FunctionsAPI: @unchecked Sendable {
 
     /// Wait for a function run to reach a terminal state.
     ///
-    /// POLLS, where a workflow wait listens for a frame: a function run
+    /// POLLS rather than listening for a frame: a function run
     /// broadcasts nothing over the socket, so a listener would reconcile once,
     /// see `running`, and wait out its whole timeout with nothing left to wake
     /// it. The interval starts at 0.4 s and doubles to 5 s, the last sleep is
     /// clamped to what is left of the budget, and one poll is taken at the
-    /// deadline itself before the wait throws `.workflowWaitTimeout`. The
+    /// deadline itself before the wait throws `.functionWaitTimeout`. The
     /// default timeout is 15 minutes; 0 or a negative value disables it.
     ///
     /// SETTLES on exactly `completed`, `failed` and `terminated` — the three
@@ -257,7 +256,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// no longer. Either way the wait ends in `.notFound` with the same
     /// message the first refusal would have thrown, and a wait whose timeout
     /// runs out while its last read was a not-found reports that `.notFound`
-    /// rather than `.workflowWaitTimeout`. A run reporting `missing` in a 200
+    /// rather than `.functionWaitTimeout`. A run reporting `missing` in a 200
     /// body throws `.notFound` in function words. A read
     /// reporting one of the DSL-only states (reachable only by handing this
     /// method a DSL run id, which is not refused) throws `.invalidArgument`
@@ -268,6 +267,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// finalization window) is re-checked on a short timer and settles from the
     /// record after the bounded re-check. Cancelling the surrounding `Task`
     /// throws `CancellationError` promptly and stops polling.
+    /// - Stability: production
     public func waitFor(
         runId: String,
         options: FunctionWaitOptions? = nil
@@ -343,11 +343,8 @@ public final class FunctionsAPI: @unchecked Sendable {
                 // waiting" would send them to look at a run the platform never
                 // showed them.
                 if let notFound { throw notFound }
-                // Same code the workflow wait raises: it is the same fact about
-                // the same kind of run, and the intent settles that error codes
-                // rename in phase 7. The MESSAGE is function-worded.
                 throw JsBaoError(
-                    code: .workflowWaitTimeout,
+                    code: .functionWaitTimeout,
                     message: "functions.waitFor timed out after \(timeoutMs)ms waiting for function run \(runId)"
                 )
             }
@@ -366,6 +363,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     }
 
     /// Typed `waitFor`: `output` decoded into `Output`, nil when absent.
+    /// - Stability: production
     public func waitFor<Output: Decodable & Sendable>(
         runId: String,
         as outputType: Output.Type,
@@ -375,14 +373,77 @@ public final class FunctionsAPI: @unchecked Sendable {
         return try Self.typed(base)
     }
 
+    // MARK: - listRuns / listRunSteps (#4145)
+
+    /// List the function runs the signed-in user started, one page at a time.
+    ///
+    /// Only this user's runs are listed — never another user's, and never a
+    /// run a trigger started. The filters combine. The order is storage
+    /// order, not start order: without `contextDocId` the most
+    /// recently updated run comes first, and with it runs are grouped by
+    /// status, newest first within a status. Sort the page by `startedAt` when
+    /// you need start order.
+    ///
+    /// GETs `functions/runs` with the JS client's query, in its order —
+    /// `functionKey`, `contextDocId`, `status`, `limit`, `cursor`, `forward`
+    /// (sent only when `true`).
+    /// - Stability: production
+    public func listRuns(
+        options: FunctionRunListOptions = FunctionRunListOptions()
+    ) async throws -> FunctionRunPage {
+        var query = URLQuery()
+        query.appendIfPresent("functionKey", options.functionKey)
+        query.appendIfPresent("contextDocId", options.contextDocId)
+        query.appendIfPresent("status", options.status)
+        if let limit = options.limit {
+            query.append("limit", limit)
+        }
+        query.appendIfPresent("cursor", options.cursor)
+        if options.forward == true {
+            query.append("forward", "true")
+        }
+        return try await transport.request(
+            method: .get,
+            path: "/functions/runs\(query.queryString)"
+        )
+    }
+
+    /// Every step a function run has recorded, oldest first.
+    ///
+    /// A run that has recorded no steps yet answers an empty `items`. Throws
+    /// `.invalidArgument` for an empty `runId`, and `.notFound` with
+    /// `Function run <id> not found` for a run id that does not exist or names
+    /// a run another user started.
+    /// - Stability: production
+    public func listRunSteps(runId: String) async throws -> FunctionRunSteps {
+        guard !runId.isEmpty else {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "runId is required for functions.listRunSteps"
+            )
+        }
+        let encoded = URLEncoding.encodeComponent(runId)
+        do {
+            return try await transport.request(
+                method: .get,
+                path: "/functions/runs/\(encoded)/steps"
+            )
+        } catch {
+            guard FunctionRunStatus.isNotFound(error) else { throw error }
+            throw JsBaoError(
+                code: .notFound,
+                message: "Function run \(runId) not found",
+                details: ["runId": .string(runId)]
+            )
+        }
+    }
+
     // MARK: - terminate
 
     /// Terminate a running function run.
     ///
-    /// POSTs the instance route itself rather than delegating: the workflow
-    /// method mints `workflowKey is required for workflows.terminate` for an
-    /// empty key and rewords nothing, so a function caller met the workflow
-    /// vocabulary on every refusal.
+    /// POSTs `functions/{functionKey}/instances/{runKey}/terminate`, and words
+    /// every refusal in function vocabulary.
     ///
     /// A 404 from this route means THREE different things — no row, no
     /// instance id, and any exception out of the engine's own `terminate()`.
@@ -391,6 +452,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     /// engine's diagnostic verbatim, because a live run the engine could not
     /// stop is not a run that does not exist, and discarding what the engine
     /// said would leave a caller with nothing to act on.
+    /// - Stability: production
     @discardableResult
     public func terminate(_ ref: FunctionRunRef) async throws -> FunctionRunStatus {
         guard !ref.functionKey.isEmpty else {
@@ -410,7 +472,7 @@ public final class FunctionsAPI: @unchecked Sendable {
         var query = URLQuery()
         query.appendIfPresent("contextDocId", ref.contextDocId)
         let path =
-            "/workflows/\(encodedKey)/instances/\(encodedRunKey)/terminate\(query.queryString)"
+            "/functions/\(encodedKey)/instances/\(encodedRunKey)/terminate\(query.queryString)"
         do {
             return try await transport.request(method: .post, path: path)
         } catch {
@@ -434,6 +496,7 @@ public final class FunctionsAPI: @unchecked Sendable {
 
     /// Typed `terminate`: a terminated run can carry partial output, decoded
     /// into `Output`.
+    /// - Stability: production
     public func terminate<Output: Decodable & Sendable>(
         _ ref: FunctionRunRef
     ) async throws -> FunctionRunResult<Output> {
@@ -451,9 +514,8 @@ public final class FunctionsAPI: @unchecked Sendable {
         meta: [String: Any]?,
         timeout: TimeInterval?
     ) async throws -> FunctionInvokeResult {
-        // #3482 — no `mode`. The ROUTE is the runtime selector: this one runs
-        // the function inside the request. The body field it replaced is
-        // deprecated compatibility for clients published before the change.
+        // No `mode`: the ROUTE is the runtime selector, and the server refuses
+        // a body that names one. This one runs the function inside the request.
         var payload: [String: Any] = [:]
         if let rootInput { payload["rootInput"] = rootInput }
         if let contextDocId { payload["contextDocId"] = contextDocId }
@@ -464,19 +526,6 @@ public final class FunctionsAPI: @unchecked Sendable {
         }
         let envelope = try await post(functionKey: functionKey, payload: payload, runtime: .request)
 
-        // The BACKSTOP, for a server that predates the route (#3482,
-        // D3482-008). Against such a deployment this path is one route whose
-        // body field decides what it answers, so it can still hand back the
-        // start envelope — which has no `output` and no terminal `status`,
-        // everything this method's return type promises. Say so.
-        if let runId = envelope.runId, envelope.runKey != nil {
-            throw JsBaoError(
-                code: .functionModeMismatch,
-                message: "Function '\(functionKey)' is a task function: it starts a RUN rather than returning a result. "
-                    + "Call functions.start(key, …) and poll with functions.getStatus / functions.waitFor.",
-                details: ["functionKey": .string(functionKey), "runId": .string(runId)]
-            )
-        }
         return FunctionInvokeResult(
             status: envelope.status ?? "",
             output: envelope.output,
@@ -504,19 +553,15 @@ public final class FunctionsAPI: @unchecked Sendable {
         if let meta { payload["meta"] = meta }
         let envelope = try await post(functionKey: functionKey, payload: payload, runtime: .task)
 
-        // The mirror of `invoke`'s backstop, and the same reason (#3482):
-        // against a server that predates this route the call would have run
-        // the function inside the request and answered with its RESULT, so
-        // there is no run id to poll.
+        // A start answers its run's identity; a body without one is not a
+        // start answer, and handing back an empty run id would be a run the
+        // caller could never poll.
         guard let runId = envelope.runId, let runKey = envelope.runKey else {
-            throw JsBaoError(
-                code: .functionModeMismatch,
-                message: "Function '\(functionKey)' is a request function: it returns a result rather than starting a run. "
-                    + "Call functions.invoke(key, …) instead.",
-                details: [
-                    "functionKey": .string(functionKey),
-                    "status": envelope.status.map(JSONValue.string) ?? .null,
-                ]
+            throw HttpError.decodingFailure(
+                path: "/functions/\(functionKey)/start",
+                expected: FunctionStartResult.self,
+                body: nil,
+                underlying: StartAnswerWithoutRun()
             )
         }
         return FunctionStartResult(
@@ -530,7 +575,7 @@ public final class FunctionsAPI: @unchecked Sendable {
         )
     }
 
-    /// Which runtime a call means — #3482. The ROUTE says it: `invoke` posts
+    /// Which runtime a call means. The ROUTE says it: `invoke` posts
     /// to `functions/{key}` and runs the function inside the request, `start`
     /// posts to `functions/{key}/start` and runs it as a task. There is no
     /// body field for it on a current server.
@@ -599,7 +644,7 @@ public final class FunctionsAPI: @unchecked Sendable {
     }
 
     /// How long the finalization re-check waits between fetches, and how many
-    /// times it retries before settling from the run record (#2348). The same
+    /// times it retries before settling from the run record. The same
     /// window the workflow wait uses; spelled here because this class names no
     /// workflow type.
     static let finalizeRecheckIntervalMs: UInt64 = 1000
@@ -640,7 +685,7 @@ public final class FunctionsAPI: @unchecked Sendable {
             attempts += 1
             if let deadline, deadline.timeIntervalSince(now()) <= 0 {
                 throw JsBaoError(
-                    code: .workflowWaitTimeout,
+                    code: .functionWaitTimeout,
                     message: "functions.waitFor timed out after \(timeoutMs)ms waiting for function run \(runId)"
                 )
             }
@@ -708,4 +753,10 @@ private struct FunctionRouteEnvelope: Decodable, Sendable {
         existing = try c.decodeIfPresent(Bool.self, forKey: .existing)
         invocationId = try c.decodeIfPresent(String.self, forKey: .invocationId)
     }
+}
+
+/// The underlying error of the decode failure a start answer with no run id
+/// raises.
+private struct StartAnswerWithoutRun: Error, CustomStringConvertible {
+    var description: String { "the start answer carries no runId and runKey" }
 }

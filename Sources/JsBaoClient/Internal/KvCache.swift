@@ -2,7 +2,7 @@ import Foundation
 
 /// Key-value cache with in-memory + persistent storage and deduplication.
 ///
-/// ## Cache values are `JSONValue` (#1993, Phase D1)
+/// ## Cache values are `JSONValue` (Phase D1)
 ///
 /// The value domain of this cache is `JSONValue`, not `Any`. That is what
 /// makes the in-flight dedup `Task` and the `withTimeout` race carry a
@@ -32,7 +32,7 @@ import Foundation
 /// to `JSONValue` on the way in, so its integer fields cross `Double` too.
 /// `testIntegersWiderThanTwoToTheFiftyThreeLoseTheirLowBits` pins the bound.
 ///
-/// ## An actor since #1993, Phase D2
+/// ## An actor (Phase D2)
 ///
 /// The lock is gone: `memCache`, `inflightRequests`, `storageProvider` and the
 /// user scope are actor-isolated, so the `@unchecked Sendable` opt-out and its
@@ -156,11 +156,11 @@ public actor KvCache {
     /// bound — with `JSONValue` as the value type throughout.
     ///
     /// The three critical sections are still three separate uninterrupted
-    /// isolated steps with `await`s between them, exactly as before (#1910):
+    /// isolated steps with `await`s between them, exactly as before:
     /// each one used to be a `lock.withLock` hold, and merging them would span
     /// a suspension.
     ///
-    /// ## A cache hit never awaits the network (#2364)
+    /// ## A cache hit never awaits the network
     ///
     /// When there is a cached record, this returns it **immediately** and, if
     /// the record is due for a refresh, starts that refresh in the background.
@@ -183,7 +183,7 @@ public actor KvCache {
     /// serve. When such a record is due, this awaits the fetch instead —
     /// matching JS, which excludes null/undefined from `localVal` and falls
     /// through to `await fetchNetwork()`, and matching what Swift did on both
-    /// of these triggers before #2364. A record holding `null` that is **not**
+    /// of these triggers before. A record holding `null` that is **not**
     /// due still short-circuits as a hit; that negative-caching difference from
     /// JS predates #2364 and is deliberately unchanged.
     ///
@@ -681,7 +681,7 @@ public final class CacheFacade: @unchecked Sendable {
 
     /// Designated initializer — the typed transport spine.
     ///
-    /// There is no `emit` parameter since #1993 Phase D2. The cache's emitter
+    /// There is no `emit` parameter. The cache's emitter
     /// belongs to `KvCache.init(emit:)` now: `KvCache` is an actor, so a
     /// synchronous initializer cannot reach in and set it afterwards, and a
     /// parameter that quietly dropped the caller's closure would be worse than
@@ -724,7 +724,7 @@ public final class CacheFacade: @unchecked Sendable {
     ///
     /// This facade layer owns the `waitForLoad` decision and offline gating —
     /// the low-level `KvCache.fetchCached` only runs when a network fetch is
-    /// actually warranted. Semantics mirror the JS client (#994):
+    /// actually warranted. Semantics mirror the JS client:
     ///
     /// - `waitForLoad`:
     ///   - `.local` → return the cached value (if any) WITHOUT hitting the
@@ -841,7 +841,7 @@ public final class CacheFacade: @unchecked Sendable {
     /// server (previously it only influenced the cache key, so a filtered
     /// request returned — and cached — the unfiltered response). The cache
     /// key also incorporates the request body for non-GET methods, so two
-    /// POSTs to the same path with different bodies don't collide (#994).
+    /// POSTs to the same path with different bodies don't collide.
     public func fetchHttp<T>(
         method: String = "GET",
         path: String,
@@ -871,9 +871,9 @@ public final class CacheFacade: @unchecked Sendable {
         // is already a `JSONValue` on the typed transport, which is also the
         // cache's value type — the `T` cast happens once, at the end.
         // An empty 2xx body still yields `nil` (`requestOptional`).
-        // GET/HEAD carry no body — the legacy `encodeLegacyBody` path
-        // dropped it too, so a `fetchHttp(method: "GET", body:)` still
-        // sends a bodyless GET.
+        // GET/HEAD carry no body, as `HttpClient.buildURLRequest` drops one
+        // on those verbs anyway, so a `fetchHttp(method: "GET", body:)`
+        // still sends a bodyless GET.
         let encodedBody: JSONValue? = verb.allowsBody
             ? try body.map { try JSONCoding.decode(JSONValue.self, from: $0) }
             : nil

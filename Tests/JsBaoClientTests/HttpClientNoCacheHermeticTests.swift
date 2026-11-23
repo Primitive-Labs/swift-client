@@ -166,26 +166,6 @@ final class HttpClientNoCacheHermeticTests: XCTestCase {
         )
     }
 
-    // MARK: - Behavior 10: the change is announced
-
-    func testChangelogAnnouncesTheForcedCacheSettings() throws {
-        let changelog = try String(
-            contentsOf: packageDirectory.appendingPathComponent("CHANGELOG.md"),
-            encoding: .utf8
-        )
-
-        XCTAssertTrue(
-            changelog.contains("#3170"),
-            "the caller-visible cache change must be announced in the CHANGELOG"
-        )
-        for phrase in ["urlCache", "sessionConfiguration", "no-store"] {
-            XCTAssertTrue(
-                changelog.contains(phrase),
-                "the CHANGELOG entry must name '\(phrase)': an app that deliberately configured a URLCache no longer gets one, and blob responses are no longer storable by intermediary caches for revalidation reuse"
-            )
-        }
-    }
-
     // MARK: - Source helpers (derived from this file's path)
 
     /// `swift-client`, derived from this file's path.

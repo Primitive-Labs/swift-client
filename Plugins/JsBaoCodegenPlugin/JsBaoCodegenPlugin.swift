@@ -30,9 +30,11 @@ import Foundation
 /// { "input": "../../models/models.toml" }
 /// ```
 /// The path resolves against the target directory (absolute paths are used
-/// as-is), and it names exactly ONE schema — see `JsBaoCodegenConfig`
-/// below. When the file is present it replaces the scan; when it is absent
-/// nothing changes. Also `exclude: ["bao-codegen.json"]` in the target so
+/// as-is). Several schemas — one db3 type file per kind of database the app
+/// opens (#5025) — are `{ "inputs": ["<file or directory>", ...] }`, which
+/// generates every model into one barrel; see `JsBaoCodegenInputs` below.
+/// When the file is present it replaces the scan; when it is absent nothing
+/// changes. Also `exclude: ["bao-codegen.json"]` in the target so
 /// SwiftPM doesn't warn about an unhandled resource.
 ///
 /// Why `buildCommand` (not `prebuildCommand`): modern SwiftPM rejects
@@ -74,7 +76,31 @@ struct JsBaoCodegenPlugin: BuildToolPlugin {
         // PackageDescription 6.1, which is why the manifest declares
         // swift-tools-version 6.1.
         let targetDirectory = target.directoryURL
-        let configured = try JsBaoCodegenConfig.resolveInput(targetDirectory: targetDirectory)
+
+        // A configured schema list (`input`, or #5025's `inputs`: files or
+        // directories) is ONE build command over every file: the tool writes
+        // one barrel over all of them, and its stale-file sweep sees every
+        // model. One `input` is the command it has always been. Directories
+        // that hold no schema yet are handed to the tool as directories, so
+        // it still writes the (empty) barrel.
+        if let files = try JsBaoCodegenInputs.resolve(targetDirectory: targetDirectory) {
+            let configured = files.isEmpty
+                ? try JsBaoCodegenInputs.directories(targetDirectory: targetDirectory) : files
+            guard !configured.isEmpty else { return [] }
+            let barrel = "GeneratedModels.swift"
+            let predicted = try files.map { try predictGeneratedFiles(at: $0) }
+            let outputs = JsBaoCodegenInputs.outputs(predicted: predicted, barrel: barrel)
+            // `"knownTypesOnly": true` in the same config: `--known-types-only` (#6024).
+            let knownTypes = try JsBaoCodegenKnownTypes.arguments(targetDirectory: targetDirectory)
+            return [.buildCommand(
+                displayName: "swift-bao-codegen \(configured.map { $0.lastPathComponent }.joined(separator: ", "))",
+                executable: tool.url,
+                arguments: JsBaoCodegenInputs.arguments(inputs: configured, outputDirectory: outputDir)
+                    + knownTypes,
+                inputFiles: files,
+                outputFiles: outputs.map { outputDir.appending(path: $0) }
+            )]
+        }
 
         // Otherwise: every `*schema.toml` in the target, plus the bare
         // `models.toml` filename js-bao's codegen reads (#944) — so a
@@ -83,8 +109,7 @@ struct JsBaoCodegenPlugin: BuildToolPlugin {
         // accepts `models.schema.toml`, `app.schema.toml`, etc.; the
         // explicit `models.toml` match adds the JS-canonical name.
         let inputs =
-            configured.map { [$0] }
-            ?? target.sourceFiles
+            target.sourceFiles
             .filter {
                 let name = $0.url.lastPathComponent
                 return name.hasSuffix("schema.toml") || name == "models.toml"
@@ -250,6 +275,137 @@ struct JsBaoCodegenPlugin: BuildToolPlugin {
     }
 }
 
+// MARK: - bao-codegen.json inputs
+//
+// Mirrored verbatim in Tests/SwiftBaoCodegenTests/PluginInputsHermeticTests.swift,
+// which compares these bytes against its copy (`testPluginSourceMatchesTheMirror`)
+// — edit both, and keep the marker comments exactly as they are.
+// PLUGIN-INPUTS-MIRROR: BEGIN
+/// `bao-codegen.json`'s `inputs` form: several schema files, each named
+/// directly or through its directory, generated together by ONE build
+/// command into the one `GeneratedModels` directory, so the codegen tool
+/// writes one barrel over all of them and its stale-file sweep sees every
+/// model. An app whose clients open several kinds of db3 points it at its
+/// `db3-types/` directory:
+/// ```json
+/// { "inputs": ["../../primitive/dev/db3-types"] }
+/// ```
+enum JsBaoCodegenInputs {
+
+    /// The schema files the target's `bao-codegen.json` names, in order, or
+    /// `nil` when there is no config file (the scan governs).
+    ///
+    /// With `inputs`, each entry resolves against the target directory as
+    /// `input` does; a directory contributes every `*.toml` directly inside
+    /// it, in name order, and a file named twice counts once. An entry that
+    /// does not exist throws, naming the config and the path; it never
+    /// degrades to the scan. Without `inputs`, the config is
+    /// `JsBaoCodegenConfig.resolveInput`'s, exactly as before.
+    static func resolve(targetDirectory: URL) throws -> [URL]? {
+        try resolveEntries(targetDirectory: targetDirectory)?.files
+    }
+
+    /// The directories `inputs` names, in order. When they hold no schema
+    /// yet (a scaffold's empty `db3-types/`), the build command hands the
+    /// codegen tool the directories themselves, and it writes the empty
+    /// barrel, so `GeneratedModels` exists before the first type file does.
+    static func directories(targetDirectory: URL) throws -> [URL] {
+        try resolveEntries(targetDirectory: targetDirectory)?.directories ?? []
+    }
+
+    private static func resolveEntries(
+        targetDirectory: URL
+    ) throws -> (files: [URL], directories: [URL])? {
+        let filename = JsBaoCodegenConfig.filename
+        let configURL = targetDirectory.appending(path: filename)
+        let configPath = configURL.path(percentEncoded: false)
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: configPath) else { return nil }
+
+        let object = (try? Data(contentsOf: configURL))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        guard let object, let rawInputs = object["inputs"] else {
+            return try JsBaoCodegenConfig.resolveInput(targetDirectory: targetDirectory)
+                .map { (files: [$0], directories: []) }
+        }
+        if object["input"] != nil {
+            throw JsBaoCodegenConfigError(
+                description: "\(filename) at \(configPath) names both \"input\" and \"inputs\"; "
+                    + "keep one. \"inputs\" takes a list: {\"inputs\": [\"<path>\", ...]}."
+            )
+        }
+        guard let entries = rawInputs as? [String], !entries.isEmpty else {
+            throw JsBaoCodegenConfigError(
+                description: "\(filename) at \(configPath) has an \"inputs\" that is not a "
+                    + "non-empty list of paths; expected {\"inputs\": [\"<path>\", ...]}."
+            )
+        }
+
+        let baseDirectory = URL(
+            fileURLWithPath: targetDirectory.path(percentEncoded: false), isDirectory: true)
+        var files: [URL] = []
+        var directories: [URL] = []
+        var seen: Set<String> = []
+        for entry in entries {
+            let trimmed = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                throw JsBaoCodegenConfigError(
+                    description: "\(filename) at \(configPath) has an empty entry in \"inputs\"; "
+                        + "expected a path to a schema TOML or a directory of them."
+                )
+            }
+            let resolved =
+                trimmed.hasPrefix("/")
+                ? URL(fileURLWithPath: trimmed).standardizedFileURL
+                : URL(fileURLWithPath: trimmed, relativeTo: baseDirectory).standardizedFileURL
+            let resolvedPath = resolved.path(percentEncoded: false)
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: resolvedPath, isDirectory: &isDirectory) else {
+                throw JsBaoCodegenConfigError(
+                    description: "\(filename) at \(configPath) names input \"\(trimmed)\", "
+                        + "which resolves to \(resolvedPath) — no such file or directory."
+                )
+            }
+            var members = [resolved]
+            if isDirectory.boolValue {
+                directories.append(resolved)
+                members = try fileManager.contentsOfDirectory(atPath: resolvedPath)
+                    .filter { $0.hasSuffix(".toml") }
+                    .sorted()
+                    .map { resolved.appending(path: $0) }
+                    .filter {
+                        var memberIsDirectory: ObjCBool = false
+                        return fileManager.fileExists(
+                            atPath: $0.path(percentEncoded: false), isDirectory: &memberIsDirectory)
+                            && !memberIsDirectory.boolValue
+                    }
+            }
+            for member in members where seen.insert(member.path(percentEncoded: false)).inserted {
+                files.append(member)
+            }
+        }
+        return (files: files, directories: directories)
+    }
+
+    /// The codegen tool's arguments for one build command over `inputs`.
+    static func arguments(inputs: [URL], outputDirectory: URL) -> [String] {
+        inputs.flatMap { ["--input", $0.path(percentEncoded: false)] }
+            + ["--output", outputDirectory.path(percentEncoded: false)]
+    }
+
+    /// The files one build command over several inputs writes: each input's
+    /// predicted model files once, in input order, then the barrel.
+    static func outputs(predicted: [[String]], barrel: String) -> [String] {
+        var files: [String] = []
+        var seen: Set<String> = [barrel]
+        for name in predicted.joined() where seen.insert(name).inserted {
+            files.append(name)
+        }
+        return files + [barrel]
+    }
+}
+// PLUGIN-INPUTS-MIRROR: END
+
 // MARK: - bao-codegen.json
 //
 // Mirrored verbatim in Tests/SwiftBaoCodegenTests/PluginConfigHermeticTests.swift,
@@ -381,3 +537,55 @@ enum JsBaoCodegenConfig {
     }
 }
 // PLUGIN-CONFIG-MIRROR: END
+
+// MARK: - bao-codegen.json knownTypesOnly
+//
+// Mirrored verbatim in Tests/SwiftBaoCodegenTests/PluginKnownTypesHermeticTests.swift,
+// because SwiftPM does not let a test target import plugin code. That file's
+// `testPluginSourceMatchesTheMirror` compares these bytes against its copy, so
+// edit both — and keep the marker comments exactly as they are.
+// PLUGIN-KNOWN-TYPES-MIRROR: BEGIN
+/// `bao-codegen.json`'s optional `knownTypesOnly` key (#6024). `true` hands
+/// the codegen tool `--known-types-only`, so the `GeneratedModels` barrel
+/// carries `db3Types` and `register(on:)` turns the client's known-type
+/// guard on. It sits beside the `input` or `inputs` that names the schema:
+/// ```json
+/// { "inputs": ["../../primitive/dev/db3-types"], "knownTypesOnly": true }
+/// ```
+enum JsBaoCodegenKnownTypes {
+
+    /// The config's shape for this key alone; `JSONDecoder` reads only
+    /// `true` or `false` as a `Bool`.
+    private struct Shape: Decodable {
+        let knownTypesOnly: Bool?
+    }
+
+    /// Whether the target's `bao-codegen.json` says `"knownTypesOnly": true`.
+    /// `false` with no config file, or a config without the key. A value
+    /// that is not `true` or `false` throws, naming the config: it never
+    /// degrades to off. A config that cannot be read or parsed is left to
+    /// the schema resolver, which throws for it.
+    static func enabled(targetDirectory: URL) throws -> Bool {
+        let filename = JsBaoCodegenConfig.filename
+        let configURL = targetDirectory.appending(path: filename)
+        let configPath = configURL.path(percentEncoded: false)
+        guard FileManager.default.fileExists(atPath: configPath),
+              let data = try? Data(contentsOf: configURL),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let raw = object["knownTypesOnly"]
+        else { return false }
+        guard let shape = try? JSONDecoder().decode(Shape.self, from: data) else {
+            throw JsBaoCodegenConfigError(
+                description: "\(filename) at \(configPath) has a \"knownTypesOnly\" that is not "
+                    + "true or false (\(raw)); expected {\"knownTypesOnly\": true}."
+            )
+        }
+        return shape.knownTypesOnly == true
+    }
+
+    /// The codegen tool's arguments the key adds: `--known-types-only`, or none.
+    static func arguments(targetDirectory: URL) throws -> [String] {
+        try enabled(targetDirectory: targetDirectory) ? ["--known-types-only"] : []
+    }
+}
+// PLUGIN-KNOWN-TYPES-MIRROR: END

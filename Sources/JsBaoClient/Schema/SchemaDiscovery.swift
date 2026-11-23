@@ -244,7 +244,7 @@ public enum SchemaDiscovery {
     ///
     /// Uses `Int(exactly:)` rather than `Int(_:)`: these values come from
     /// document data, so a corrupt one would otherwise trap and abort the
-    /// process (#2056). `.towardZero` keeps the old truncation semantics for
+    /// process. `.towardZero` keeps the old truncation semantics for
     /// in-range values. Internal rather than private so it can be unit tested.
     ///
     /// Note the downstream reading: `nil` means "no limit" to the validators in

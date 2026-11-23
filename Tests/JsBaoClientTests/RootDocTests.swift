@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-root-doc.test.ts
 /// Tests root document support.
+@available(*, deprecated)
 final class RootDocTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!
@@ -116,5 +117,59 @@ final class RootDocTests: XCTestCase {
         }
         XCTAssertTrue(client.isRootDocument(rootDocId))
         XCTAssertFalse(client.isRootDocument("not-the-root-doc"))
+    }
+
+    func testRecordLogRootDocumentIsReportedAndOpens() async throws {
+        // #4195, re-anchored by #4313: an app whose `rootDocumentFormat` is 3
+        // mints each new user's root document as a record-log document. The
+        // client needs no change — it learns the format from the document
+        // read — so this proves the root the server mints is reported as
+        // format 3 and opens as one. A stored 2 is refused by the server.
+        let app = try await ctx.createTestApp(name: "swift-root-format3")
+        try await ctx.updateAppSettings(
+            appId: app.appId,
+            updates: ["rootDocumentFormat": 3],
+            jwt: app.ownerJWT
+        )
+        let member = try await ctx.createTestUser(appId: app.appId)
+        let ensured = try await ctx.adminPost(
+            "/admin/api/apps/\(app.appId)/users/\(member.userId)/root-document",
+            body: [:]
+        )
+        XCTAssertEqual(ensured["documentFormat"] as? Int, 3)
+
+        let directory = NSTemporaryDirectory() + "root-format3-\(UUID().uuidString.prefix(8))"
+        try FileManager.default.createDirectory(
+            atPath: directory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let memberClient = createTestClient(
+            appId: app.appId,
+            token: member.jwt,
+            storageConfig: .sqlite(directory: directory + "/root.sqlite"),
+            autoNetwork: true
+        )
+        _ = await memberClient.waitForStorageReady()
+
+        let rootDocId = try XCTUnwrap(memberClient.rootDocId)
+        XCTAssertEqual(rootDocId, ensured["rootDocId"] as? String)
+        let root = try await memberClient.documents.getRoot()
+        XCTAssertEqual(root.documentId, rootDocId)
+        XCTAssertEqual(root.documentFormat, 3, "the minted root is a record-log document")
+
+        try await memberClient.connect()
+        try await waitForConnection(client: memberClient, timeout: 30)
+        _ = try await memberClient.documents.openRoot(
+            options: OpenDocumentOptions(
+                waitForLoad: .localIfAvailableElseNetwork, enableNetworkSync: true
+            )
+        )
+        // Opened as a record-log document: the client remembers the format it
+        // resolved for the root and binds its store.
+        try await eventually(timeout: 30, description: "the root to resolve as a record-log document") {
+            memberClient.documentManager.getLocalMetadata(rootDocId)?.documentFormat == 3
+                && memberClient.isRecordLogDocument(rootDocId)
+        }
+        await memberClient.destroy()
     }
 }

@@ -7,7 +7,7 @@ import XCTest
 /// these tests cover everything around it: authorize-URL construction, state
 /// encoding, callback parsing, redirect-URI/scheme derivation, plist loading,
 /// and error mapping. `GoogleSignInLiveTests` additionally exercises the
-/// server endpoints (`GET /oauth-config`, `GET /oauth/callback`) against the
+/// server endpoints (`GET settings/sign-in`, `GET /oauth/callback`) against the
 /// local dev server.
 final class GoogleSignInUnitTests: XCTestCase {
 
@@ -294,7 +294,7 @@ final class GoogleSignInUnitTests: XCTestCase {
 
 /// Live tests against the local dev server (`node debug-server.js`).
 /// Covers the non-interactive halves of the flow: authorize-URL construction
-/// from the app's real `GET /oauth-config`, and the `GET /oauth/callback`
+/// from the app's real `GET settings/sign-in`, and the `GET /oauth/callback`
 /// exchange endpoint's error handling.
 final class GoogleSignInLiveTests: XCTestCase {
     var ctx: TestContext!

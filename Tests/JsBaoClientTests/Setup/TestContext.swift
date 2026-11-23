@@ -58,7 +58,7 @@ final class TestContext: @unchecked Sendable {
     func initialize() async throws {
         // The suite's super-admin token: TEST_SUPERADMIN_JWT, else an
         // email-only token for TEST_SUPERADMIN_EMAIL, else an admin the local
-        // server provisions (TestConfig.resolveSuperAdminJwt, #3885).
+        // server provisions (TestConfig.resolveSuperAdminCredential, #3885).
         let jwt = try await TestConfig.superAdminJwt()
         self.superuserJWT = jwt
 
@@ -179,7 +179,7 @@ final class TestContext: @unchecked Sendable {
 
     /// Sign in through the email-code path with the `+primitivetest` bypass
     /// (magic code `000000`) and return the provisioned user's id. The app
-    /// must have `otpEnabled` on and the address's base listed in
+    /// must have `emailSignInEnabled` on and the address's base listed in
     /// `testAccountBaseEmails` (both via `updateAppSettings(appId:settings:)`).
     ///
     /// Unlike `createTestUser`, which goes through admin add-by-email and gets
@@ -253,19 +253,15 @@ final class TestContext: @unchecked Sendable {
     /// `steps` under the workflow-config model) and activate it.
     /// Returns the workflowId. `requiresClientApply` defaults to true so
     /// the run parks in `apply_pending` until a client claims and applies.
-    /// `syncCallable` opts the workflow into `runSync` (mirrors the JS
-    /// `createSyncWorkflow` helper in
-    /// tests/client/js-bao-client-workflow-runSync.test.ts — which, like
-    /// this helper, does not go near the legacy publish endpoint: it was
+    /// The helper does not go near the legacy publish endpoint: it was
     /// retired in #2768, and activation is the workflow's active
-    /// configuration).
+    /// configuration.
     @discardableResult
     func setupWorkflow(
         appId: String,
         workflowKey: String,
         steps: [[String: Any]],
-        requiresClientApply: Bool = true,
-        syncCallable: Bool = false
+        requiresClientApply: Bool = true
     ) async throws -> String {
         let createRes = try await adminPost(
             "/admin/api/apps/\(appId)/workflows",
@@ -276,7 +272,6 @@ final class TestContext: @unchecked Sendable {
                 // #2652: caller workflows must state who may start them.
                 "accessRule": "true",
                 "steps": steps,
-                "syncCallable": syncCallable,
             ]
         )
         guard let workflow = createRes["workflow"] as? [String: Any],
@@ -314,9 +309,29 @@ final class TestContext: @unchecked Sendable {
     /// the base64 TOML, sources and bundle plus the bundle's SHA-256
     /// `contentHash`. `bundle` is ESM whose default export is the handler.
     ///
-    /// `durable: true` makes it a task function (`mode = "task"`); the default
-    /// is a request function. `inputSchema` / `outputSchema` are the JSON
+    /// `durable` and `mode` name the runtime a caller had in mind, and are
+    /// not sent: a function has no runtime key since #3482 (the caller picks
+    /// it at each call), and since #3188 the server refuses a push whose TOML
+    /// or payload still carries `mode` or `durable`. The helper pushes what
+    /// the JS helper pushes. `inputSchema` / `outputSchema` are the JSON
     /// schemas the server validates against, when the case is about them.
+    ///
+    /// #4738 — the create writes no `access` (the server refuses the key), and
+    /// a push of a bare handler is refused `FUNCTION_AUTHORIZE_REQUIRED`. As
+    /// the JS helper does, a bundle with `authorize` lands through the admin
+    /// route, and a bare one is re-sent unchanged to the local-only legacy
+    /// seed route `POST /test/function-legacy-config/{appId}/{key}/push`,
+    /// which runs the same push with the break off and writes `access` as the
+    /// header's rule.
+    ///
+    /// #5775 — the configs push carries what the current CLI sends, as the JS
+    /// helper's `withFunctionSchemaPayload` does: the TOML declares the
+    /// header's `inputSchema` / `outputSchema` (a push with a compiled payload
+    /// binds the header's schemas to the TOML's, so one the TOML left out
+    /// would be cleared), and `compiled` / `provenance` hold their compile. A
+    /// ref-free schema compiles to itself with no provenance, so that is what
+    /// is sent; a schema holding `$ref` or `$defs` is refused here, before
+    /// anything is created, rather than as a mismatch from the server.
     @discardableResult
     func pushFunction(
         appId: String,
@@ -324,19 +339,18 @@ final class TestContext: @unchecked Sendable {
         bundle: String,
         access: String = "true",
         durable: Bool = false,
-        /// #3454 — `"request"`, `"task"` or `"any"`. Absent leaves the
-        /// pre-#3454 shape: the `durable` boolean alone, which is a LOCK
-        /// either way. An `any` push sends no `durable`, because a boolean
-        /// beside `mode = "any"` is the disagreement the server refuses.
+        /// #3454 — `"request"`, `"task"` or `"any"`; not sent (see above).
         mode: String? = nil,
         inputSchema: [String: Any]? = nil,
-        outputSchema: [String: Any]? = nil
+        outputSchema: [String: Any]? = nil,
+        /// Extra `[function]` lines, such as `public = true`.
+        tomlExtra: String = ""
     ) async throws -> PushedFunction {
+        let schemas = try Self.functionSchemaPayload(
+            functionKey: functionKey, inputSchema: inputSchema, outputSchema: outputSchema
+        )
         let base = "/admin/api/apps/\(appId)/functions"
-        var header: [String: Any] = [
-            "functionKey": functionKey,
-            "access": access,
-        ]
+        var header: [String: Any] = ["functionKey": functionKey]
         if let inputSchema { header["inputSchema"] = inputSchema }
         if let outputSchema { header["outputSchema"] = outputSchema }
         let created = try await adminPost(base, body: header)
@@ -345,26 +359,33 @@ final class TestContext: @unchecked Sendable {
         }
 
         let entry = "functions/\(functionKey).ts"
-        var toml = "[function]\nkey = \"\(functionKey)\"\n"
-        if let mode, mode != "any" { toml += "mode = \"\(mode)\"\n" }
+        let toml = "[function]\nkey = \"\(functionKey)\"\n" + schemas.tomlLines.map { "\($0)\n" }.joined() + tomlExtra
         let bundleData = Data(bundle.utf8)
         let contentHash = SHA256.hash(data: bundleData)
             .map { String(format: "%02x", $0) }
             .joined()
-        var config: [String: Any] = [
+        let config: [String: Any] = [
             "entry": entry,
             "toml": Data(toml.utf8).base64EncodedString(),
             "sources": [["path": entry, "content": bundleData.base64EncodedString()]],
             "bundle": bundleData.base64EncodedString(),
             "contentHash": contentHash,
+            "compiled": schemas.compiled,
+            "provenance": schemas.provenance,
         ]
-        if let mode {
-            config["mode"] = mode
-            if mode != "any" { config["durable"] = mode == "task" }
-        } else {
-            config["durable"] = durable
+        var (status, pushed) = try await jsonRequest(
+            method: "POST", path: "\(base)/\(functionId)/configs", body: config, jwt: superuserJWT
+        )
+        if status == 400, pushed["code"] as? String == "FUNCTION_AUTHORIZE_REQUIRED" {
+            var seed = config
+            seed["access"] = access
+            (status, pushed) = try await jsonRequest(
+                method: "POST", path: "/test/function-legacy-config/\(appId)/\(functionKey)/push", body: seed, jwt: nil
+            )
         }
-        let pushed = try await adminPost("\(base)/\(functionId)/configs", body: config)
+        guard (200..<300).contains(status) else {
+            throw TestSetupError("Failed to push function \(functionKey): HTTP \(status) \(pushed)")
+        }
         return PushedFunction(
             functionId: functionId,
             functionKey: functionKey,
@@ -372,11 +393,77 @@ final class TestContext: @unchecked Sendable {
         )
     }
 
+    /// The schema part of a configs push for `pushFunction` (#5775): the
+    /// `[function]` lines declaring each given schema as a JSON string, and
+    /// the `compiled` / `provenance` payload the server checks against its
+    /// own compile of those lines. Only a ref-free schema compiles to itself,
+    /// so one holding `$ref` or `$defs` is refused naming the keyword.
+    static func functionSchemaPayload(
+        functionKey: String,
+        inputSchema: [String: Any]?,
+        outputSchema: [String: Any]?
+    ) throws -> (tomlLines: [String], compiled: [String: Any], provenance: [String: Any]) {
+        var tomlLines: [String] = []
+        var compiled: [String: Any] = ["inputSchema": NSNull(), "outputSchema": NSNull()]
+        let provenance: [String: Any] = ["inputSchema": [String: Any](), "outputSchema": [String: Any]()]
+        for (field, schema) in [("inputSchema", inputSchema), ("outputSchema", outputSchema)] {
+            guard let schema else { continue }
+            let found = refKeywords(in: schema).sorted()
+            if !found.isEmpty {
+                throw TestSetupError(
+                    "pushFunction cannot push \(functionKey): its \(field) holds \(found.joined(separator: ", ")). "
+                        + "The helper sends a schema as its own compile, which only a ref-free schema is; "
+                        + "inline the definition, or push the function with the CLI."
+                )
+            }
+            let data = try JSONSerialization.data(withJSONObject: schema, options: [.sortedKeys, .withoutEscapingSlashes])
+            tomlLines.append("\(field) = \(tomlBasicString(String(decoding: data, as: UTF8.self)))")
+            compiled[field] = try JSONSerialization.jsonObject(with: data)
+        }
+        return (tomlLines, compiled, provenance)
+    }
+
+    /// The ref keywords (`$ref`, `$defs`) anywhere in `value`.
+    private static func refKeywords(in value: Any) -> Set<String> {
+        var found = Set<String>()
+        if let object = value as? [String: Any] {
+            for (key, child) in object {
+                if key == "$ref" || key == "$defs" { found.insert(key) }
+                found.formUnion(refKeywords(in: child))
+            }
+        } else if let array = value as? [Any] {
+            for child in array { found.formUnion(refKeywords(in: child)) }
+        }
+        return found
+    }
+
+    /// `text` as a TOML basic string: quotes, backslashes and control
+    /// characters escaped, everything else written as itself.
+    static func tomlBasicString(_ text: String) -> String {
+        var out = "\""
+        for scalar in text.unicodeScalars {
+            switch scalar {
+            case "\\": out += "\\\\"
+            case "\"": out += "\\\""
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            default:
+                if scalar.value < 0x20 || scalar.value == 0x7F {
+                    out += String(format: "\\u%04X", scalar.value)
+                } else {
+                    out.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return out + "\""
+    }
+
     // MARK: - App settings
 
     /// PATCH-style update of app-level settings via the admin API
-    /// (`PUT /admin/api/apps/{appId}` — e.g. `otpEnabled`,
-    /// `magicLinkEnabled`). Mirrors the JS tests' `adminHttpClient().put`.
+    /// (`PUT /admin/api/apps/{appId}` — e.g. `emailSignInEnabled`).
+    /// Mirrors the JS tests' `adminHttpClient().put`.
     func updateAppSettings(appId: String, settings: [String: Any]) async throws {
         _ = try await adminRequest(
             method: "PUT",
@@ -475,8 +562,19 @@ final class TestContext: @unchecked Sendable {
         return refreshToken
     }
 
+    /// `PUT /app/{appId}/api/settings` with `body`, as the test superuser
+    /// (for example, turning `signedOutAccess` on).
+    func updateAppSettings(appId: String, body: [String: Any]) async throws {
+        let (status, answer) = try await jsonRequest(
+            method: "PUT", path: "/app/\(appId)/api/settings", body: body, jwt: superuserJWT
+        )
+        guard (200..<300).contains(status) else {
+            throw TestSetupError("Failed to update settings of \(appId): HTTP \(status) \(answer)")
+        }
+    }
+
     @discardableResult
-    private func adminGet(_ path: String) async throws -> [String: Any] {
+    func adminGet(_ path: String) async throws -> [String: Any] {
         try await adminRequest(method: "GET", path: path, body: nil)
     }
 
@@ -501,8 +599,75 @@ final class TestContext: @unchecked Sendable {
         try await adminRequest(method: "POST", path: path, body: body)
     }
 
+    /// Create a group through the admin API's
+    /// `POST /admin/api/apps/{appId}/groups` (#4737). On the app routes only a
+    /// server function creates a group, and a session's `groups.create` is
+    /// refused, so live suites make their groups here: the Swift twin of
+    /// `tests/helpers/create-group-4735.ts`.
+    ///
+    /// `custodian` defaults to `user:<ownerUserId>`, the app owner who was the
+    /// caller of the session creates this replaces. A suite whose subject is
+    /// the role table passes an ordinary member instead, because the app
+    /// owner's session holds app authority and is admitted before the role
+    /// table is read. `initialMembers` are `(userId, role)` pairs, `role`
+    /// `manager` or `member`. The server mints the group's id (#4917): read it
+    /// from the returned `GroupInfo`.
+    @discardableResult
+    func createGroup(
+        app: TestApp,
+        name: String,
+        custodian: String? = nil,
+        initialMembers: [(userId: String, role: String)] = [],
+        initialMetadata: [String: Any]? = nil,
+        settings: [String: Any]? = nil
+    ) async throws -> GroupInfo {
+        var body: [String: Any] = ["name": name, "custodian": custodian ?? "user:\(app.ownerUserId)"]
+        if !initialMembers.isEmpty {
+            body["initialMembers"] = initialMembers.map { ["userId": $0.userId, "role": $0.role] }
+        }
+        if let initialMetadata { body["initialMetadata"] = initialMetadata }
+        if let settings { body["settings"] = settings }
+        let data = try await adminData(method: "POST", path: "/admin/api/apps/\(app.appId)/groups", body: body)
+        return try JSONDecoder().decode(GroupInfo.self, from: data)
+    }
+
+    /// Publish `toml` as the app's `user-properties.toml` through the admin
+    /// API (`PUT /admin/api/apps/{appId}/users/properties`), as the
+    /// super-admin (#5387).
+    func pushUserProperties(appId: String, toml: String) async throws {
+        try await adminRequest(method: "PUT", path: "/admin/api/apps/\(appId)/users/properties", body: ["schema": toml])
+    }
+
+    /// Write a member's properties through the admin API
+    /// (`PATCH /admin/api/apps/{appId}/users/{userId}/properties`), which
+    /// reaches every declared field, as the super-admin (#5387).
+    func writeUserProperties(appId: String, userId: String, patch: [String: Any]) async throws {
+        try await adminRequest(method: "PATCH", path: "/admin/api/apps/\(appId)/users/\(userId)/properties", body: ["patch": patch])
+    }
+
     @discardableResult
     private func adminRequest(method: String, path: String, body: [String: Any]?) async throws -> [String: Any] {
+        let data = try await adminData(method: method, path: path, body: body)
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// A request whose refusal the caller reads: the status and the JSON body,
+    /// never a throw on a non-2xx answer.
+    private func jsonRequest(method: String, path: String, body: [String: Any]?, jwt: String?) async throws -> (Int, [String: Any]) {
+        var request = URLRequest(url: URL(string: "\(TestConfig.httpUrl)\(path)")!)
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let jwt { request.setValue("Bearer \(jwt)", forHTTPHeaderField: "Authorization") }
+        request.setValue(TestConfig.globalAdminAppId, forHTTPHeaderField: "X-Global-Admin-App-Id")
+        if let body { request.httpBody = try JSONSerialization.data(withJSONObject: body) }
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw TestSetupError("Non-HTTP response")
+        }
+        return (httpResponse.statusCode, (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:])
+    }
+
+    private func adminData(method: String, path: String, body: [String: Any]?) async throws -> Data {
         let url = URL(string: "\(TestConfig.httpUrl)\(path)")!
         var request = URLRequest(url: url)
         request.httpMethod = method
@@ -524,7 +689,7 @@ final class TestContext: @unchecked Sendable {
             throw TestSetupError("HTTP \(httpResponse.statusCode) \(method) \(path): \(text)")
         }
 
-        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        return data
     }
 
     @discardableResult

@@ -1,0 +1,23 @@
+# A db3 type file whose models declare no `id` field (#5025). Its models are
+# emitted into Tests/JsBaoClientTests/CodegenAcceptance/ImplicitId, where the
+# test target compiles them. Re-roll with:
+#   swift run swift-bao-codegen \
+#     --input  Tests/SwiftBaoCodegenTests/Fixtures/implicit-id-5025.toml \
+#     --output <tmp>
+# and copy the two model files (not the barrel) over.
+
+[type]
+name = "implicit-id"
+
+[models.notes]
+class_name = "ImplicitIdNote"
+
+[models.notes.fields.title]
+type = "string"
+required = true
+
+[models.notes.fields.done]
+type = "boolean"
+
+[models.empty]
+class_name = "ImplicitIdEmpty"

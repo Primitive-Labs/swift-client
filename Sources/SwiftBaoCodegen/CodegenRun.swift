@@ -1,0 +1,191 @@
+import Foundation
+import TOMLKit
+
+/// One schema input: its path, the name generated headers give it (its
+/// basename) and its contents.
+struct CodegenInput {
+    var path: String
+    var sourceName: String
+    var source: String
+}
+
+/// The files `--input` names (#5025): each a TOML file, or a directory
+/// contributing every `*.toml` directly inside it, in name order.
+enum CodegenInputs {
+
+    /// The input files, in order. A directory contributes the `*.toml` files
+    /// directly inside it, sorted by name; subdirectories and other files are
+    /// ignored. A file named twice is read once, at its first position.
+    static func expand(_ inputs: [String]) throws -> [String] {
+        let fileManager = FileManager.default
+        var files: [String] = []
+        var seen: Set<String> = []
+        for input in inputs {
+            let url = URL(fileURLWithPath: input).standardizedFileURL
+            let path = url.path(percentEncoded: false)
+            var isDirectory: ObjCBool = false
+            var members = [path]
+            if fileManager.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue {
+                members = try fileManager.contentsOfDirectory(atPath: path)
+                    .filter { $0.hasSuffix(".toml") }
+                    .sorted()
+                    .map { url.appending(path: $0).path(percentEncoded: false) }
+                    .filter {
+                        var memberIsDirectory: ObjCBool = false
+                        return fileManager.fileExists(atPath: $0, isDirectory: &memberIsDirectory)
+                            && !memberIsDirectory.boolValue
+                    }
+            }
+            for member in members where seen.insert(member).inserted {
+                files.append(member)
+            }
+        }
+        return files
+    }
+
+    /// The `schemas/` each input's shared-enum refs resolve against (#5545):
+    /// `<input's directory>/../schemas`, its `*.toml` in name order, each
+    /// directory read once; the inputs' type names are the db3 keys. A ref
+    /// may name an object def too (#5899).
+    static func sharedEnumFiles(for inputs: [CodegenInput]) -> [SharedEnums] {
+        let db3 = typeNames(inputs)
+        var byDirectory: [String: SharedEnums] = [:]
+        return inputs.map { input in
+            let url = URL(fileURLWithPath: input.path).deletingLastPathComponent().appending(path: "../schemas").standardizedFileURL
+            let dir = url.path(percentEncoded: false)
+            if let read = byDirectory[dir] { return read }
+            var isDirectory: ObjCBool = false
+            let files = FileManager.default.fileExists(atPath: dir, isDirectory: &isDirectory) && isDirectory.boolValue
+                ? ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).filter { $0.hasSuffix(".toml") }.sorted()
+                    .map { (String($0.dropLast(5)), (try? String(contentsOf: url.appending(path: $0), encoding: .utf8)) ?? "") }
+                : nil
+            byDirectory[dir] = SharedEnums(files: files, dir: "\(dir)/", db3: db3, objects: true)
+            return byDirectory[dir]!
+        }
+    }
+
+    /// Each type file's db3 type name: its `[type] name`, else its stem.
+    static func typeNames(_ inputs: [CodegenInput]) -> [String] {
+        inputs.compactMap { input in
+            guard let type = (try? TOMLTable(string: input.source))?["type"]?.table else { return nil }
+            return type["name"]?.string.flatMap { $0.isEmpty ? nil : $0 } ?? URL(fileURLWithPath: input.sourceName).deletingPathExtension().lastPathComponent
+        }
+    }
+
+    /// Each type file's db3 type once, sorted by name, archived when any
+    /// file declaring it says `[type] archived = true`.
+    static func typeDeclarations(_ documents: [(sourceName: String, source: String)]) -> [(name: String, archived: Bool)] {
+        var archived: [String: Bool] = [:]
+        for document in documents {
+            guard let type = (try? TOMLTable(string: document.source))?["type"]?.table else { continue }
+            let name = type["name"]?.string.flatMap { $0.isEmpty ? nil : $0 }
+                ?? URL(fileURLWithPath: document.sourceName).deletingPathExtension().lastPathComponent
+            archived[name] = (archived[name] ?? false) || type["archived"]?.bool == true
+        }
+        return archived.keys.sorted().map { (name: $0, archived: archived[$0]!) }
+    }
+
+    /// Read each file, named by its basename.
+    static func read(_ paths: [String]) throws -> [CodegenInput] {
+        try paths.map { path in
+            let url = URL(fileURLWithPath: path)
+            return CodegenInput(
+                path: path,
+                sourceName: url.lastPathComponent,
+                source: try String(contentsOf: url, encoding: .utf8)
+            )
+        }
+    }
+}
+
+/// Everything one `swift-bao-codegen` run writes, rendered in memory: one
+/// file per model over every input, then the registration barrel. Pure, so
+/// `--check` and the hermetic tests read exactly what a run writes.
+enum CodegenRun {
+
+    /// Render `documents` (each a file's basename and contents). A model's
+    /// file names the input that declared it; the barrel names every input,
+    /// or `emptyLabel` when there is none. For one input the output is what
+    /// a single `--input` has always written. `sharedEnums`, one per
+    /// document, expands its fields' shared-enum refs (#5545).
+    static func render(
+        documents: [(sourceName: String, source: String)],
+        sharedEnums: [SharedEnums?]? = nil,
+        emptyLabel: String,
+        accessLevel: String,
+        moduleImport: String,
+        swiftNameSuffix: String,
+        strict: Bool,
+        knownTypesOnly: Bool = false
+    ) throws -> [(fileName: String, source: String)] {
+        // An authoring door, like js-bao-codegen-v2: a field name that
+        // breaks a generated model on either client is refused here.
+        let schemas = try TomlParser.parseAll(
+            documents: documents,
+            sharedEnums: sharedEnums,
+            swiftNameSuffix: swiftNameSuffix,
+            strict: strict,
+            rejectReservedFieldNames: true
+        )
+
+        // Detect Swift-name collisions (two TOML models with the same
+        // resolved swiftName would clobber each other) before rendering.
+        var modelsByFile: [String: [String]] = [:]
+        var fileOrder: [String] = []
+        for schema in schemas {
+            let fileName = "\(schema.swiftName).swift"
+            if modelsByFile[fileName] == nil { fileOrder.append(fileName) }
+            modelsByFile[fileName, default: []].append(schema.name)
+        }
+        for fileName in fileOrder where modelsByFile[fileName]!.count > 1 {
+            throw CodegenError.swiftNameCollision(fileName: fileName, models: modelsByFile[fileName]!)
+        }
+        // The registration barrel uses a fixed filename — reject a model
+        // whose resolved Swift name would collide with it.
+        if modelsByFile[SwiftEmitter.barrelFileName] != nil {
+            throw CodegenError.reservedBarrelName(fileName: SwiftEmitter.barrelFileName)
+        }
+        // A model named like a protocol its own declaration conforms to
+        // would shadow it; the token types are named through the model.
+        for schema in schemas where SwiftEmitter.conformedProtocolNames.contains(schema.swiftName) {
+            throw CodegenError.reservedProtocolName(model: schema.name, name: schema.swiftName)
+        }
+        // A ref'd field's generated names must not be taken or shadowed (#5896).
+        try SwiftEmitter.checkSharedEnums(schemas: schemas)
+        // A JSON field's generated `<field>Raw` must not be taken (#5899).
+        try SwiftEmitter.checkJSONFields(schemas: schemas)
+
+        // The cross-model name map lets relationship accessors name their
+        // typed return types (`task` → `TaskRecord?`), across every input.
+        var options = EmitOptions(
+            accessLevel: accessLevel,
+            moduleImport: moduleImport,
+            sourcePath: "",
+            swiftNamesByModel: Dictionary(uniqueKeysWithValues: schemas.map { ($0.name, $0.swiftName) })
+        )
+        var rendered: [(fileName: String, source: String)] = []
+        for schema in schemas {
+            options.sourcePath = schema.sourceName
+            rendered.append(("\(schema.swiftName).swift", SwiftEmitter(options: options).emit(schema: schema)))
+        }
+        // The barrel is emitted even for an empty schema list — registering
+        // zero models is harmless, and a consumer can reference
+        // `GeneratedModels.all` unconditionally.
+        options.sourcePath = documents.isEmpty
+            ? emptyLabel
+            : documents.map(\.sourceName).joined(separator: ", ")
+        // A type that allows local-only db3s: its declarations and their hash.
+        let localOnly = try LocalOnlyDeclarations.of(documents: documents, sharedEnums: sharedEnums)
+        // `--known-types-only`: the barrel declares every input db3 type, an
+        // opted-in one with its declarations. Without it, only the opted-in
+        // types, so a build that opts none in is generated as before.
+        let db3Types: [BarrelDb3Type]? = knownTypesOnly
+            ? CodegenInputs.typeDeclarations(documents).map { BarrelDb3Type(name: $0.name, archived: $0.archived, localOnly: localOnly[$0.name]) }
+            : localOnly.isEmpty ? nil : localOnly.keys.sorted().map { BarrelDb3Type(name: $0, archived: false, localOnly: localOnly[$0]) }
+        rendered.append((
+            SwiftEmitter.barrelFileName,
+            SwiftEmitter(options: options).emitBarrel(schemas: schemas, db3Types: db3Types, knownTypesOnly: knownTypesOnly)
+        ))
+        return rendered
+    }
+}

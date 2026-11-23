@@ -202,7 +202,7 @@ final class MultiDocModelTests: XCTestCase {
             ]
         ))
         let byDoc = Dictionary(uniqueKeysWithValues: rows.compactMap { row -> (String, [String: JSONValue])? in
-            guard let docId = row["_meta_doc_id"]?.stringValue else { return nil }
+            guard let docId = row["group"]?["_meta_doc_id"]?.stringValue else { return nil }
             return (docId, row)
         })
         XCTAssertEqual(byDoc["docA"]?["n"]?.numberValue, 2)

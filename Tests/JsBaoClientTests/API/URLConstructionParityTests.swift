@@ -64,9 +64,13 @@ final class URLConstructionParityTests: XCTestCase {
     }
 
     // MARK: - GroupsAPI.list — byte-identical + boolean convention preserved
+    //
+    // The group pins below call the typed labels and `ListGroupsOptions.type`,
+    // deprecated since #4737, so they are deprecated test methods.
 
     /// A slug type filter and the `includeSystem=true`-only-when-true boolean
     /// convention are preserved byte-for-byte.
+    @available(*, deprecated)
     func test_groupsList_slugAndBoolean_areByteIdentical() async throws {
         let recorder = PathRecorder()
         let groups = GroupsAPI(transport: recorder)
@@ -77,6 +81,7 @@ final class URLConstructionParityTests: XCTestCase {
     }
 
     /// `includeSystem` defaulting to nil/false appends nothing (unchanged).
+    @available(*, deprecated)
     func test_groupsList_includeSystemFalse_isOmitted() async throws {
         let recorder = PathRecorder()
         let groups = GroupsAPI(transport: recorder)
@@ -89,6 +94,7 @@ final class URLConstructionParityTests: XCTestCase {
     /// The cursor is now percent-encoded. Before the fix `listMembers`
     /// interpolated it raw (`cursor=\(cursor)`), so a cursor containing a `+`
     /// or space produced a malformed query on page 2.
+    @available(*, deprecated)
     func test_groupsListMembers_cursor_isEncoded() async throws {
         let recorder = PathRecorder()
         let groups = GroupsAPI(transport: recorder)
@@ -104,6 +110,7 @@ final class URLConstructionParityTests: XCTestCase {
     }
 
     /// A plain cursor stays byte-identical.
+    @available(*, deprecated)
     func test_groupsListMembers_plainCursor_isByteIdentical() async throws {
         let recorder = PathRecorder()
         let groups = GroupsAPI(transport: recorder)
@@ -120,6 +127,7 @@ final class URLConstructionParityTests: XCTestCase {
 
     // MARK: - GroupsAPI.removeMemberByEmail — plus email in the query
 
+    @available(*, deprecated)
     func test_groupsRemoveMemberByEmail_plusEmail_isEncoded() async throws {
         let recorder = PathRecorder()
         let groups = GroupsAPI(transport: recorder)
@@ -136,6 +144,7 @@ final class URLConstructionParityTests: XCTestCase {
 
     /// A value containing `/` is now escaped to `%2F` (the old `.urlPathAllowed`
     /// left it literal, letting a value split into extra path segments).
+    @available(*, deprecated)
     func test_groupsDelete_slashInValue_isEscaped() async throws {
         let recorder = PathRecorder()
         let groups = GroupsAPI(transport: recorder)
@@ -154,6 +163,7 @@ final class URLConstructionParityTests: XCTestCase {
 
     // MARK: - InvitationsAPI.listDeferredGrants — email filter
 
+    @available(*, deprecated)
     func test_invitationsListDeferredGrants_email_isEncoded() async throws {
         let recorder = PathRecorder()
         let invitations = InvitationsAPI(transport: recorder)
@@ -163,6 +173,7 @@ final class URLConstructionParityTests: XCTestCase {
 
     // MARK: - RuleSetsAPI.list — resourceType filter
 
+    @available(*, deprecated)
     func test_ruleSetsList_resourceType_isEncoded() async throws {
         let recorder = PathRecorder()
         let ruleSets = RuleSetsAPI(transport: recorder)
@@ -171,6 +182,7 @@ final class URLConstructionParityTests: XCTestCase {
     }
 
     /// A plain resourceType slug stays byte-identical.
+    @available(*, deprecated)
     func test_ruleSetsList_slug_isByteIdentical() async throws {
         let recorder = PathRecorder()
         let ruleSets = RuleSetsAPI(transport: recorder)
@@ -199,28 +211,37 @@ final class URLConstructionParityTests: XCTestCase {
 
     // MARK: - JsBaoClient.syncMetadata — query
 
-    /// No options → bare `/documents`, no trailing `?`.
-    func test_syncMetadataPath_noOptions_isBare() {
+    /// The whole scope is the pair that replaced `GET /documents` (#4830):
+    /// the first page of each list asks only for a full page.
+    func test_syncMetadataPagePath_firstPage_asksForAFullPage() {
         XCTAssertEqual(
-            JsBaoClient.syncMetadataPath(payloadType: nil),
-            "/documents"
+            JsBaoClient.syncMetadataPagePath(owned: true, payloadType: nil, cursor: nil),
+            "/me/owned-documents?limit=100"
+        )
+        XCTAssertEqual(
+            JsBaoClient.syncMetadataPagePath(owned: false, payloadType: "full", cursor: nil),
+            "/me/shared-documents?limit=100"
         )
     }
 
-    /// `payloadType` was previously appended unescaped; it now routes through
-    /// `URLQuery`.
-    func test_syncMetadataPath_payloadType_isEncoded() {
+    /// An ids sync asks the owned list for ids, as js-bao does; the shared
+    /// list takes no such option.
+    func test_syncMetadataPagePath_ids_asksOnlyTheOwnedList() {
         XCTAssertEqual(
-            JsBaoClient.syncMetadataPath(payloadType: "full/ids"),
-            "/documents?payloadType=full%2Fids"
+            JsBaoClient.syncMetadataPagePath(owned: true, payloadType: "ids", cursor: nil),
+            "/me/owned-documents?fields=ids&limit=100"
+        )
+        XCTAssertEqual(
+            JsBaoClient.syncMetadataPagePath(owned: false, payloadType: "ids", cursor: nil),
+            "/me/shared-documents?limit=100"
         )
     }
 
-    /// Plain values stay byte-identical.
-    func test_syncMetadataPath_plainValues_areByteIdentical() {
+    /// The server's cursor is raw JSON; it routes through `URLQuery`.
+    func test_syncMetadataPagePath_cursor_isEncoded() {
         XCTAssertEqual(
-            JsBaoClient.syncMetadataPath(payloadType: "full"),
-            "/documents?payloadType=full"
+            JsBaoClient.syncMetadataPagePath(owned: false, payloadType: nil, cursor: #"{"k":"a b"}"#),
+            "/me/shared-documents?limit=100&cursor=%7B%22k%22%3A%22a%20b%22%7D"
         )
     }
 

@@ -3,7 +3,7 @@ import XCTest
 
 /// The task run's `slice` block on the status envelope — #3388.
 ///
-/// `GET /workflows/runs/{runId}/status` carries `slice` beside `status` and
+/// `GET /functions/runs/{runId}/status` carries `slice` beside `status` and
 /// `run` for a task run that has a record (#3381) — the route path is the
 /// wire's, not a statement about which client surface owns the block. These
 /// pin it field for field on the FUNCTIONS result, typed and untyped, and
@@ -44,7 +44,7 @@ final class FunctionsSliceHermeticTests: XCTestCase {
 
         let status = try await api.getStatus(runId: "run-1")
 
-        XCTAssertEqual(transport.lastCall?.path, "/workflows/runs/run-1/status")
+        XCTAssertEqual(transport.lastCall?.path, "/functions/runs/run-1/status")
         XCTAssertEqual(status.status, "completed")
         let slice = try XCTUnwrap(status.slice, "a task run with a record carries the block")
         XCTAssertEqual(slice.sliceId, "slice-abc")
@@ -311,5 +311,88 @@ final class FunctionsSliceHermeticTests: XCTestCase {
         XCTAssertEqual(slice.resets, 0)
         XCTAssertNil(slice.lastResetAt)
         XCTAssertNil(slice.lastResetCause)
+        // #3766 — and the progress fields.
+        XCTAssertNil(slice.lastProgressAt)
+        XCTAssertNil(slice.openStep)
+        XCTAssertNil(slice.openStepStartedAt)
+        XCTAssertNil(slice.parkedAt)
+    }
+
+    // MARK: - #3766 — the run's last progress, on the same block
+
+    /// A task run inside a step: when the platform last saw it do anything,
+    /// the step it is inside, and when that began. An operator tells a stalled
+    /// run from a live one by these before the platform ends it.
+    private static let progressingTaskRun = """
+    {"status":{"status":"running"},
+     "run":{"runId":"run-p","runKey":"rk-p","status":"running"},
+     "slice":{"sliceId":"slice-prg","startedAt":1757000000000,
+              "ceilingAt":1757043200000,"settledAt":null,"settledStatus":null,
+              "lastRefreshAt":null,"refreshCount":0,"resets":0,
+              "lastResetAt":null,"lastResetCause":null,
+              "lastProgressAt":1757000400000,"openStep":"hang#0",
+              "openStepStartedAt":1757000350000,"parkedAt":1757000200000}}
+    """
+
+    func testGetStatusCarriesLastProgressTheOpenStepAndThePark() async throws {
+        let (api, _) = makeApi(json: Self.progressingTaskRun)
+
+        let status = try await api.getStatus(runId: "run-p")
+        let slice = try XCTUnwrap(status.slice)
+
+        XCTAssertEqual(slice.lastProgressAt, 1_757_000_400_000)
+        XCTAssertEqual(slice.openStep, "hang#0")
+        XCTAssertEqual(slice.openStepStartedAt, 1_757_000_350_000)
+        XCTAssertEqual(slice.parkedAt, 1_757_000_200_000)
+
+        let (typedApi, _) = makeApi(json: Self.progressingTaskRun)
+        let typed: FunctionRunResult<One> = try await typedApi.getStatus(runId: "run-p")
+        XCTAssertEqual(typed.slice, slice)
+    }
+
+    /// A server that predates #3766 sends none of the four, and a settled
+    /// slice sends them `null`: both read `nil` and keep the record.
+    func testAbsentOrNullProgressFieldsReadNilAndKeepTheBlock() async throws {
+        for tail in [
+            "",
+            #","lastProgressAt":null,"openStep":null,"openStepStartedAt":null,"parkedAt":null"#,
+        ] {
+            let (api, _) = makeApi(json: """
+            {"status":{"status":"running"},
+             "run":{"runId":"run-q","runKey":"rk-q","status":"running"},
+             "slice":{"sliceId":"slice-q","startedAt":1757000000000\(tail)}}
+            """)
+
+            let status = try await api.getStatus(runId: "run-q")
+            let slice = try XCTUnwrap(status.slice, "progress tail \(tail)")
+
+            XCTAssertEqual(slice.sliceId, "slice-q")
+            XCTAssertNil(slice.lastProgressAt)
+            XCTAssertNil(slice.openStep)
+            XCTAssertNil(slice.openStepStartedAt)
+            XCTAssertNil(slice.parkedAt)
+        }
+    }
+
+    /// A progress field the client cannot read drops the block, as every
+    /// other field does.
+    func testAMalformedProgressFieldDropsTheBlock() async throws {
+        for field in [
+            #""lastProgressAt":"soon""#,
+            #""openStep":7"#,
+            #""openStepStartedAt":true"#,
+            #""parkedAt":[1]"#,
+        ] {
+            let (api, _) = makeApi(json: """
+            {"status":{"status":"completed"},
+             "run":{"runId":"run-x","runKey":"rk-x","status":"completed"},
+             "slice":{"sliceId":"slice-x",\(field)}}
+            """)
+
+            let status = try await api.getStatus(runId: "run-x")
+
+            XCTAssertEqual(status.status, "completed", "slice \(field) must not break the read")
+            XCTAssertNil(status.slice, "slice \(field) is not a record the client can publish")
+        }
     }
 }

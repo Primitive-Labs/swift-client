@@ -1,6 +1,6 @@
 // AUTO-GENERATED FROM prompts/advisor.toml — DO NOT EDIT.
 // Run `primitive functions codegen --lang swift` to regenerate.
-// fingerprint: f869d34b4e7e659a
+// fingerprint: 557d4b528c6e0529
 
 import Foundation
 import JsBaoClient
@@ -152,6 +152,59 @@ public struct AdvisorToolProposeBudgetChangeOutput: Codable, Equatable, Sendable
     }
 }
 
+public struct AdvisorPresentationPresent: Codable, Equatable, Sendable {
+    public var show: [Int]
+    public var suggestions: [String]?
+    /// Extra keys the schema does not model, preserved round-trip.
+    public var extra: [String: JSONValue]
+
+    public init(
+        show: [Int],
+        suggestions: [String]? = nil,
+        extra: [String: JSONValue] = [:]
+    ) {
+        self.show = show
+        self.suggestions = suggestions
+        self.extra = extra
+    }
+
+    public enum CodingKeys: String, CodingKey {
+        case show
+        case suggestions
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.show = try container.decode([Int].self, forKey: .show)
+        self.suggestions = try container.decodeIfPresent([String].self, forKey: .suggestions)
+        let dynamic = try decoder.container(keyedBy: DynamicCodingKey.self)
+        var collected: [String: JSONValue] = [:]
+        for key in dynamic.allKeys where !Self.knownKeys.contains(key.stringValue) {
+            collected[key.stringValue] = try dynamic.decode(JSONValue.self, forKey: key)
+        }
+        self.extra = collected
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(show, forKey: .show)
+        try container.encodeIfPresent(suggestions, forKey: .suggestions)
+        var dynamic = encoder.container(keyedBy: DynamicCodingKey.self)
+        for (key, value) in extra where !Self.knownKeys.contains(key) {
+            try dynamic.encode(value, forKey: DynamicCodingKey(stringValue: key))
+        }
+    }
+
+    private static let knownKeys: Set<String> = ["show", "suggestions"]
+
+    private struct DynamicCodingKey: CodingKey {
+        var stringValue: String
+        var intValue: Int? { nil }
+        init(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { nil }
+    }
+}
+
 public struct AdvisorEventApplied: Codable, Equatable, Sendable {
     public var callId: String
     /// Extra keys the schema does not model, preserved round-trip.
@@ -199,10 +252,28 @@ public struct AdvisorEventApplied: Codable, Equatable, Sendable {
     }
 }
 
+/// A presentation the `advisor` agent hands the client with its answer,
+/// typed by name: decode one of `view.presentations(of:names:)` with `init?(_:)`.
+public enum AdvisorAgentPresentation: Equatable, Sendable {
+    case present(AdvisorPresentationPresent)
+
+    /// The presentation's typed input; `nil` for a name this agent does not
+    /// declare, or an input its type does not decode.
+    public init?(_ presentation: AgentPresentation) {
+        switch presentation.name {
+        case "present":
+            do { self = .present(try presentation.decode(AdvisorPresentationPresent.self)) } catch { return nil }
+        default:
+            return nil
+        }
+    }
+}
+
 /// The `advisor` agent: the key a session is created with, and the
-/// client tools and event kinds it declares.
+/// client tools, presentations and event kinds it declares.
 public enum AdvisorAgent {
     public static let key = "advisor"
     public static let clientToolNames: [String] = ["propose_budget_change"]
+    public static let presentationNames: [String] = ["present"]
     public static let eventNames: [String] = ["applied"]
 }

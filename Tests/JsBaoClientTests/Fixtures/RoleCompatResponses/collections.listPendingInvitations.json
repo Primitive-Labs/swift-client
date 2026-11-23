@@ -1,0 +1,22 @@
+{
+  "name": "collections.listPendingInvitations",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "GET",
+  "path": "/app/<appId>/api/collections/<ulid>/pending-invitations",
+  "caller": "owner",
+  "request": null,
+  "status": 200,
+  "body": {
+    "items": [
+      {
+        "email": "<email>",
+        "permission": "reader",
+        "invitationId": "<ulid>",
+        "createdAt": "<iso>",
+        "expiresAt": "<iso>",
+        "addedBy": "<ulid>"
+      }
+    ]
+  }
+}

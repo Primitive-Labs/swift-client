@@ -31,7 +31,7 @@ final class ErrorCodeRefreshFailureHermeticTests: XCTestCase {
         let (_, http) = makeWiredClients(initialToken: makeTestJwt(userId: "u1-stale"))
 
         do {
-            _ = try await http.request(method: "GET", path: "/me")
+            let _: JSONValue? = try await http.requestOptional(method: .get, path: "/me")
             XCTFail("a refused refresh must surface the 401 to the caller")
         } catch let error as HttpError {
             XCTAssertEqual(error.status, 401)
@@ -56,7 +56,7 @@ final class ErrorCodeRefreshFailureHermeticTests: XCTestCase {
         let (_, http) = makeWiredClients(initialToken: makeTestJwt(userId: "u1-stale"))
 
         do {
-            _ = try await http.request(method: "GET", path: "/me")
+            let _: JSONValue? = try await http.requestOptional(method: .get, path: "/me")
             XCTFail("a refused refresh must surface the 401 to the caller")
         } catch let error as HttpError {
             XCTAssertEqual(error.status, 401)

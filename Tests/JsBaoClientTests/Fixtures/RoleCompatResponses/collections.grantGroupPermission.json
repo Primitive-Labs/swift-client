@@ -1,0 +1,22 @@
+{
+  "name": "collections.grantGroupPermission",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "POST",
+  "path": "/app/<appId>/api/collections/<ulid>/group-permissions",
+  "caller": "owner",
+  "request": {
+    "groupType": "team",
+    "groupId": "baseline2",
+    "permission": "reader"
+  },
+  "status": 201,
+  "body": {
+    "collectionId": "<ulid>",
+    "groupType": "team",
+    "groupId": "baseline2",
+    "permission": "reader",
+    "grantedAt": "<iso>",
+    "grantedBy": "<ulid>"
+  }
+}

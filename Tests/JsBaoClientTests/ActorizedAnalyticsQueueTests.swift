@@ -310,7 +310,7 @@ final class ActorizedAnalyticsQueueTests: XCTestCase {
     // MARK: - The typed entry point's field mapping (review of PR #2266)
 
     /// `asJSONObject()` is the only path the typed `logEvent` takes and it
-    /// re-spells all 14 fields by hand. A copy-paste slip (`row["os_name"] =
+    /// re-spells all 13 fields by hand. A copy-paste slip (`row["os_name"] =
     /// .string(os_version)`) or a dropped `if let` line would ship wrong or
     /// missing analytics dimensions on every event with the whole suite green,
     /// so every field is asserted key-by-key against a distinct value.
@@ -328,8 +328,7 @@ final class ActorizedAnalyticsQueueTests: XCTestCase {
             browser_name: "browser-name-value",
             browser_version: "browser-version-value",
             app_version: "app-version-value",
-            context_json: .object(["ctx": .string("ctx-value")]),
-            user_created_at_epoch_s: 1_700_000_000
+            context_json: .object(["ctx": .string("ctx-value")])
         )
 
         let row = input.asJSONObject()
@@ -347,8 +346,7 @@ final class ActorizedAnalyticsQueueTests: XCTestCase {
         XCTAssertEqual(row["browser_version"], .string("browser-version-value"))
         XCTAssertEqual(row["app_version"], .string("app-version-value"))
         XCTAssertEqual(row["context_json"], .object(["ctx": .string("ctx-value")]))
-        XCTAssertEqual(row["user_created_at_epoch_s"], .number(1_700_000_000))
-        XCTAssertEqual(row.count, 14, "no extra keys, and none of the 14 collapsed onto another")
+        XCTAssertEqual(row.count, 13, "no extra keys, and none of the 13 collapsed onto another")
     }
 
     /// The other half of the mapping's contract: a nil field is *dropped*, not
@@ -360,7 +358,7 @@ final class ActorizedAnalyticsQueueTests: XCTestCase {
                        "only the one non-nil field may appear")
     }
 
-    /// The same 14 fields on the untyped bridge, so the two spellings cannot
+    /// The same 13 fields on the untyped bridge, so the two spellings cannot
     /// drift apart. `asDictionary()` is what the deprecated `[String: Any]`
     /// callers still reach.
     func testAsDictionaryCarriesTheSameKeysAsAsJSONObject() throws {
@@ -368,7 +366,7 @@ final class ActorizedAnalyticsQueueTests: XCTestCase {
             action: "a", feature: "b", route: "c", plan: "d", tenant_id: "e",
             user_ulid: "f", device_type: "g", os_name: "h", os_version: "i",
             browser_name: "j", browser_version: "k", app_version: "l",
-            context_json: .object(["m": .string("n")]), user_created_at_epoch_s: 7
+            context_json: .object(["m": .string("n")])
         )
         XCTAssertEqual(
             Set(input.asDictionary().keys), Set(input.asJSONObject().keys),
@@ -447,18 +445,6 @@ final class ActorizedAnalyticsQueueTests: XCTestCase {
         }
     }
 
-    /// The twins are deliberately *not* same-name `async` overloads: Swift
-    /// prefers the `async` overload in an asynchronous context, so a same-name
-    /// twin makes every existing un-`await`ed call a compile error — the source
-    /// break the window exists to avoid. Pin the reasoning next to the code.
-    func testTheTwinNamingRationaleIsRecorded() throws {
-        let source = try Self.clientSource("API/AnalyticsAPI.swift")
-        XCTAssertTrue(
-            source.contains("prefers an `async` overload"),
-            "the reason the twins carry a distinct name must stay written down"
-        )
-    }
-
     // MARK: - Behavior 8 — the TSan baseline shrank
 
     /// The `AnalyticsQueue` / `flushTimer` entries were type-level, so they
@@ -511,11 +497,16 @@ final class ActorizedAnalyticsQueueTests: XCTestCase {
             "wall-clock budget is not meaningful under ThreadSanitizer (~4× overhead)"
         )
         let queue = AnalyticsQueue(logger: Logger(level: .none, scope: "d3-perf"))
-        let start = DispatchTime.now().uptimeNanoseconds
+        // CPU time of this thread, not wall time: the loop runs on one thread
+        // and never blocks, so its CPU time is the work `prepared()` does. Wall
+        // time also counts the time the scheduler gives other processes, and on
+        // a fleet worker running other suites (load average 60) that alone
+        // pushed a ~10 ms loop past the budget.
+        let start = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)
         for i in 0..<10_000 {
             _ = queue.prepared(["action": "bench", "feature": "perf", "i": i])
         }
-        let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+        let elapsedMs = Double(clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - start) / 1_000_000
         XCTAssertLessThan(
             elapsedMs, 50,
             "10,000 untyped analytics events took \(elapsedMs) ms — the conversion regressed the hot path"

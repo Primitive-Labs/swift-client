@@ -3,7 +3,7 @@ import Foundation
 // MARK: - InvitationsAPI
 
 /// Mirrors the JS `InvitationsAPI` — app-level invitation lifecycle plus
-/// deferred-grant browsing for the deferred-grant flow (#466). Distinct
+/// deferred-grant browsing for the deferred-grant flow. Distinct
 /// from the per-document invitation methods on `client.documents.*`,
 /// which were the only invitation surface before this PR.
 public final class InvitationsAPI: @unchecked Sendable {
@@ -18,6 +18,7 @@ public final class InvitationsAPI: @unchecked Sendable {
 
     /// Check the caller's invitation quota. Admins/owners always get
     /// `unlimited: true`.
+    /// - Stability: production
     public func quota() async throws -> InvitationQuota {
         try await transport.request(method: .get, path: "/invitations/quota")
     }
@@ -25,12 +26,14 @@ public final class InvitationsAPI: @unchecked Sendable {
     /// Create an app-level invitation. Members can create invitations
     /// when `memberInvitationsEnabled` is true; admins/owners always can.
     /// Only `params.email` is required.
+    /// - Stability: production
     public func create(params: CreateInvitationParams) async throws -> AppInvitationInfo {
         try await transport.request(method: .post, path: "/invitations", body: params)
     }
 
     /// List app-level invitations (admin/owner only). Returns a typed
-    /// `{ items, cursor }` page.
+    /// `{ items, hasMore, nextCursor? }` page.
+    /// - Stability: production
     public func list(
         limit: Int? = nil,
         cursor: String? = nil
@@ -44,17 +47,19 @@ public final class InvitationsAPI: @unchecked Sendable {
     /// Fetch a single app invitation by id. Includes `inviteToken` so
     /// callers can build their own accept-page CTA.
     /// Permissions: app admin/owner, OR the original inviter.
+    /// - Stability: production
     public func get(invitationId: String) async throws -> AppInvitationInfo {
         try await transport.request(method: .get, path: "/invitations/\(invitationId)")
     }
 
     /// Delete an app-level invitation (admin/owner only). Cascade-deletes
     /// any linked deferred grants.
+    /// - Stability: production
     public func delete(invitationId: String) async throws -> InvitationDeleteResult {
         try await transport.request(method: .delete, path: "/invitations/\(invitationId)")
     }
 
-    /// Accept an invitation via its invite token (#466). For an
+    /// Accept an invitation via its invite token. For an
     /// authenticated user whose session already exists; the server marks
     /// the invitation accepted (write-once) and resolves any pending
     /// deferred grants to the caller's `userId`. The result's
@@ -63,6 +68,7 @@ public final class InvitationsAPI: @unchecked Sendable {
     /// Throws on any failure with a uniform `INVITE_TOKEN_INVALID` code
     /// (the server collapses invalid / expired / already-accepted to one
     /// shape so existence isn't leaked to probing).
+    /// - Stability: production
     public func accept(inviteToken: String) async throws -> AcceptInviteResult {
         try await transport.request(
             method: .post,
@@ -76,16 +82,18 @@ public final class InvitationsAPI: @unchecked Sendable {
     /// List pending deferred grants (admin/owner only). Grants are
     /// permissions/memberships created for users who haven't signed up
     /// yet — they activate when the user accepts the linked invitation.
-    /// Returns a typed `{ grants, nextCursor }` page; each grant is a
+    /// Returns a typed `{ items, hasMore, nextCursor? }` page; each grant is a
     /// `DeferredGrant` discriminated on `type`.
     ///
     /// - Parameters:
     ///   - type: Filter to `.document` or `.group` only.
     ///   - email: Filter to grants targeting this email.
     ///   - limit: Page size.
-    ///   - cursor: Continuation token from a previous page's `nextCursor`
-    ///     (#1316). Without it the server's real position cursor is
+    ///   - cursor: Continuation token from a previous page's `nextCursor`.
+    ///     Without it the server's real position cursor is
     ///     unreachable and a caller can never advance past page one.
+    /// - Stability: production
+    @available(*, deprecated, message: "The deferred-grants API is deprecated: revoke a pending invitation from its resource (documents, db3.permissions, groups, collections). It keeps answering until a later removal project. (api-surface-stability)")
     public func listDeferredGrants(
         type: DeferredGrantType? = nil,
         email: String? = nil,
@@ -108,6 +116,8 @@ public final class InvitationsAPI: @unchecked Sendable {
     ///
     /// - Parameter type: `.document` or `.group` — required because
     ///   document and group deferred grants live in separate tables.
+    /// - Stability: production
+    @available(*, deprecated, message: "The deferred-grants API is deprecated: revoke a pending invitation from its resource (documents, db3.permissions, groups, collections). It keeps answering until a later removal project. (api-surface-stability)")
     public func revokeDeferredGrant(
         deferredId: String,
         type: DeferredGrantType

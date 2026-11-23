@@ -1,0 +1,97 @@
+# The read-default parity fixture (#6304 behavior 60). Every surface reads this
+# one type: the web emitter and getter, swift-bao-codegen (the committed
+# `ParityRecord.swift` beside this directory), the functions `Db3` row, the row
+# projection and the db3 room. `tests/fixtures/read-default-parity-6304/
+# parity.json` names the fields each must read as defaulted and the stored
+# values each must read as the default.
+#
+# Each scalar kind is declared with and without a literal default, but `id`,
+# which is declared with one only: swift-bao-codegen types every `id` field
+# non-optional, so one with no default and not required does not compile.
+# `rank` is required as well. `made` (a generator), `price` (an escaped `$$` string),
+# `tags` (a string set), `gone` (cleared), `shipping` (a JSON field) and
+# `embedding` (a vector) are never read-defaulted. `schemas/common.toml` is a
+# byte-for-byte copy of `CodegenJson/schemas/common.toml`, so `shipping`'s
+# `ShipAddress` compiles against the alias that tree's
+# `Generated/JsonShared.generated.swift` declares.
+
+[type]
+name = "parity"
+
+[models.parity]
+class_name = "ParityRecord"
+
+[models.parity.fields.title]
+type = "string"
+
+[models.parity.fields.label]
+type = "string"
+default = "none"
+
+[models.parity.fields.blank]
+type = "string"
+default = ""
+
+[models.parity.fields.count]
+type = "number"
+
+[models.parity.fields.score]
+type = "number"
+default = 7
+
+[models.parity.fields.zero]
+type = "number"
+default = 0
+
+[models.parity.fields.flag]
+type = "boolean"
+
+[models.parity.fields.on]
+type = "boolean"
+default = true
+
+[models.parity.fields.off]
+type = "boolean"
+default = false
+
+[models.parity.fields.seen]
+type = "date"
+
+[models.parity.fields.due]
+type = "date"
+default = "2026-01-01T00:00:00.000Z"
+
+[models.parity.fields.owner]
+type = "id"
+default = "u-default"
+
+[models.parity.fields.rank]
+type = "number"
+required = true
+default = 1
+
+[models.parity.fields.made]
+type = "date"
+default = "$now"
+
+[models.parity.fields.price]
+type = "string"
+default = "$$0.00"
+
+[models.parity.fields.tags]
+type = "stringset"
+default = ["a"]
+
+[models.parity.fields.gone]
+type = "string"
+default = "x"
+deprecated = true
+cleared = true
+
+[models.parity.fields.shipping]
+ref = "ShipAddress"
+
+[models.parity.fields.embedding]
+type = "vector"
+dims = 2
+element = "f32"

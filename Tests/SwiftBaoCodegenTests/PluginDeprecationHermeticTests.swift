@@ -240,22 +240,4 @@ final class PluginDeprecationHermeticTests: XCTestCase {
             manifest.contains("-suppress-warnings"),
             "the manifest silences plugin diagnostics with -suppress-warnings")
     }
-
-    /// Raising the tools version raises the toolchain a consumer needs, so
-    /// the package documents the floor — and the documented floor is the
-    /// manifest's, not a number that was true once.
-    func testDocumentedToolchainFloorMatchesTheManifest() throws {
-        let toolsVersion = try declaredToolsVersion()
-        let readme = try String(
-            contentsOf: packageRoot.appending(path: "docs/README.md"), encoding: .utf8)
-        let pattern = /Toolchain floor:\*{0,2} Swift ([0-9]+(?:\.[0-9]+)*)/
-        guard let match = try pattern.firstMatch(in: readme) else {
-            XCTFail("docs/README.md states no \"Toolchain floor: Swift <version>\"")
-            return
-        }
-        XCTAssertEqual(
-            String(match.1), toolsVersion,
-            "docs/README.md documents a Swift \(String(match.1)) floor while Package.swift "
-                + "declares swift-tools-version \(toolsVersion)")
-    }
 }

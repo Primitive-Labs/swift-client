@@ -107,6 +107,8 @@ internal enum TestPrimitiveValueBridge {
         case .json:
             if let s = value as? String { return .json(Data(s.utf8)) }
             if let d = value as? Data   { return .json(d) }
+        case .vector:
+            if let v = value as? [Float] { return .vector(v) }
         }
         return nil
     }

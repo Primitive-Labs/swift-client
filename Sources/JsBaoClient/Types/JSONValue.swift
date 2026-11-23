@@ -30,8 +30,8 @@ import Foundation
 /// as a nearby value rather than the one that was sent. Nothing throws; the
 /// digits just change.
 ///
-/// This bites on the dynamic payloads specifically: `DoDb` record fields
-/// (`[String: JSONValue]`), document `metadata`, and workflow inputs are all
+/// This bites on the dynamic payloads specifically: document `metadata`,
+/// resource metadata values (`[String: JSONValue]`), and workflow inputs are all
 /// caller-defined, so the client cannot know a field was meant to be an
 /// exact large integer. Platform identifiers are unaffected — they are ULID
 /// **strings**, not numbers.
@@ -121,6 +121,20 @@ public enum JSONValue: Codable, Sendable, Equatable {
         guard case let .array(items) = self else { return nil }
         return items.compactMap { $0.stringValue }
     }
+
+    /// A vector field's numbers as a db3 read answers them: an `.array`
+    /// of numbers. `nil` for anything else, an array holding a non-number
+    /// included, so a stored value that does not fit the field reads as none.
+    public var floatArrayValue: [Float]? {
+        guard case let .array(items) = self else { return nil }
+        var numbers: [Float] = []
+        numbers.reserveCapacity(items.count)
+        for item in items {
+            guard let number = item.numberValue else { return nil }
+            numbers.append(Float(number))
+        }
+        return numbers
+    }
 }
 
 public extension JSONValue {
@@ -139,7 +153,7 @@ public extension JSONValue {
     ///
     /// Containers are converted element by element rather than round-tripped
     /// through `JSONSerialization`, which is what makes this cheap enough for a
-    /// per-event path (#1993, behavior 13). The cast order is chosen for the
+    /// per-event path (behavior 13). The cast order is chosen for the
     /// same reason and is explained inline.
     ///
     /// - Parameter subject: names the values in the error message, so a caller
@@ -212,7 +226,7 @@ public extension JSONValue {
     /// dictionary branch. A caller that already knows it holds a dictionary —
     /// every untyped public surface that feeds a typed one — should use this:
     /// on a three-key event it saves seven failed dynamic casts, which is
-    /// measurable on the analytics hot path (#1993, behavior 13).
+    /// measurable on the analytics hot path (behavior 13).
     static func typedRow(from dictionary: [String: Any], subject: String = "Values") throws -> [String: JSONValue] {
         var row: [String: JSONValue] = [:]
         row.reserveCapacity(dictionary.count)

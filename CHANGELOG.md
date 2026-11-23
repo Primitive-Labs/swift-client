@@ -20,6 +20,2649 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Added: delete or patch the db3 records matching a filter
+
+`client.db3.deleteWhere(_:model:filter:limit:cursor:requestId:)` deletes the
+records of one model that match a query filter, and
+`client.db3.patchWhere(_:model:filter:data:limit:cursor:requestId:)` merges
+one `data` object into them, in beta. Each call changes up to `limit` records
+(1,000 by default and at most) in id order as one write, under the rules a
+single write meets, and answers a `Db3WriteWhereResult` with `changed`,
+`hasMore` and a `nextCursor` to pass back as `cursor`. A page whose write would
+pass 1 MiB is cut short with `cutBy == "entryBytes"`, and one whose stored
+records would pass 16 MiB with `cutBy == "rowBytes"`.
+
+```swift
+var cursor: String?
+repeat {
+    let page = try await client.db3.deleteWhere(db3Id, model: "Txn", filter: ["accountId": .string(accountId)], cursor: cursor)
+    cursor = page.nextCursor
+} while cursor != nil
+```
+
+### Breaking: a field with a default is non-optional in generated models
+
+A `string`, `number`, `boolean`, `date` or `id` field that declares a literal
+`default` is now a non-optional property, and every read answers the default
+where the stored record has no value of the field's kind:
+
+```toml
+[models.institution.fields.disconnectPending]
+type = "boolean"
+default = false
+```
+
+```swift
+let pending: Bool = institution.disconnectPending   // was Bool?
+```
+
+- `init?(record:)`, `init?(row:)` and `init(from:)` read the default when the
+  record or the JSON lacks the field, holds `null`, or holds a value of another
+  kind (`"5"` in a number field, `1` in a boolean field, a string that is not
+  an ISO date in a date field). The kind is judged as stored, before any
+  conversion, so a stored `1` in a boolean field that used to read `true` on
+  a db3 now reads the default. On a Y.Map document a stored `0` or `1` in a
+  boolean field still reads `false` or `true`, and any other number reads the
+  default. A query row reads as its record does: a Y.Map row lists, under
+  `_meta_stored`, a stored value its columns hold converted (another number
+  in a boolean field, an epoch number in a date field). `init(from:)` no
+  longer throws for such a field.
+- The read stores nothing. A stored `null` stays `null`, and a filter on the
+  default (`{ done: false }`) still does not match a record that only reads it.
+- A field without a default, a generator default (`"$now"`), a string default
+  that starts with `$` (an escaped `"$$..."` included), a string set's default
+  and a JSON field keep their optional types and reads.
+- A ref'd field with a default has a non-optional `<field>Raw`. Its typed
+  accessor stays optional, and assigning `nil` to it leaves the value as it is.
+- Both initializers keep the parameter as `T? = nil`. Leaving it out, or
+  passing `nil`, stores the default, and a create saved from that value writes
+  it.
+- A `date` default is read whole, as the web client and the server read it:
+  `"2026-04-05 13:14:15Z"` is that instant, no longer midnight, and a default
+  with text after its date (`"2026-04-05 1:00 PM"`) is no date literal, so
+  its field stays optional.
+
+#### Migrating
+
+- **Unwraps stop compiling.** `if let`, `guard let`, `!` and `?.` on such a
+  property are compile errors, and `??` warns. Drop them:
+  `institution.baseCurrency ?? "USD"` becomes `institution.baseCurrency`.
+- **Assigning `nil` stops compiling.** A typed write can no longer store
+  `null` in such a field. Write the default, or a value, instead. The
+  record's `subscript` (`record["field"] = nil`) still stores `null`, which
+  reads as the default.
+- **A default the model supplied is never written over a record.** When a
+  value was read without the field, decoded from JSON that lacked it, or built
+  with the parameter left out, saving it over an existing record leaves that
+  record's stored value as it was. The model lists such fields in
+  `_suppliedDefaults`, and `primitiveValues()` leaves them out, a required
+  field included, so `save(in:upsertOn:)` on a unique key the model supplied
+  is refused as a missing key instead of matching the record that holds the
+  default. Assigning the field makes the value yours. `markAllChanged()` is an explicit whole-record
+  write, so it writes every field the value carries, a supplied default
+  included.
+- **Clear a field in two steps.** A build generated while a field had a
+  default does not build records (`init?(record:)` and `init?(row:)` answer
+  `nil`) from a db3 that holds a clear of that field. The server refuses a
+  push that clears a field with a default (`cleared-field-defaulted`). Push
+  the field without its `default`, ship the build generated from that, and
+  only then clear it.
+
+### Breaking: permission levels in results are enums
+
+A result that carried a permission level as `String` now reads it as an enum
+with the levels the server sends, and an `.unknown` case that keeps a level this
+client does not know instead of failing the decode:
+
+```swift
+for grant in try await client.documents.listGroupPermissions(documentId: documentId) {
+    switch grant.permission {
+    case .readWrite: print("\(grant.groupId) can edit")
+    case .reader: print("\(grant.groupId) can read")
+    case .unknown(let level): print("\(grant.groupId) holds \(level)")
+    }
+}
+```
+
+- `DocumentGrantLevel` (`.readWrite`, `.reader`): `DocumentGroupPermissionEntry`,
+  `DirectPermissionGrant`, `DeferredPermissionGrant`, `PendingInvitationEntry`,
+  `DeferredDocumentGrant` and `DocumentAccessRequest.requestedPermission` /
+  `grantedPermission`.
+- `DocumentAccessLevel` (`.owner`, `.readWrite`, `.reader`):
+  `GroupDocumentInfo.permission`, now optional because the server can send
+  `null`; `DocumentInfo.permission`, `DocumentPermissionEntry.permission` and
+  `DocumentAccessResult.permission` and `Db3Info.permission` (what `db3.get`
+  and `db3.listMine` answer), which were `DocumentPermission` (so they no
+  longer list `.admin`); and `CollectionDocumentInfo.permission`, as
+  `CollectionDocumentPermission` is now an alias of `DocumentAccessLevel`.
+- `DocumentLinkAccessLevel` (`.reader`, `.readWrite`) and the deprecated
+  `CollectionPermission` (`.reader`, `.readWrite`) gain the `.unknown` case, so
+  `DocumentInfo.linkAccess`, `LinkAccessResult.linkAccess` and the collection
+  results that carry `CollectionPermission` keep an unknown level too. Their
+  `init(rawValue:)` no longer returns an optional.
+- `DatabaseAccessLevel` (`.owner`, `.manager`): `GroupDatabaseInfo.permission`.
+- `CollectionAccessLevel` (`.reader`, `.readWrite`): the deprecated `permission`
+  of `CollectionGroupPermissionInfo`, `CollectionMemberInfo`,
+  `CollectionGroupMemberAdd` and `CollectionMemberEntry`.
+
+Read `.rawValue` for the wire string. `DocumentPermission.admin` and
+`Db3Permission.admin` are deprecated: no answer or event sends `admin`, and a
+db3 whose cached level is `admin` reports `.owner`.
+### Added: a db3 JSON field can be a list (beta)
+
+A db3 field may `ref` a `schemas/` list def (`type = "array"`), and the record
+stores the array itself as canonical JSON text (`["a","b"]`), with no wrapper
+object. `primitive functions codegen --lang swift` declares the def's type as a
+Swift array (`[String]`, or `[Address]` for items that ref an object def), and
+`swift-bao-codegen` types the model's property by it. A save validates the
+value against the def and throws `Db3JSONValueError` with kind `.schema` at
+the item's path (`value[1]`) when it does not match; a list def's binding
+refuses a value whose root is not an array with kind `.root`. Stored text
+whose root is not the def's kind reads `nil`, is logged once, and stays in
+`<field>Raw`. An app build older than this release reads a list field as
+`nil`.
+
+### Added: a db3 JSON field can be a map with typed values (beta)
+
+A `schemas/` def a db3 field refs may give `additionalProperties` a schema,
+such as `additionalProperties = { type = "number" }`. `primitive functions
+codegen --lang swift` declares the def's type as a dictionary
+(`[String: Double]`), or, beside declared `properties`, as a struct whose
+catch-all holds values of that type; a key `required` names that
+`properties` does not declare is a stored property of the value type. A save
+validates every undeclared key's value against the schema and throws
+`Db3JSONValueError` with kind `.schema` at `value.<key>` when it does not
+match.
+### Added: db3 blob batch delete and uploader in metadata (beta)
+
+`client.db3.blobs(db3Id).deleteBatch(blobIds:)` deletes up to 500 of a db3's
+blobs in one request and returns the new `Db3BlobBatchDeleteResult`
+(`deleted`, `blobIds`, `db3Id`). An id that is not a blob of the db3 is skipped
+and counted. Once the server accepts, a named upload queued for this db3 is
+cancelled and this db3's local copy of each id goes; a refused batch throws and
+changes nothing on the device.
+
+`client.db3.blobs(db3Id).delete(blobId:)` now cancels only an upload of the id
+queued for this db3, as the batch does. An upload of the id queued for another
+db3 stays queued; before, it was cancelled too.
+
+`BlobInfo` gains three optional fields: `createdBy` (the uploading member's
+user id; `nil` for a signed upload and for a document blob), `etag` (the tag
+the blob's download answers; `nil` for a document blob) and `status`.
+### Added: `client.db3.parallel(_:)` sends several db3 requests in one call (beta)
+
+`client.db3.parallel(_:)` sends up to 10 `.batch` and `.batchRead` requests,
+each on a different db3, in one round trip. They are separate requests, not one
+bigger batch: nothing is atomic or ordered between them, and each is authorized
+and answered as its single call is. Each result carries its `status` and its
+`answer`: `.batch`, `.batchRead`, or `.refused` with the error envelope, in its
+place.
+
+```swift
+let response = try await client.db3.parallel([
+    .batchRead(projects, [.query(model: "Project", limit: 20)]),
+    .batch(me, [.create(model: "Visit", data: ["at": 1])]),
+])
+```
+
+### Changed: `appVersion.onStatusChange` also fires on a policy change
+
+The handler is now called whenever what the client reports changes: the
+status, this platform's policy entry, or a server refusal. A raised `latest`
+that keeps the status at `updateAvailable` now reaches the handler with
+`.updateAvailable`, so a dismissed banner can come back for the newer version;
+read `getPolicy()` in the handler for the entry. A handler that assumed each
+call carries a different status from the last one should compare for itself.
+
+After a server refusal that comes within 60 seconds of the previous one, the
+client now waits 1 second before it refetches the policy (it was 5), doubling
+to at most 60. After 60 seconds with no refusal, the next refusal refetches at
+once.
+
+### Added: typed local-only databases
+
+- A db3 type whose file says `[type] allowLocalOnly = true` can type a db3
+  that lives only on this device:
+  `client.db3.create(title:type:localOnly: true)`. `swift-bao-codegen`
+  embeds the type's declarations and their hash in
+  `GeneratedModels.db3Types` (a new `PrimitiveDb3Types.LocalOnlyDeclarations`
+  and a `DeclaredType(name:archived:localOnly:)` initializer), and
+  `register(on:)` registers them. Nothing is sent; the answer and
+  `stored()` carry `type`. A type the build carries no such declarations
+  for is still refused `.localOnlyUnsupportedOption`; in a
+  `--known-types-only` build an unknown or archived type is refused
+  `.invalidArgument` (`unknown-type`) first. Codegen stops on an opted-in
+  type file that declares a trigger, `autoPopulatedFields` or `timestamps`.
+- Its writes, through generated models, transactions and `DocumentRecords`
+  alike, are judged on the device by the declarations it holds, with the
+  server's codes, at the commit; its constraints and declared indexes come
+  from them.
+- When a newer build opens it, the newer declarations are installed if they
+  only add and its records pass them. Otherwise nothing is installed and
+  `client.db3.state(id).error` is `DB3_TYPE_REFUSED` with `reasons`. An
+  older build keeps the installed declarations. A build whose declarations
+  diverged from them can read the db3, but its writes are refused
+  `.db3TypeRefused` (`details["diverged"]`); so is every write to a copy
+  whose declarations cannot be read (`details["unreadable"]`), until a build
+  that declares its type opens it.
+- When another client of the same store installs newer declarations, an
+  already-open client judges its next write by them at the commit, and its
+  next read leaves out the fields they clear. A write condition reads a
+  cleared field as unset. No index of any kind is registered over a field
+  the installed declarations clear (`.db3IndexInvalid`), and the db3's index
+  list changes only in the same store transaction as the declarations it
+  follows, so another client's install is never undone by an index change
+  made under older ones.
+- In a `knownTypesOnly` build, a typed local-only db3 whose type the build
+  was not generated with is refused `DB3_TYPE_UNKNOWN_TO_CLIENT`, as a
+  synced one is; `allowUnknownType` on subscribe opens it under its
+  installed declarations.
+- `JsBaoErrorCode` gains `.db3TypeRefused`; `Db3StateError` gains `reasons`
+  (`[Db3TypeRefusalReason]`) and an initializer that takes them.
+### Changed: a db3 batch carries up to 1000 operations
+
+`client.db3.batch` and `batchRead` now take up to 1000 operations in one call,
+where they took 100; past that the server refuses the call with
+`BATCH_TOO_LARGE`. The writes between two reads are still one entry of at most
+1 MiB of JSON, so a batch of larger records is refused first for its bytes,
+with `DOCUMENT_ENTRY_TOO_LARGE` (413).
+
+### Added: typed filters, sorts and aggregate rows on generated models
+
+A model `swift-bao-codegen` writes now has `fields`, one token per field, and
+conforms to `TypedQueryModel`, which adds labelled reads checked against the
+model's fields:
+
+```swift
+let f = TaskRecord.fields
+let due = try TaskRecord.query(
+    where: .and([f.done.eq(false), f.dueDate.lt("2026-07-01")]),
+    sort: [.asc(f.dueDate), .desc(f.priority)]
+)
+let category = f.category.group, hours = f.hours.sum()
+for row in try TaskRecord.aggregate(groupBy: [category], operations: [hours]) {
+    _ = (row[category], row[hours]) // String?, Double?
+}
+```
+
+`query(where:)`, `queryPaged(where:)`, `queryOne(where:)`, `count(where:)` and
+`aggregate(groupBy:operations:)` build the same `DocumentFilter`, `sortOrder`
+and `AggregateOptions` the hand-written forms do. A field the model does not
+have, an operand of the wrong type or an operator the field's kind does not
+take fails to compile. A string set token matches members: `contains`, `all`
+and `size`, a count or comparisons (`f.tags.size(.gte(1), .lt(3))`).
+`ModelFilter(unchecked:)` wraps a `DocumentFilter` the tokens cannot say. The `DocumentFilter` reads and `aggregate(_:)` are
+unchanged, and models generated before this change keep compiling. Regenerate
+with this package's `swift-bao-codegen` to get the tokens.
+
+A model named like a token type (`ModelIdField`) still generates and compiles.
+`swift-bao-codegen` now refuses a model whose Swift name is `TypedQueryModel`,
+`PrimitiveModel` or `PrimitiveRowDecodable`: those are protocols every
+generated model conforms to, so the model would shadow them. Such a model
+already failed to compile under the last two names. Rename it with
+`class_name`.
+
+### Breaking: bucket blobs take the database-blob upload and download contract
+
+`BlobBucketsAPI.upload` takes `blobId: String? = nil` and stores the blob under
+that id, a ULID, or one it mints. It sends the bytes' size and SHA-256, so
+uploading the same bytes under an id again stores nothing new and answers
+`bytesTransferred == 0`; other bytes under the id throw `HttpError` 409, and an
+id that is not a ULID 400.
+
+```swift
+let info = try await client.blobBuckets.upload(
+    bucketIdOrKey: "avatars", data: data, filename: "alice.jpg",
+    contentType: "image/jpeg", blobId: blobId
+)
+```
+
+`BucketBlobInfo.uploaded` is now `BucketBlobInfo.createdAt`, and the upload's
+answer carries `bytesTransferred`. `getMetadata` and `download` keep their
+signatures. A bucket download is inline only for images other than SVG, audio
+and video, and a signed URL opens only the blob it was minted for.
+### Changed: a run's `slice.lastResetCause` can read `"storage-reset"`
+
+When the task runtime's own storage is reset under a run, so that a step is
+rejected before its body runs, the platform now counts it as a reset and keeps the run open for the runtime to resume, rather
+than settling it `failed`. The run's `slice.resets` counts it and
+`slice.lastResetCause` reads `"storage-reset"`. The field stays a plain string.
+
+### Breaking: a blob bucket's access is one of four presets
+
+A bucket no longer takes a rule set. `BlobBucketPreset` has no `.custom` case,
+and `BlobBucketInfo`, `CreateBlobBucketParams` and `UpdateBlobBucketParams`
+have no `ruleSetId` (the `ruleSetId:` initializer arguments are gone). The
+server refuses a create or update that sends a rule set with a 400 naming the
+presets.
+
+`BlobBucketInfo.convertedFromRuleSet` is `true` for a bucket that had a rule
+set; it is served as `.adminOnly` until `updateBucket` names a preset, which
+clears the mark. For access a preset cannot express, make the bucket
+`.adminOnly` and have a server function return read URLs from
+`ctx.api.blobBuckets.getSignedUrls`.
+### Fixed: a sent message no longer shows twice in an agent session view
+
+`view.messages` used to hold a sent message twice, its `.pending` entry and its
+synced row, from the moment the row synced until `send` returned. Now the
+pending entry leaves in the same change that brings the row in, so every change
+notification shows one entry per send. Another member's row with the same
+`clientMessageId` still never removes your entry.
+A send refused as a reuse of a `clientMessageId` (`AGENT_CLIENT_ID_CONFLICT`)
+stays `failed`, even when the earlier message's row syncs around the refusal.
+### Added: known db3 types (beta)
+
+`swift-bao-codegen --known-types-only` adds `GeneratedModels.db3Types`, which
+`GeneratedModels.register(on:)` registers through the new
+`JsBaoClient.registerDb3Types(_:)` (a `PrimitiveDb3Types`). The client then
+refuses to create a db3 of a type the build was not generated with, or one
+archived in it (`.invalidArgument`, `details["reason"]` `unknown-type`), and to
+open one (`.db3TypeUnknownToClient`). A new `create(…, allowUnknownType:)`
+overload and an `allowUnknownType` property on
+`Db3GetOrCreateWithAliasOptions` and `Db3SubscribeOptions` let a db3 through.
+`Db3StoredEntry` and `listMine` rows of such a type carry `knownType == false`.
+Nothing changes without the flag; no existing initializer or method changed.
+
+The SwiftPM codegen plugin passes the flag when the target's `bao-codegen.json`
+says `"knownTypesOnly": true` beside its `input` or `inputs`; a value other
+than `true` or `false` fails the build naming the file. A stored copy of an
+unknown type that the client bound from the device before
+`registerDb3Types(_:)` ran is unbound when it runs, so it is not readable
+under the registered build.
+
+### Breaking: an illegal app version stops construction
+
+`JsBaoClient(options:)` now reads the app's version from the bundle's
+`CFBundleShortVersionString` and its platform from the OS (`ios` or `macos`),
+and stops with a precondition failure, naming the value, when either is not
+legal. A version is one to three dot-separated numbers of one to six digits,
+such as `1.4` or `2.0.1`; a platform is a lowercase letter followed by up to 31
+lowercase letters, digits or hyphens. A bundle whose
+`CFBundleShortVersionString` is present but empty, or reads like `1.0-beta`,
+stops here after the update. A bundle with no `CFBundleShortVersionString` at
+all reports no version.
+
+Fix: set `MARKETING_VERSION` to a legal version, or pass one as
+`JsBaoClientOptions(appVersion:)`, which replaces the bundle's and skips its
+check. The `appVersion` and `platform` options are checked the same way. The
+initialiser's signature does not change.
+
+### Added: `client.appVersion` (beta)
+
+`client.appVersion` reports the version and platform this copy of the app
+sends, and its status against the app's version policy (`[clients.<platform>]`
+in `app.toml`): `getStatus()`, `getPolicy()`, `refresh()` and
+`onStatusChange(_:)`, with the new `AppVersionStatus` and
+`ClientPlatformVersions` types. Nothing is fetched until the first ask; after
+it, the client refetches shortly after a reconnect (a random wait of up to 30
+seconds, so clients that reconnect together do not all fetch at once), on
+return to the foreground and hourly, and keeps the last policy for offline use. Every app-API request carries the
+`X-Primitive-App-Version` and `X-Primitive-App-Platform` headers, the socket
+URL carries the same two names, and analytics events carry the version as
+`app_version` (`setAnalyticsAppVersionOverrideAsync` still wins). An HTTP 426
+with code `CLIENT_UPDATE_REQUIRED`, or a socket close with code 4426, sets
+`updateRequired` at once and holds the client's own reconnects until a later
+fetch moves the status; `connect()`, `setShouldConnect(true)` and
+`forceReconnectAsync()` still connect.
+
+### Added: `JsBaoClient.resolveBackend` (beta)
+
+`JsBaoClient.resolveBackend(options:timeout:)` reads the app's backend overrides
+(`[[clients.<platform>.backendOverrides]]` in `app.toml`) before a client
+exists and answers a `ResolvedBackend`: the `appId`, `apiUrl` and `wsUrl` to
+construct the client with, whether they came from an override (`overridden`),
+and whether the decision came from a fresh read, the stored policy or the
+build's own values (`source`: `.fresh`, `.stored`, `.build`).
+
+```swift
+let backend = await JsBaoClient.resolveBackend(options: options)
+let client = JsBaoClient(options: backend.applied(to: options))
+```
+
+- Pass the build's own options. The call sends one unauthenticated request to
+  the home app's `settings/client-versions`, never throws, and waits at most
+  `timeout` seconds (10 by default).
+- `applied(to:)` replaces the three backend values and keeps every other
+  option, except that an overridden answer drops `token`: sessions do not
+  follow an override. With an explicit `.sqlite(directory: path)`, an
+  overridden answer also gets a SQLite file of its own,
+  `<path>.<target app id>.sqlite`, because one file holds one session whatever
+  the app id. Every character of the app id other than a lower-case letter, a
+  digit, `-` or `_` is percent-encoded in that name, so two app ids that differ
+  only in letter case never share a file. The default `.sqlite()` is one file per app id, except that a
+  target app id that is not a plain name (letters, digits, `-`, `_`) or is the
+  home app's in other letter case, such as `./<home id>`, gets
+  `<home database file>.<target app id>.sqlite`, so it can never open the home
+  app's file. A session the target app's store already holds is
+  restored as usual; otherwise sign in, or, after
+  `await client.waitForStorageReady()`, call `client.updateToken(_:)` with a
+  token for the target app (a token given before the stored session is
+  restored can be replaced by it).
+- The resolver keeps the home policy and the targets this copy was sent to in
+  `<database file>.backend-resolver.json` beside the client's SQLite file
+  (nothing with `.memory` storage). The client never reads that file.
+- Each call logs one line at every `logLevel` but `.none`:
+  `[resolveBackend] home=<id> version=<v> platform=<p> appId=<id> apiUrl=<url> overridden=<bool> source=<fresh|stored|build>`.
+- Write an override `apiUrl` in canonical form, root slash included:
+  `apiUrl = "https://api.example.com/"`. `primitive config push` and
+  `PUT settings` refuse any other spelling and name the form to write. The
+  answer's `apiUrl` drops trailing slashes, and its `wsUrl` is that URL with
+  `wss` for `https` (or `ws` for `http`).
+
+A platform whose `[clients.<platform>]` table holds only `backendOverrides` now
+reads as no table in `client.appVersion` (`.unknown`, `getPolicy()` returns
+`nil`), and adding, changing or removing an override never calls a status
+listener.
+
+### Added: `client.db3.cancelPendingCreate(_:evictLocal:)` (beta)
+
+`client.db3.cancelPendingCreate(db3Id, evictLocal:)` cancels a db3's pending
+create on this device: the db3 is no longer pending, and neither a retry nor a
+reconnect commits it. Nothing is sent, so it works offline, and a db3 already
+on the server is left as it is. Use it in place of the deprecated
+`client.cancelPendingCreate(_:evictLocal:)`.
+
+### Added: `client.db3.commitCreate(_:)` (beta)
+
+`client.db3.commitCreate(db3Id)` commits a db3's pending create now and
+answers a `Db3CommitResult`: `created` once the server has it, `refused` with
+the server's `reason` for a refusal, or `reason` `"not_pending"` when nothing
+is pending, with nothing sent. A refused create is tried again, and a commit
+already out is joined; a transient failure throws and the client keeps
+retrying. Use it in place of the deprecated
+`client.commitOfflineCreate(documentId:onExists:)`.
+
+Both members wait for the client's storage setup before they decide, so a
+pending create stored in an earlier session counts right after start-up: it is
+cancelled, or committed, never answered as not pending.
+
+### Deprecated: the client members that work only on a document
+
+Every `JsBaoClient` member that works only on a (non-db3) document is now
+`@available(*, deprecated)`, and its message names the member to use instead,
+or says why none applies. Each keeps working until a later removal project:
+
+- `openDocument(_:options:)`, `startNetworkSync(documentId:)`,
+  `waitForInitialSync(documentId:timeout:pollInterval:)`:
+  `client.db3.subscribe(_:options:)`;
+- `openDocumentByAlias(_:options:)`: `client.db3.aliases`, then
+  `client.db3.subscribe(_:options:)`;
+- `closeDocument(_:options:)`: `client.db3.unsubscribe(_:)`;
+- `createDocument(options:)`: `client.db3.create(title:)`;
+- `isSynced(_:)`, `isDocumentOpen(_:)`, `isPendingCreate(_:)`,
+  `isLocalOnly(_:)`, `hasLocalCopy(_:)`, `getOfflineInfo(_:)`,
+  `isDocumentReadOnly(_:)`, `getDocumentPermission(_:)`:
+  `client.db3.state(_:)`;
+- `listOpenDocuments()`, `listLocalDocuments()`, `listPendingCreates()`:
+  `client.db3.stored()`;
+- `evictLocalDocument(_:)`: `client.db3.evict(_:options:)`;
+- `getDocumentSchema(documentId:modelNames:)`: `client.db3.schema(_:)`;
+- `addDocumentModelMapping(modelName:documentId:)`:
+  `client.setModelDefaultDb3(_:_:)`;
+- `setDefaultDocumentId(_:)`: `client.setDefaultDb3(_:)`;
+- `cancelPendingCreate(_:evictLocal:)`: `client.db3.cancelPendingCreate`;
+- `commitOfflineCreate(documentId:onExists:)`: `client.db3.commitCreate(_:)`;
+- with no db3 counterpart: `getDoc(_:)`, `transactAndSync(_:_:)`,
+  `transactAndSyncAsync(_:_:)`, `getDocHash(documentId:)`, `rootDocId`,
+  `isRootDocument(_:)`, `markMetadataDeleted(_:)`, `syncMetadata(options:)`,
+  `getAwarenessStates(documentId:)` and `document(_:)`.
+
+`clearDocumentModelMapping(modelName:)`, `getDocumentModelMapping(modelName:)`,
+`clearDefaultDocumentId()` and `defaultDocumentId` stay: a db3 app still uses
+them for the defaults `setModelDefaultDb3` and `setDefaultDb3` set.
+### Added: renaming a db3 field (`storedAs`)
+
+A db3 type field renamed by changing its key keeps its records when the new
+table names the old name in `storedAs = "<old name>"`. A device keeps reading
+and writing the stored name through its generated models, so a build from
+before the rename keeps working.
+
+`swift-bao-codegen` generates from a renamed type: the property takes the
+current name, `CodingKeys` and the generated runtime keys take the stored
+name, and `primitiveSchema` carries `fieldNames` and `fieldNameTypes`
+(`PrimitiveSchema` gains both through a new initializer; the four-argument one
+is unchanged). `client.db3.records(id)` takes and
+answers the current name for a model the client registered, on a db3 of one of
+those types; elsewhere it keeps stored names. Through a generated model, a
+write's `condition` takes the current name, `upsert(on:)` names a unique
+constraint first and otherwise a field, and `increment` answers each value
+under the current name.
+### Added: the code of a create the caller's role may not make
+
+`JsBaoErrorCode` takes `.db3CreateRoleRequired` (`"DB3_CREATE_ROLE_REQUIRED"`).
+A db3 type whose file says `create = "admins"` is created only by app admins
+and owners, and with `[app] untypedDb3Create = "admins"` the same holds for
+db3s with no type. A member's `client.db3.create(title:type:)` returns at once,
+then the refusal arrives as `Db3CreateFailedEvent` with the db3's `id`, the
+code and the `type` (`nil` for an untyped db3); rows saved on the device stay
+readable. `client.db3.getOrCreateWithAlias` whose alias names nothing throws
+the code. Server functions create for members as before, and local-only
+creates are never judged.
+
+### Added: db3 JSON fields (beta)
+
+A db3 field whose `ref` names a `schemas/` object def is a JSON field: the
+record stores the value as canonical JSON text in a `string` field, and the
+model `swift-bao-codegen` writes reads and writes it as the def's Swift type.
+`primitive functions codegen --lang swift` declares, in
+`Primitive.generated.swift`, a `Db3JSON_<file>_<Name>` alias of the def's type
+and a `Db3JSONDef_<file>_<Name>` enum conforming to the new `Db3JSONDef`
+protocol, which carries the def's id and compiled schema. The model's property
+is `Db3JSON_<file>_<Name>?` (Optional even when the field is `required`, which
+the save checks), and `<field>Raw` holds the stored text.
+
+Every save encodes an assigned value, validates it against the def and throws
+the new `Db3JSONValueError` (`code` `DB3_JSON_INVALID`, `model`, `field`,
+`def`, `path`, `reason`, `kind`) without writing anything when it does not
+match or JSON cannot hold it exactly: an integer above 2^53 in magnitude is
+refused, never rounded. Stored text that does not decode reads `nil`, is logged
+once per model and field, stays in `<field>Raw`, and is not overwritten by a
+save that did not assign the field. The model stays `Equatable`, `Hashable` and
+`Codable`; its hash combines only whether a JSON field holds a value.
+### Added: retiring a db3 field (deprecated, cleared, removedFields)
+
+`swift-bao-codegen` and `TomlSchemaLoader` take a db3 type field's
+`deprecated = true` and `cleared = true` and a model's `removedFields` in
+strict mode. A deprecated field is generated `@available(*, deprecated)`; a
+cleared or removed field is not generated and is no field of the loaded
+schema. A model generated while a field was `required` returns `nil` from
+`init?(record:)` for a record without it, so make the field optional and
+ship that build before clearing it.
+
+A device that holds a db3 type revision clearing a field leaves the field
+out of every local read: `db3.records` `get`, `query` and `count`, model
+reads and queries, include legs and change notices. Local filters, sorts and
+aggregates read it as unset, a value the device's copy kept from before the
+clear included; over several db3s, only on the rows of the db3s that clear
+it. A type entry stored by an earlier version asks the room for the type's
+declarations once on its next open.
+### Added: `client.db3.permissions(_:).setPublicAccess(_:)` marks a db3 public (beta)
+
+An app owner or admin calls `setPublicAccess(.reader)` to let server functions
+serve the db3 to callers who are not signed in, and `setPublicAccess(nil)` to
+clear it. It answers `Db3PublicAccessChange` (`id`, `level`, `changed`,
+`signedOutAccess`); `signedOutAccess` reports whether the app's setting is on,
+which public access needs to take effect. A member, the db3's owner included,
+is refused 403. `Db3Info` gains the optional `publicAccess`,
+`publicAccessUpdatedBy` and `publicAccessUpdatedAt`, which `client.db3.get(_:)`
+answers to a caller who manages the db3's sharing while it is public.
+
+### Added: empty a db3 model in one call (experimental)
+
+`client.db3.clearModel(_:model:drop:)` removes every record of a model in one
+operation: the server writes one log entry, not one per record, and every
+device holding the db3 removes the model's rows from that one entry. With
+`drop: true` the model itself goes too (an untyped db3 only). On a db3 this
+client has open and syncing, the call returns once this device has applied
+the clear; if that has not happened 10 seconds after the server answered, it
+throws `Db3ClearError.clearApplyPending` carrying the server's answer (the
+server did clear the model: do not retry). A record another device created
+offline before it applied the clear is discarded when it syncs. The client now
+declares wire version 5, and the local store keeps the highest clear it
+applied (storage version 11); a store opened by an earlier build is brought
+forward at open.
+### Added: the code of a create of an archived db3 type
+
+`JsBaoErrorCode` gains `.db3TypeArchived` (`DB3_TYPE_ARCHIVED`). An app
+archives a db3 type with `archived = true` in its `db3-types/<name>.toml` (or
+`primitive db3-types archive <name>`); the type then takes no new db3s, and
+existing db3s of it keep working. A local-first `db3.create(title:type:)`
+returns at once and the refusal arrives as `Db3CreateFailedEvent` with
+`code` `DB3_TYPE_ARCHIVED`, the db3's `id` and the `type`; a sync-off or
+custodian-naming create, `getOrCreateWithAlias` whose alias names nothing,
+and `setType` on an untyped db3 throw `HttpError` with that `serverCode`. An
+exhaustive `switch` over `JsBaoErrorCode` needs a branch for it.
+### Deprecated: `client.resourceMetadata`
+
+`client.resourceMetadata` and every `ResourceMetadataAPI` method (`get`,
+`set`, `getBatch`, `list`, `resolve`, `delete`) are deprecated, and stay
+experimental. Keep per-user data in user properties, and group or collection
+data in a db3 keyed by the group or collection id. Every call keeps working.
+
+### Added: the codes of a db3 type change that would drop stored data
+
+`JsBaoErrorCode` gains `.db3TypeNotAppendOnly` (`DB3_TYPE_NOT_APPEND_ONLY`)
+and `.db3TypeFieldRemovalNotEnabled` (`DB3_TYPE_FIELD_REMOVAL_NOT_ENABLED`):
+a type write to a type at least one db3 is of is refused with the first when
+it would make stored records unreadable, `details["reasons"]` listing each
+change, and with the second when it asks for `allowFieldRemoval` on an app
+whose stored settings do not enable it. An exhaustive `switch` over
+`JsBaoErrorCode` needs a branch for each.
+### Added: a db3 field's enum can be enforced
+
+A db3 type field with `enforce_enum = true` beside its `enum` refuses any
+write whose value is outside the set. A save, and a model-free
+`client.db3.records(_:)` put or patch, on a synced db3 of that type throws
+`JsBaoError` with the new code `.db3ValueNotInEnum`
+(`details["scope"] == "local"`) before anything commits, in the server's own
+words (a value is a member only when its code units match one, as on the
+server: a canonically equivalent spelling is not), and a write the server
+refuses is handed back under the same code.
+`TomlSchemaLoader` and `swift-bao-codegen` take `enforce_enum = true` or
+`false` and refuse any other value; `TomlSchemaLoader` in strict mode now also
+takes `enum`, as the codegen does. Generated models are unchanged. The client
+now declares wire version 4; a server at version 3 still serves it.
+
+`JsBaoErrorCode`, `TomlSchemaLoaderError` (`.invalidEnforceEnum`) and the
+codegen's error type each gain a case: an exhaustive `switch` over one needs a
+branch for it.
+### Added: `client.db3.update(_:title:)` renames a db3 (beta)
+
+`client.db3.update(db3Id, title:)` sets a db3's title and answers the db3 as
+`client.db3.get` does. Its owner, a `read-write` grant or link, and an app
+owner or admin may rename it; anyone else gets `HttpError` 403
+`DOC_ACCESS_DENIED`. A db3 that lives only on the device is renamed there with
+nothing sent. `Db3StoredEntry` now carries `title`, the title the device last
+heard, or `nil`. Use it in place of the deprecated
+`client.documents.update(documentId:data:)` with a title.
+
+### Changed behaviour: a read-only write refused on the device throws `.writeAccessDenied`
+
+A commit to a db3 the user may only read, through a model or
+`db3.records(_:)`, now throws `JsBaoError` with code `.writeAccessDenied`
+(`WRITE_ACCESS_DENIED`), the code the server's refusal of the same write
+carries. It threw `.accessDenied` before: an app matching `.accessDenied` on a
+save must match `.writeAccessDenied`. Nothing is committed, and no
+write-refused event fires for it.
+
+### Fixed: a member granted again right after losing access stays subscribed
+
+A readable level heard for a db3 while the client's open of it was unanswered
+outlives the database's refusal of that open: the subscription stays out of
+`.gone`, a pending `ready()` keeps waiting, and the client asks the database
+again (at once, then once more about a second later). A `deleted` frame heard
+after the grant still wins.
+### Breaking: the production branch has no experimental members
+
+The `main` branch of the mirror compiles without `client.notifications`,
+`client.resourceMetadata` and `ruleSets.debug(data:)`: they sit behind the
+`PRIMITIVE_EXPERIMENTAL_APIS` compile condition, which that branch's manifest
+turns off, and so do every `NotificationsAPI` and `ResourceMetadataAPI` method,
+push-device registration included. The two types themselves, the payload types
+and the `.notification` event stay. Production does not serve those
+routes. An app that uses them works only outside production: depend on
+`branch: "alpha"`, which keeps them.
+
+### Changed: generated models type their upsert names
+
+A generated model whose schema declares a unique field or constraint gets the
+nested `UniqueField` and `UniqueConstraint` enums and the `save(in:upsertOn:)`
+and `upsertByUnique` overloads that take them, as in `upsertOn: .email`. The
+`String` forms stay.
+
+`UniqueField` and `UniqueConstraint` are now reserved field names, because a
+field with either name makes the struct's uses of it ambiguous: the codegen
+plugin refuses such a schema with `Field '<name>' is reserved (<reason>)`.
+Rename the field and regenerate.
+
+### Changed: Swift markings now match the JS client
+
+- `ruleSets` and every `RuleSetsAPI` method are deprecated, as in JS: rule sets
+  are app configuration, authored in `rule-sets/<name>.toml` and applied with
+  `primitive config push`.
+- `databaseTypeConfigs` is deprecated with the databases family.
+- `AgentSessionView` and `AgentSessionList` properties are marked beta, like
+  their methods. `createDocument` and `commitOfflineCreate` are marked beta.
+
+Nothing changes at run time; uses of the newly deprecated members now warn.
+### Changed: the bundled SQLite compiles without its 190 C warnings
+
+A clean build of an app on the client no longer prints
+`-Wambiguous-macro`, `-Wshorten-64-to-32` or `-Wlogical-op-parentheses`
+warnings from `Vendor/JsBaoSQLite`. The modules conflict behind the first is
+removed (the target compiles with `-fno-modules`); the other two are
+suppressed for that target only. Warnings from Swift code, yours and the
+client's, are reported as before. Nothing to change in your app.
+
+### Changed: push tokens are experimental with the rest of notifications
+
+`notifications.registerDevice(params:)`, `listDevices()` and
+`unregisterDevice(token:)` call `me/push-tokens`, which is now labelled
+experimental with the notifications family instead of production under `me`,
+so their `- Stability:` lines say experimental. Experimental routes are not
+served in production, so these calls answer 404 there, as the rest of
+`notifications` already did.
+
+### Changed: db3 members are beta and documents members are deprecated
+
+Every db3 member now says `- Stability: beta`, including the fields of the
+index, subscription and stored-entry types (`Db3Index`, `Db3LocalIndex`,
+`Db3Subscription`, `Db3StoredEntry` and the rest), `Db3BlobContext.db3Id`,
+`Db3PermissionsAPI.db3Id` and both `db3.listMine` overloads. They read as
+production before because they carried no marking. Every documents member is
+deprecated with the documents family: `client.documents`,
+`DocumentsAPI.aliases`, `ingests` and `uploadConcurrency`,
+`DocumentContext.documentId` and `doc`, and the fields of
+`DocumentSchemaAnswer`. Nothing changes at run time; uses of the newly
+deprecated members now warn. Build on db3 (`client.db3`).
+
+### Added: revoke one pending invitation on its resource
+
+`documents.revokePendingInvitation(documentId:invitationId:)` (deprecated with
+the documents family), `db3.permissions(_:).revokePendingInvitation(_:)`
+(beta), `groups.revokePendingInvitation(groupId:invitationId:)` and
+`collections.revokePendingInvitation(collectionId:invitationId:)` cancel a
+share made by email before the invitee signed up, keyed by the `invitationId`
+each resource's `listPendingInvitations` returns, and answer a
+`PendingInvitationRevokeResult`. The invitation and its grants on other
+resources stay. `invitations.listDeferredGrants` and `revokeDeferredGrant` are
+deprecated: the deferred-grants routes they call are.
+
+### Changed: sign-in settings are read from `GET settings/sign-in`
+
+`auth.getAuthConfig()`, `auth.getAppConfig()`, `checkOAuthAvailable()` and
+`signInWithGoogle` / `startOAuthFlow` now read the app's sign-in settings
+from the public `GET /app/{appId}/api/settings/sign-in`, which answers the
+same body as the deprecated `GET oauth-config`. Signatures and results are
+unchanged, and the read still skips the token refresh. This client needs a
+server that serves the route: against one that does not, `getAuthConfig()`
+throws `HttpError` 404 and `checkOAuthAvailable()` answers `false`.
+
+### Added: `client.db3.aliases`; `documents.aliases` deprecated
+
+`client.db3.aliases.set(_:)`, `resolve(_:)` and `delete(_:)` (beta) bind a
+user's key to a db3, read the db3's row back as a `Db3AliasResolution` (`nil`
+when the key names nothing) and remove the key. `set` on a db3 that lives only
+on this device throws `.db3LocalOnly` before any request; a document that is
+not a db3 is refused `HttpError` 409 `NOT_A_DB3`.
+`DocumentAliasesAPI.set(_:)`, `resolve(_:)` and `delete(_:)` are deprecated in
+their favour, and keep working.
+
+### Every public method states its stability; the documents family is deprecated
+
+Each public method and sub-API accessor now ends its doc comment with
+`- Stability: production`, `beta` or `experimental`, so Quick Help shows how
+settled it is. `beta` members (`client.db3`, `client.agents`, channel
+subscriptions) may still change shape. `experimental` members
+(`client.notifications`' inbox, `client.resourceMetadata`,
+`client.ruleSets.debug`) are the ones a later release leaves out of production
+builds.
+
+These members are now deprecated, with db3 (`client.db3`) as the successor:
+
+- every method of `client.documents`, its blob, ingest and context types
+  (`DocumentBlobContext`, `DocumentIngestsAPI`, `DocumentContext`) and
+  `client.documents.aliases.listForDocument(documentId:)`;
+- every method of `client.databaseTypeConfigs`;
+- `client.collections.listCollectionsForDocument(documentId:options:)`, and
+  `client.collections.listAll(limit:cursor:)`, which has no successor;
+- the document-protocol members of `JsBaoClient`: `checkStateVector`,
+  `waitForInSync`, `waitForWriteConfirmation`, `setAwareness` and
+  `removeAwareness`.
+
+Calling one produces a compiler warning naming the successor. Nothing is
+removed and nothing behaves differently: every deprecated method keeps working
+until a later removal release.
+
+Three db3 members (beta) answer what their documents counterparts answer, so
+replacing the call is the whole migration:
+
+- `client.db3.records(_:)` returns the same `DocumentRecords` handle as
+  `client.documents.records(_:)`;
+- `client.db3.schema(_:)` returns the same `DocumentSchemaAnswer` as
+  `client.documents.schema(_:)`;
+- `client.db3.validateAccess(_:userId:)` returns the same
+  `DocumentAccessResult` as `client.documents.validateAccess(documentId:userId:)`.
+
+```swift
+let records = client.db3.records(db3Id)
+try records.put("Note", ["title": "Groceries"])
+let schema = try await client.db3.schema(db3Id)
+let access = try await client.db3.validateAccess(db3Id, userId: memberId)
+```
+### Added: shared enums in db3 type fields
+
+`swift-bao-codegen` reads the `schemas/` directory beside the `db3-types/` it
+is given, and expands a field's `ref = "<Name>"` (or `"<file>.<Name>"`,
+`"schemas.<file>.<Name>"`) to the `enum` of the string enum def it names, so
+the generated struct matches the type `config push` stores. A ref that names no
+plain string enum fails codegen naming the file, model, field and ref.
+
+### Changed: `.connected` means user events reach the client
+
+The client now reports `.connected` (`StatusChangedEvent`, `isConnected`,
+`connect()` returning) when the server's new `ready` frame arrives, not when
+the socket opens: from then on the server delivers the user's events
+(notifications, document metadata, agent sessions, access requests) to this
+client, so an app that lists on `.connected` and applies the events misses
+none. The work the client does on connect (re-subscribing channels and open
+documents) starts then. A socket that opens and hears no `ready` within
+`SyncConfig.handshakeTimeout` is closed and retried, and a token for another
+user applied while the socket waits for `ready` rebuilds the connection as
+that user. The client needs a server that sends `ready`.
+
+### User properties on `me` and `users`
+
+`UserProfile`, `BasicUserInfo`, `BatchUserProfile` and `UserLookupSummary`
+gain `properties: [String: JSONValue]`: the user's properties the app's
+`user-properties.toml` lets a client read, with the schema's defaults
+applied. On another user that is the fields whose `client` is `members` or
+`self-write-members`; on the caller's own row also `self` and `self-write`.
+An app with no schema answers `[:]`, and an answer cached before this release
+decodes to `[:]`.
+
+`UpdateMeParams(properties: ["theme": .string("dark"), "nickname": .null])`
+sets the caller's own `self-write` and `self-write-members` fields through
+`me.update(params:)` as a merge patch: `.null` clears a field so its default
+shows again, and a stringset is replaced whole. Naming any other field throws
+`HttpError` with status 403 and `serverCode`
+`USER_PROPERTY_NOT_CLIENT_WRITABLE`, and nothing in the update is written.
+`BasicUserInfo(...)`, `BatchUserProfile(...)` and `UpdateMeParams(...)` keep
+their existing initializers; `properties` is a trailing parameter with a
+default.
+### Added: access-request events
+
+The client now emits the server's access-request frames as typed events:
+`Db3AccessRequestCreatedEvent` and `Db3AccessRequestResolvedEvent` for a db3,
+and `DocumentAccessRequestCreatedEvent` and
+`DocumentAccessRequestResolvedEvent` for any document (a db3 sends both
+pairs), under four new `JsBaoEvent` cases named like the JS events
+(`.db3AccessRequestCreated` is `"db3:access-request-created"`, and so on).
+Owners hear `created`; the requester and every owner hear `resolved`, whoever
+resolved it. A frame missing a required field is dropped with a warning.
+Nothing is replayed after a reconnect, so list the requests on each
+`StatusChangedEvent` with `.connected` and apply the events from there.
+`AccessRequestDocumentSummary` is now `Equatable`.
+
+### What a device skipped, and a read explained on the device
+
+`client.db3.indexes.skipped(_:)` lists the entries of a db3's index list this
+device's copy built nothing for, as a new `[Db3SkippedIndex]` (`name`,
+`model`, `fields`, `kind`, `on`, `reason`): an index placed on the server
+only, and one the device can't build (an index on `id`, which the primary key
+serves, a name that isn't an identifier, a member or vector index over more
+than one field, text options it can't read). It reads the device's copy, so
+it answers offline and sends nothing. `local(_:)`, `Db3LocalIndex` and
+`Db3LocalIndexStatus` are unchanged: a `switch` over its four cases still
+compiles.
+
+`client.documents.records(id).explain(_:_:)` explains a read of the device's
+copy in the shape the server's explain answers (`Db3Explain`, with
+`Db3ExplainedStatement`s and `Db3ExplainCost`): the indexes it used by their
+names in the db3's index list, the models it scanned, each statement's plan,
+and `answered`; `cost` is `nil` on a device. `Db3ExplainRequest(op:filter:
+options:include:aggregate:index:setFields:)` describes the read; `index`
+forces it through a field or member index, or `"none"`. A force that can't
+serve the read throws the new `JsBaoErrorCode.db3IndexCannotServe` with
+`details["reason"]`; an unknown name `.db3IndexNotFound`.
+
+The store moves to storage version 10 (a table of skipped entries); a store
+of an earlier build gains it when it is next opened, and nothing is
+downloaded again.
+### Changed: `ttl: 0` is refused
+
+`client.db3.setRetentionPolicy(_:)` throws `JsBaoError` `.invalidArgument`
+when the policy's `ttl` is `0`, a negative or not finite, and the policy stays
+as it was. Assigning such a policy to `client.retentionPolicy` is refused the
+same way: the policy is unchanged, no enforcement runs, and one error line is
+logged. `0` used to evict every db3 copy and local document with a recorded
+last use, while the web client read it as no TTL. Pass `nil` for no TTL; any
+positive `ttl`, a fraction of a second included, is accepted as before.
+
+### Breaking: `maxDocs: 0` is refused, and `client.db3.setRetentionPolicy` throws
+
+`client.db3.setRetentionPolicy(_:)` is now `throws`; add `try` at each call. It throws `JsBaoError` `.invalidArgument` when `maxDocs` is `0`
+or a negative, and the policy stays as it was. Assigning such a policy to
+`client.retentionPolicy` is refused the same way: the policy is unchanged,
+no enforcement runs, and one error line is logged. `0` used to evict every
+copy and every local document the policy may remove, while the web client
+read it as no cap. Pass `nil` for no cap.
+### Vector search on the device — `$near`, with one shared approximate model per database
+
+A db3 `vector` index now builds on the device, and `$near` answers the `k`
+records nearest a query vector there, nearest first, each raw row carrying
+its exact `_distance` (`client.codegen.query`/`queryPaged`, `PrimitiveRow.raw`,
+the model-free records); `count` and `aggregate` keep a `$near`'s rows. It
+answers exactly from the first record. An index registered with
+`Db3VectorIndexOptions(index: .ann())` answers from an approximate index once
+the device has the database's model and has filled the index, reranked on
+the full vectors, and exactly until then; no query waits. One device that
+holds at least 1,000 records trains the model in the background and uploads
+it, and every other device — Swift or JavaScript — fetches and uses it. A db3
+that lives only on this device registers `kind: .vector` on a field its model
+declares a vector, and trains and keeps its own model.
+
+New and changed:
+
+- `Db3IndexesAPI.fetchModel(_:name:)` (answers `Db3IndexModel`),
+  `uploadModel(_:name:bytes:upload:)` (takes `Db3IndexModelUpload`, answers
+  the `Db3Index`) and `deleteModel(_:name:)` (answers
+  `Db3IndexModelDeletion`, the index's new revision); a db3 that lives only
+  on this device refuses all three `.db3LocalOnly`. After an upload or a
+  delete, a db3 this client holds open reads its index list again before
+  the call returns, as `register` and `drop` do.
+- `Db3Index` gains `vector` (`Db3VectorIndex`: `distance`, `index`, `dims`,
+  `element`), `generation`, `revision` and `annModel` (`Db3IndexAnnModel`:
+  `revision`, `trainedAt`, `rows`, `bytes`, `format`); each is `nil` for
+  other kinds.
+- `Db3LocalIndex` gains `mode` (`Db3LocalIndexMode`: `.exact` or `.ann`) for
+  a vector index; its initializer's new `mode:` parameter is defaulted.
+- `Db3VectorIndexOptions.Distance`, `.Quantizer` and `.Mode` are `Codable`.
+- `JsBaoErrorCode` gains `.db3IndexModelExists`, `.db3IndexGenerationStale`,
+  `.db3IndexModelStale`, `.db3IndexModelNotFound`, `.db3IndexModelTooLarge`
+  and `.db3IndexModelInvalid`, the codes of the model routes' refusals.
+- `Format2SqlValue` gains `.blob(Data)`: a `switch` over it that has no
+  `default` needs a case for it.
+- The bundled SQLite (`JsBaoSQLite`) includes the read-only `dbstat` virtual
+  table, for measuring what a store file holds.
+- The device store moves to storage version 9, adding the column that names
+  a vector index's table; a store from version 8 converts at its first open.
+### Batches of records: `client.db3.batch` and `client.db3.batchRead`
+
+`client.db3.batch(db3Id, operations, options:)` applies creates, patches,
+deletes, upserts and increments across models in one request, with reads
+among them (`.query`, `.count`, `.aggregate`): in order, in one transaction,
+at most 100 operations, each read answered in the result's `reads` against
+the writes before it. `client.db3.batchRead(db3Id, reads, atomic:)` answers
+several reads from one state of the db3 and needs read access only. Each
+read result decodes its answer as `.query` (with its next and previous
+cursors), `.count`, `.aggregate`, or, with `atomic: false`,
+`.refused(code:status:error:)`. A batch's increments answer each field's
+value after it, in `incremented` and in each applied increment's `values`;
+what the db3's hook rules wrote rides in `appliedFields` on each created,
+changed and upserted record and on each applied write's result. Both wait for a pending create of the db3, as the other `client.db3` calls
+do.
+### Fixed: offline, a db3's copy no longer takes other writers' changes (#5447)
+
+Once `setNetworkMode(.offline)` returns, changes other writers make to an open
+db3 no longer reach the device's copy until the client is online again, as in
+the JavaScript client. They apply in order when networking returns. A write
+made offline starts from the copy as it was when the client went offline: an
+offline replace of a string set keeps a member another writer added
+meanwhile.
+
+### A database download writes each chunk in a few statements
+
+A db3 download writes each chunk into the device's copy in a few SQL
+statements instead of three per row: a 40,000-row chunk takes under half
+the time it did. The copy that results is the same row for row; nothing is
+downloaded again and the device storage is unchanged.
+
+### A device's indexes — live index lists, failed builds and `deviceIndexes`
+
+An index registered or dropped on a db3 reaches every device holding it open
+within moments, without a resubscribe. A device that cannot build an index
+(its storage is full, say) keeps syncing: the index stays unbuilt, queries it
+would speed up scan, and each later sync retries. New
+`client.db3.indexes.local(_:)` lists the indexes placed on devices as
+`Db3LocalIndex` values with their `Db3LocalIndexStatus` here (`.built`,
+`.building`, `.unbuilt`, `.declined`, with a `reason`), and `Db3State.indexes`
+carries the same list. `client.db3.indexes.decline(_:name:)` drops one from
+this device's copy and keeps it declined across restarts, evicts and
+re-registration until `accept(_:name:)` or `client.db3.delete`; nothing is
+sent. A device `$search` needing a declined text index throws
+`JsBaoErrorCode.db3IndexDeclinedOnDevice` with `details` `model`, `index` and
+`kind`. The new `JsBaoClientOptions.deviceIndexes` (`.all`, the default,
+`.none`, or `.kinds([...])`) says which indexes a device builds when it has
+not already. Opening a store from an earlier build adds the device's index
+list in place; nothing is downloaded again.
+### An interrupted database download continues where it stopped
+
+A db3's download that is cut short — the app quitting, a dropped connection —
+continues at the next subscribe from the chunks already on the device. The
+database offers that same download again while it still keeps it, even when
+other imports landed meanwhile or many rows changed since; once it no longer
+does, the device syncs as before. `state.progress` starts at the chunks already downloaded. Two
+clients over one store never download it at once: the later one continues the
+download and the earlier one waits for it.
+
+### Show a db3 blob as an image: `BlobImage` and `downloadRequest`
+
+A new product, `JsBaoClientUI`, holds the client's SwiftUI views. Its
+`BlobImage` shows a db3 blob as `AsyncImage` shows a URL:
+`BlobImage(client.db3.blobs(db3Id), blobId:)`, the
+`content:placeholder:` form, or `content:` over `BlobImagePhase`. It loads
+through `blobs.read(blobId:)`, so it carries the user's auth, shows the
+local copy without a request, and fails `JsBaoError` `.offline` while the
+client is offline with no local copy. Add
+`.product(name: "JsBaoClientUI", package: "JsBaoClient")` to the target and
+`import JsBaoClientUI`.
+
+`Db3BlobContext.downloadRequest(blobId:disposition:attachmentFilename:)`
+answers a `URLRequest` for the blob's download URL carrying
+`Authorization: Bearer` with the token in force, for an image library
+(Kingfisher, Nuke) to send. `downloadUrl` itself carries no credentials: an
+`AsyncImage` of it is refused `401`.
+
+### Fixed: a `wipeLocal` logout no longer deletes other users' document content (#5366)
+
+`logout(wipeLocal: true)` deleted the local content of every document on the
+device, whoever stored it. After user B's wipe, user A's pending create was
+still listed but empty, so content A never synced was lost, and documents A
+had synced were downloaded again. The wipe now removes the signed-out user's
+content only:
+
+- A document another user on the device has stored keeps its content, so that
+  user reopens their pending creates and synced documents as they left them.
+- Everything else goes: the content of every document only the signed-out
+  user stored, and content no user's local metadata lists.
+- If the client cannot read which documents the other users stored, the wipe
+  removes no document content rather than guess.
+
+### Fixed: one user's local document metadata no longer loads for another user on the same device (#4829)
+
+The client keeps one SQLite file per app, and every user who signed in on a
+device shared its document metadata rows. After user A signed out with a
+pending create, user B's `documents.listPendingCreates()` listed it,
+`getPendingCreate` answered for it, and the client retried its commit under
+B's token. Local metadata is now kept per app and per user:
+
+- A signed-in user's `listPendingCreates()`, `getPendingCreate(documentId:)`,
+  `isPendingCreate` and `getLocalMetadata` answer from that user's rows only,
+  and another user's pending creates are never retried or committed under
+  them. A user who signs back in, in the same process or after a relaunch,
+  finds their own rows again.
+- Rows written by an earlier build carry no owner, so no user loads them:
+  pending creates still uncommitted when the app updates are no longer
+  listed. They stay on disk until a `logout(wipeLocal: true)` clears them.
+- `logout(wipeLocal: true)` clears the signed-out user's metadata, the rows
+  from an earlier build and the signed-out user's local document content.
+  Other users' metadata stays.
+- A `documents.create` made while the client is still starting up, before the
+  signed-in user is bound, is stored under that user once the bind finishes.
+### Vector fields
+
+A db3 model field can be `.vector` with `dims` and `element` (`VectorElement`:
+`.f32`, `.f16`, `.i8`): `FieldDescriptor(type: .vector, dims: 768, element:
+.f16)`, or `type = "vector"` with `dims` and `element` in a db3 type file,
+which `TomlSchemaLoader` and `swift-bao-codegen` read (generated models type
+it `[Float]`). A save writes `PrimitiveValue.vector([Float])` as the standard
+base64 of the field's encoding — the db3 type's when the room sent it — and
+reads answer it decoded: an array of numbers in a row
+(`JSONValue.floatArrayValue`), `.vector` from a record. `VectorCodec`
+(`encode(_:encoding:)`, `decode(_:encoding:)`, `bytes(_:)`) converts, byte
+for byte as the JS client and the functions SDK do. The model-free records
+take `DocumentRecordValue.vector([Float])` for a field the type or a
+registered model declares a vector. A value that does not fit is refused
+before anything commits with `JsBaoErrorCode.db3VectorInvalid`
+(`DB3_VECTOR_INVALID`); a model declaring a vector field saves only to a db3
+(`.invalidArgument` on a format-1 document). `Db3IndexRegistration(model:
+field: kind: .vector, vector: Db3VectorIndexOptions(...))` registers a vector
+index. `$near` in a device read is refused `.queryIndexNotOnDevice`, and the
+server's records routes answer it `QUERY_INDEX_NOT_ON_SERVER`
+(`.queryIndexNotOnServer`).
+
+**Source-breaking:** `PrimitiveFieldType` gains `.vector` and `PrimitiveValue`
+gains `.vector([Float])`; an exhaustive `switch` over either needs the new
+case.
+### How far behind a device's copy is, and `maxDrift`
+
+A device page's `PagedQueryResult` carries `drift`: by db3 id, a `Db3Drift`
+of `entriesBehind` (changes the server had that the copy hadn't applied, as
+of `asOf`, when the device last heard the server's position), `live` and
+`pendingWrites`. `Db3State.drift` reports the same, kept on the device so it
+survives going offline and a relaunch. `QueryOptions.maxDrift`
+(`Db3MaxDrift(entries:age:)`, `age` in seconds) on model queries and counts
+(generated models' and `DynamicModel`'s `count` take a trailing `options:`),
+and `documents.records(id).query` and `count(_:_:maxDrift:)`, refuses a copy
+further behind with `JsBaoErrorCode.db3DriftExceeded` (`details` carry
+`db3Id`, `drift` and `maxDrift`); it never waits. A synced db3 that has not
+heard the server's position yet has no `drift` and refuses every `maxDrift`;
+a local-only db3 has none and passes every one. Generated models' paged
+queries and `hasManyThrough` pages forward `drift`, and their `count`
+forwards its options; regenerate them. Each new
+member is added with a default, so existing code compiles unchanged.
+### The bundled SQLite is 3.54.1, with vec1
+
+The client's own SQLite moves from 3.53.4 to 3.54.1, the release the JS
+client's sqlite-wasm carries, and now includes SQLite's vec1 extension (0.8),
+set up on every connection the library opens. The compiled SQLite library
+grows by about 0.57 MB. Store files written by the earlier build open as they
+are, and nothing in the client's API changes.
+
+### Text search and member indexes on the device
+
+A db3's copy on this device builds the text indexes the room places on the
+device (`kind: .text`, `on: .device`), and the member indexes placed `.device`
+or `.both`, and keeps them on every write. `$search` in a query filter finds
+records by their words: a string, or `["query": …, "mode": "all" | "any",
+"prefix": true, "fields": […]]`, with double-quoted phrases. Results come best
+first; each raw row (`client.codegen.query`, `PrimitiveRow.raw`) carries its
+`_score`, and `sort` may name `_score`. Register one with
+`Db3IndexRegistration(model:fields:kind: .text, on: .device, text:
+Db3TextIndexOptions(tokenizer:prefix:weights:))`; `Db3Index.text` lists its
+options (`Db3TextIndex`). A local-only db3 takes a text index too. A `$search`
+on a model with no text index on the device is refused
+`JsBaoErrorCode.queryIndexNotOnDevice`; `.queryIndexNotOnServer` names the
+server's refusal. The bundled SQLite now includes FTS5, which adds about
+0.8 MB to the compiled SQLite library. Opening a store from an earlier build converts its
+index cache in place at the first open; nothing is downloaded again. The device
+keeps a text index in the same form as the JS client and the server, so a
+`$search` ranks the same wherever it answers, with the same `_score`, after
+any creates, patches and deletes; a store from an earlier unreleased build
+rebuilds its text tables once, from the rows it holds, at its next index sync.
+
+### An index's kind and where it lives
+
+`Db3IndexRegistration` takes optional trailing `kind:` and `on:`
+parameters: `.both` (the default) builds the index on the server and on
+every device holding a synced copy, `.server` on the server only, and
+`.device` on the devices only. `Db3Index` lists its `kind` (`Db3IndexKind`:
+`.scalar`, or `.members` for a member index) and its `on`
+(`Db3IndexPlacement`). A member index lives on the server, and a local-only
+db3 keeps every index on the device. To move an index, drop it and register
+it again: the same fields registered with another `on` are refused
+`DB3_INDEX_EXISTS`, with `details.on`. A `unique` index on the device alone
+is refused `DB3_INDEX_INVALID`, a kind and placement no side builds
+`DB3_INDEX_PLACEMENT_UNSUPPORTED` (`JsBaoErrorCode.db3IndexPlacementUnsupported`),
+and `.server` or `.both` on a local-only db3 `DB3_LOCAL_ONLY`. A
+registration without `on` works as before.
+### An untyped db3 is declared only the models it uses
+
+A db3 without a type takes its indexes and unique constraints from the
+model declarations of the clients that write it. The client now declares to
+such a db3 only the models it uses there, instead of every registered model:
+
+- the models whose records the device's copy holds, or whose writes are
+  still unconfirmed;
+- a model written there for the first time, declared just before that write,
+  so its unique constraint holds from the first record;
+- the models bound to it with the new `client.setModelDefaultDb3(model, id)`,
+  and, when it is the client's default db3 (`client.setDefaultDb3(id)`),
+  every model bound to no db3.
+
+A model used only in other db3s, `client.registerModels` additions included,
+no longer reaches this db3's declaration or its schema. An empty db3 with
+nothing bound declares no model at open. To have a model's indexes and unique
+constraints in force before its first record, bind it with
+`setModelDefaultDb3` before you subscribe.
+
+- `client.setModelDefaultDb3(_:_:)` records the binding without checking the
+  db3: it need not be open, bound or held on this device.
+  `getDocumentModelMapping(modelName:)` reads it back and
+  `clearDocumentModelMapping(modelName:)` removes it. No save reads it; every
+  save still names its db3.
+- A model bound while its db3 is open is declared at the db3's next open (or
+  at its first write); a bound model registered while the db3 is open is
+  declared at once.
+
+### Local-only databases
+
+`client.db3.create(title:localOnly: true)` keeps a db3 on this device only:
+nothing of it is ever sent to the server, in this session or a later one. It
+returns at once with `localOnly == true` and `sync == false`, and
+`Db3CreatedEvent` fires once.
+
+- Saves, queries, aggregates, upserts, increments, conditions,
+  `confirm: true`, live updates and `client.db3.indexes` work on it as on a
+  synced db3. Each write is judged on the device with the codes the server
+  uses (`.documentConstraintViolated` with the conflicting record,
+  `.db3ConditionNotMet` with `current`, `.db3RecordNotFound`) and accepted at
+  once, so `pendingWrites` stays 0. A subscription is `live` at once. It
+  survives restarts for the same user; another user signing in on the device
+  does not see it.
+- `Db3Info`, `Db3State` and `Db3StoredEntry` gain `localOnly`.
+- `client.db3.delete(_:)` removes it with nothing sent, and
+  `logout(wipeLocal: true)` removes it with everything else.
+  `client.db3.evict(_:)` and `client.documents.evict(documentId:)` throw
+  `.db3LocalOnly`; `client.evictLocalDocument(_:)`, `evictAllLocal()`,
+  `documents.evictAll()` and the retention policy keep it, and it counts
+  toward no `maxDocs` cap.
+- Every call that would ask the server about it — the `client.db3` server
+  calls, `blobs(_:)`, `ingests`, and the `client.documents` calls naming it —
+  throws the new `.db3LocalOnly` before any request. `create` refuses
+  `localOnly` with `type`, `sync: false` or `custodian`
+  (`.localOnlyUnsupportedOption`). The `.db3Index…` codes join
+  `JsBaoErrorCode` for its device-side index refusals.
+- The local store moves to storage version 5 at its next open: each db3's
+  state gains the local-only mark, and every db3 already stored reads synced.
+
+### A member index for a db3's string set field
+
+`client.db3.indexes.register(db3Id, Db3IndexRegistration(model:field:members: true))`
+registers a member index on a string set field, named
+`idx_members_<model>_<field>`. The db3 then answers `$contains`, any-of,
+membership groups and unfiltered facets on the field from the index, so a
+selective `$contains` on a large db3 answers in milliseconds, with the same
+results. It costs one stored row per member and a little time on each write
+that changes the set, and it is built from the existing records in the
+registration's one request (about 1,000,000 records). `Db3Index.members` is
+`true` on it and `false` on every other index. `members: true` on a field
+holding single values is refused `.db3IndexNotSetField`. A synced db3's copy
+on a device builds nothing for a member index. A local-only db3 builds it on
+the device, by the same rules and names, keeps it on every write and across
+restarts, and answers the same reads from it.
+
+### The db3 copies on this device take less space
+
+The local store keeps each db3 record as SQLite JSONB without its `id`, which
+the record's key already holds: the harness's 100,000 IMDb rows take 86% of
+the pages they took before. The first open after the update converts the
+copies already on the device, one db3 at a time, and an interrupted conversion
+continues at the next open. Reads answer every row with its `id`, as before.
+
+`$startsWith`, `$endsWith` and `$containsText` on `id` and `type` now match on
+the record's key and model; on `type` they matched nothing before.
+
+A build from before this change reads a converted copy wrongly until this
+build opens it again.
+
+### A re-grant reopens a refused db3
+
+When the server grants this user a readable level again on a db3 the room
+refused (`.gone`, `DB3_ACCESS_REFUSED`), the client asks the room again at once
+for a db3 it holds open: a subscription that was `.live`, one whose `ready()`
+is still waiting, or a document door. The same `Db3Subscription` goes `.live`
+with the new permission, with no new `Db3GoneEvent`, and writes made afterwards
+land. A re-grant at the level the client had before the revocation counts too.
+Re-granted `reader`, saves are refused on the device from the moment `.live` is
+reported. A refused copy nothing holds open reports the grant's level from
+`client.db3.state(id)`, and its next `subscribe` asks the room. A grant heard
+while offline takes effect when networking returns.
+
+### A registered index reaches this device
+
+`client.db3.indexes.register` and `drop` on a db3 this client has subscribed
+now change the local copy before they return, so a query on the field right
+after uses the index. After a subscribe, `ready()` returns only once the copy
+holds the database's index list (including an index the room created for this
+open's model declarations); `available()` does not wait for it. A failed list
+read is retried on a backoff while connected, and again when the socket opens
+or networking returns; `ready()` stays bounded by its `readyTimeout`.
+
+### Fixed: a db3 already gone that is then deleted emits a second gone event
+
+A db3 gone for `.permission` or `.syncOff` that is then deleted emits
+`Db3GoneEvent(reason: .deleted)` (`DB3_DELETED`) once more, at the latest on
+the client's next subscribe; a waiting `ready()` throws `.db3Deleted`. A db3
+already gone for `.deleted` or `.clientOutdated` emits nothing more.
+
+### Fixed: `maxDocs` counts the db3 copies stored on this device
+
+- `client.db3.setRetentionPolicy(RetentionPolicy(maxDocs:))` keeps at most
+  `maxDocs` of the copies `client.db3.stored()` lists, subscribed ones
+  included, and evicts the least recently used first. A copy's last use is the
+  later of its last open and the end of its last subscription (a `dispose()`,
+  a logout, another user's sign-in, `destroy()`).
+- A db3 the client only knows of, with no copy here, and a format-1 document
+  no longer take a slot, so the policy no longer keeps too few copies, and
+  `Db3EvictedEvent` no longer fires for a db3 that had no copy here.
+- A subscribed copy, one held open, a pending create and one with unsent
+  writes are never evicted and still count, so the device may keep more than
+  `maxDocs`. `maxDocs: nil` is no cap; `0` evicts every copy the policy may.
+- `ttl` applies to the stored copies by their last use; `maxBytes` never
+  removes a db3 copy. Format-1 documents are evicted exactly as before.
+
+### A grant change on an open db3 reaches its state
+
+A permission heard for a bound db3 (`reader` ↔ `read-write`, with no write of
+this client's) now emits a `Db3StateEvent` with the new `permission`, and
+`client.db3.state(id)` answers it. The phase stays `.live`.
+
+### Added: `swift-bao-codegen` over every db3 type file
+
+`--input` repeats and takes a directory, so one run generates the models of
+every kind of db3 an app opens. A directory contributes each `*.toml` directly
+inside it, in name order:
+
+```bash
+swift-bao-codegen --input primitive/dev/db3-types --output Sources/App/Models
+```
+
+Every model gets one struct and `GeneratedModels.swift` registers them all.
+Each struct's header names the file that declared it; the barrel's names every
+input. A model two files declare must be declared the same way in both, or the
+run exits 1 naming both files and the fields that differ.
+
+`bao-codegen.json` takes the same list as `inputs`, files or directories
+resolved against the target directory, and the plugin generates them in one
+build command:
+
+```json
+{ "inputs": ["../../primitive/dev/db3-types"] }
+```
+
+A directory that holds no type file yet still gets an empty
+`GeneratedModels.swift`, so `GeneratedModels.all` compiles from the start.
+
+`{ "input": "<file>" }` works as before. A model in a db3 type file (a TOML
+document with a `[type]` table) needs no `id` field: it gets the `id` a
+declared `type = "id", auto_assign = true` gives, so the struct has `id`, the
+auto-id initializer mints one, and it compiles. A schema with no `[type]` table
+generates exactly as before.
+
+### `permission` on `client.db3.getOrCreateWithAlias`
+
+`Db3GetOrCreateWithAliasOptions` gains `permission: Db3AliasPermission?`
+(`.owner`, the default, `.readWrite` or `.reader`): the alias user's level on
+a db3 the call creates, with no owner row for a level other than `.owner`.
+An app owner or admin passes it to make a per-user db3 the user can only
+read; a member passing a level other than `.owner` gets `HttpError` 403.
+
+```swift
+let inbox = try await client.db3.getOrCreateWithAlias(
+    Db3GetOrCreateWithAliasOptions(
+        alias: AliasRef(scope: .user, aliasKey: "inbox", userId: memberId), title: "Inbox", permission: .reader
+    )
+)
+```
+
+A `.reader` db3 you create for yourself is read-only on this device at once:
+`Db3State.permission` is `.reader`, and a save throws `.accessDenied` before
+any subscribe, sending nothing. A db3 a create makes for another user, or one
+`create(title:custodian: "app")` makes, is no longer stored on the creating
+device (`stored()` does not list it); subscribe to it as any db3 you can read.
+
+The options' initializer gains a trailing defaulted `permission:` parameter.
+Every call compiles unchanged; a reference to the initializer as a function
+value (`Db3GetOrCreateWithAliasOptions.init(alias:title:tags:metadata:type:)`)
+must add `permission:` to its labels.
+
+### A db3 is `available` only once a query answers it
+
+Once `try await subscription.available()` returns, a model query scoped to
+the db3 answers its rows: after a relaunch, a sign-in and another account's
+session too, not only right after a create. `Db3State.resident` (and
+`Db3StoredEntry.resident`) is now `true` only for a store bound to this client
+with its models attached; a copy the device holds but has not bound yet reads
+`resident: false` until a subscribe or the start-up bind binds it. A held
+copy is a db3 even with no metadata row, so an offline subscribe over it
+binds it.
+
+A sign-out (`logout()`) or another user's sign-in (`updateToken(_:)`, then
+`rebindUserScopedStorage()`) now closes every open db3 of the previous user
+before anything opens for the next one: a subscribe made during the switch
+opens after it, under the new user, and its `ready()` settles. Nothing is
+sent for the previous user's db3s under the new user's token, and a db3 got
+by an existing alias reconnects with `record.open` from the start.
+
+A `DB3_DISPOSED` error now says why the subscription ended in
+`details["reason"]`, with the web client's strings: `disposed`, `destroyed`,
+`closed`, `evicted` or `identity-changed`.
+
+### `client.db3.listMine` lists held, shared and app db3s
+
+`listMine(_ options: Db3ListMineOptions = Db3ListMineOptions())` reads the
+db3s you hold, those shared with you and those granted to the app, in that
+order, one request per page, as the JS client does. Each `Db3Info` names its
+listing as `via` (`.held`, `.shared`, `.app`) and a shared row carries
+`grantedBy`. `Db3ListMineOptions(via:limit:cursor:)` reads only some listings;
+a cursor this call did not issue throws `.invalidArgument`. A db3 whose sync is
+off is not listed.
+
+```swift
+var page = try await client.db3.listMine()
+while page.hasMore {
+    page = try await client.db3.listMine(Db3ListMineOptions(cursor: page.nextCursor))
+}
+```
+
+- The bare `client.db3.listMine()` is now the full form. `listMine(options:)`
+  keeps its signature and its held-only answer for a server cursor, and
+  continues a cursor the full form issued, so an existing paging loop pages
+  through all three listings.
+- `Db3Info` gains `via` and `grantedBy` (`nil` from every other call), as
+  trailing defaulted parameters of its initializer.
+
+### `client.db3.subscribe` settles at once when the server refuses the db3
+
+A subscribe to a db3 this device has never held throws from `available()` and
+`ready()` within a few seconds when the server refuses it: `.db3AccessRefused`
+for no access (403), `.notFound` for no such db3 (404), and the `HttpError`
+for any other 4xx but 401 and 429. `Db3ErrorEvent` carries the code. Offline,
+a 5xx, 429 and 401 still retry as before.
+
+### Setting a generated model's field to `nil` clears it on a db3
+
+`model.closedAt = nil` followed by a save now stores null on a db3, as the web
+client's `undefined` does; a string set loses every member. A cleared
+required field is refused `requiredFieldMissing`, and a unique constraint
+over a cleared field no longer holds its old value. Saves into a format-1
+document are unchanged.
+
+### Added: a deleted db3 is gone for `.deleted`
+
+- `Db3GoneEvent.Reason` gains `.deleted` (code `DB3_DELETED`) and
+  `JsBaoErrorCode` gains `.db3Deleted`: a client subscribed to a db3 that is
+  deleted hears `Db3GoneEvent(reason: .deleted)` once, and `ready()` throws
+  `.db3Deleted`. A revoked grant still reports `.permission`. An exhaustive
+  `switch` over either enum needs the new case.
+
+### Agent session records gain `deletingAt` and `configId`
+
+An agent session's db3 is now at type generation 3, so a session can be
+rebuilt from it when the platform loses the session's own state. Two optional
+properties join the records the view reads, and nothing else changes:
+
+- `AgentSessionRecord.deletingAt` — set while a session's delete is under way.
+- `AgentSessionTurnRecord.configId` — the agent config the turn was pinned to.
+
+`AgentSessionModels.schemaVersion` is 3.
+
+### Changed: a db3 applies what the room allows on the device
+
+- A permission heard for a bound db3 (a `permission` frame, or a
+  `docMetadata` frame carrying one) applies before its `PermissionEvent`:
+  after `.reader`, `codegen.save` and `documents.records(id).put` throw
+  `.accessDenied` and commit nothing; after `.readWrite`, `.admin` or
+  `.owner`, saves land again with no resubscribe.
+- Once the device has opened a typed db3, a model save, increment or
+  `transact` that breaks the type's declarations throws before anything is
+  sent, with the room's code and message: `.documentEntryInvalid` for a value
+  its field's declared kind does not take (`""` for a `.date`),
+  `.db3ModelNotDeclared` for a model the type does not declare. Each is
+  reported as a `Db3WriteRefusedEvent` with `scope: "local"`.
+- The client sends no `record.declare` to a typed db3, so the room's
+  `DB3_DECLARATION_REFUSED_TYPED` and the error-level log line about it no
+  longer appear. A db3 created here with a `type` declares nothing on its
+  first open.
+
+### Breaking: an agent session is its own db3, and the view reads it
+
+- A session's conversation is a db3 whose id is the session's. `open(sessionId:)`
+  runs `get`, subscribes to that db3 and reads it by model name from its local
+  copy; it opens no document, registers no model and makes no `documents`
+  request. `close()` gives the view's subscription up and keeps the copy.
+- Removed: `AgentSessionInfo.documentId`, `AgentSessionListItem.documentId`
+  and `AgentSessionDeleteResult.documentId` (the delete answers
+  `{ deleted, sessionId }`), `client.agents.sessions.inspect`,
+  `AgentSessionInspectAPI`, `AgentSessionStorage`, `AgentSessionView.documentId`,
+  `OpenAgentSessionOptions.open`, `AgentSessionModels.schemas` and
+  `JsBaoErrorCode.agentSessionModelNameTaken`.
+- The format-1 models are gone: `PrimitiveSession`, `PrimitiveMessage`,
+  `PrimitivePart`, `PrimitiveStep`, their `Primitive*PartContent` types and
+  their vocabularies. The records of the session's seven models replace them:
+  `AgentSessionRecord`, `AgentSessionMemberRecord`, `AgentSessionTurnRecord`,
+  `AgentSessionMessageRecord`, `AgentSessionPartRecord` (its `content` by kind),
+  `AgentSessionToolCallRecord` and `AgentSessionStepRecord`, each with
+  `init?(row:)` and the row it was read from, and their open enums
+  (`AgentSessionStatus`, `AgentSessionTurnStatus`, `AgentSessionPartKind`,
+  `AgentSessionTextState`, `AgentSessionToolCallState`,
+  `AgentSessionAuthorKind`, `AgentSessionStepKind`, `AgentSessionStepStatus`;
+  a member's role is `AgentSessionRole`). `AgentSessionModels` keeps
+  `schemaVersion` (now 2) and adds `modelNames`.
+- Retyped: `AgentSessionInfo.status` and `AgentSessionListItem.status` are
+  `AgentSessionStatus`; `AgentCallAnswerResult.state` is
+  `AgentSessionToolCallState`; `view.session` is `AgentSessionRecord?` and
+  `view.status` `AgentSessionStatus?`; a synced message's `message` is an
+  `AgentSessionMessageRecord`, its `parts` `[AgentSessionViewPart]` (its `Part`
+  records and its calls in one list by `seq`, a call as `.toolCall`) and its
+  `steps` `[AgentSessionStepRecord]`, and it gains `turn`;
+  `presentations(of:names:)` takes a synced message; `artifact(of:)` takes an
+  `AgentSessionToolCallRecord` and reads a stored artifact through the
+  session's attachment route; `AgentPresentation.part` and `call(_:)` answer
+  call records.
+- Added: `view.members` (the `Member` rows, in the order added) and `view.gone`
+  (`Db3GoneEvent?`). `view.queue` is read from the messages' `queueSeq`.
+- A member removed while the view is open loses the session: running client
+  tools stop, the view empties, the subscription ends, the local copy is
+  evicted and `gone` reports `.permission`. A removal that lands while `open`
+  waits for the db3 makes `open` throw `DB3_ACCESS_REFUSED` and evicts the
+  copy. A removal that lands after the db3 is ready, while `open` is still
+  starting the view, gives you a view that has already lost the session.
+  `loadOlder()` returns `{ loaded: 0, hasOlder: false }` when the session is
+  lost during its read. `.syncOff` and `.clientOutdated` set `gone` and keep
+  the copy.
+- Client tools run only when the active turn's `Turn` row names you as its
+  initiator, over the turn's `ToolCall` rows; a call whose answer failed to go
+  out runs again once the db3 is live after a reconnect.
+- `client.agents.sessions.watch` no longer calls an `onChange` listener for
+  the first page: the page is already in `items` when `watch` returns.
+
+### Breaking: `client.db3.create` returns before the server answers
+
+A create of a db3 you hold, with sync on and no `custodian`, now returns at
+once with networking on too: the db3 is created on the device and committed
+with `POST db3` in the background, retried with backoff. `Db3CreatedEvent`
+fires once the server has it. A refusal only the server can decide
+(`DB3_TYPE_NOT_FOUND`, `DB3_TYPE_REFUSED`, a quota, a taken id) no longer
+throws: it arrives as `Db3CreateFailedEvent` with the db3's `id`, and its
+records stay on the device.
+
+```swift
+let db = try await client.db3.create(title: "Orders", type: "orders")
+let answer = try await client.documents.commitOfflineCreate(documentId: db.id)
+if answer.refused == true { print(answer.reason ?? "") }
+```
+
+- `commitOfflineCreate(documentId:)` on a db3 create waits for the server's
+  answer, joining a commit already out, instead of answering
+  `["scheduled": true]`: `["created": true]`, `["refused": true, "reason":
+  …]`, or `["created": false, "reason": "not_pending"]` once the commit had
+  landed (it no longer throws `.invalidArgument` for that db3). A failure the
+  client keeps retrying throws.
+- `CommitOfflineCreateResult.refused`, filled by
+  `documents.commitOfflineCreate`; the initializer's `refused:` parameter
+  defaults to `nil`.
+- Every `client.db3` call that asks the server about a db3 by its id (`get`,
+  the sync, type, app-access and custody calls, `permissions(_:)`, `indexes`
+  and `ingests`) waits for that db3's pending create to commit first. It
+  throws the create's refusal (`HttpError`, `details.db3Id` in its body), or
+  `JsBaoError(.pendingCreate)` (`details["db3Id"]`) offline or after 30
+  seconds. `subscribe(_:)`, `state(_:)`, `evict(_:)`, `blobs(_:)` and
+  `delete(_:)` do not wait.
+- An upload through `blobs(_:)` made before the create has committed stays
+  queued (`bytesTransferred` 0) and is sent once the server has the db3,
+  instead of being refused 404 and dropped.
+- Sync-off and custodian-naming creates, and `getOrCreateWithAlias`, still
+  wait for the server and throw on a refusal. A `Db3API` with no wired client
+  keeps sending the create itself.
+
+### Breaking: an emailed sign-in link lands on the app's callback by default
+
+- `client.auth.emailSignInRequest(email:)` with no `redirectUri` (nil or
+  empty) now asks for a link to `options.auth.oauthRedirectUri` when set, else
+  to `links.appBaseURL`'s origin + `/oauth/callback` when `appBaseURL` is set,
+  where it sent a code-only email. The public `AuthController` call does the
+  same. Add that URL to `[auth].emailRedirectUris` and run
+  `primitive config push`, or pass `target: .codeOnly`. An app with neither
+  configured, or one that passes a `redirectUri`, is unaffected.
+
+### Added: sign-in helpers on `client.auth`
+
+- `emailSignInRequest(email:target:)` with `EmailSignInTarget`
+  (`.automatic`, `.codeOnly`, `.uri(_:)`), and `emailSignInLinkTarget(_:)`,
+  which returns the target a request would carry without sending it.
+- `handleSignInCallback(_:inviteToken:)` finishes a sign-in from an emailed
+  link (`magic_token`) or an OAuth redirect (`code` + `state`) and returns a
+  `SignInCallbackResult`. A URL off `links.appBaseURL`'s origin or the scheme
+  `oauthRedirectUri` registers, off the callback path, or outside the grammar
+  throws `AuthError` with code `.invalidToken` before any request.
+- `AuthConfig.oauthRedirectUri`.
+
+### Breaking: `client.locks` and `.lockTimeout` are removed
+
+- Named locks are server-function-only. `client.locks`, `LocksAPI`, the lock
+  types (`LockHandle`, `LockContention`, `LockAcquireResponse`,
+  `LockReleaseResult`, `LockRenewResult`, `LockStatus`, `LockListEntry`,
+  `LockListResult`) and `JsBaoErrorCode.lockTimeout` are gone, and a direct
+  call to `locks/acquire`, `locks/renew` or `locks/release` is refused 403
+  `FUNCTION_ROUTE_FUNCTION_ONLY`.
+- Take the lock in a server function with `ctx.locks.withLock`, decide who may
+  lock which key in its `authorize`, and call it from the app with
+  `client.functions.invoke`. A `withLock` that cannot take the key in time
+  throws an error whose `code` is `LOCK_TIMEOUT`.
+- App admins inspect and free locks with `primitive locks list`,
+  `locks status <key>` and `locks force-release <key>`.
+
+### Breaking: the server assigns every group's id
+
+- `CreateGroupParams` loses `groupId` and its initializer parameter: a
+  group's id is always a ULID the server assigns. Read it from the returned
+  `GroupInfo.groupId` and keep it. A call that passed `groupId:` no longer
+  compiles; drop the argument.
+- A create whose body still sends `groupId` — from a server function or the
+  admin API — is refused with a 400 whose code is `GROUP_ID_NOT_ACCEPTED`.
+  Groups that already hold a chosen id keep answering by it.
+
+### Added: db3 write guards and counters on generated models
+
+Every generated model gains `save(in:options:)`, `delete(in:options:)` and
+`static increment(id:fields:in:options:)`, taking `Db3WriteOptions`
+(`condition`, `ifNotExists`, `confirm`):
+
+```swift
+task = try await task.save(in: db3Id, options: Db3WriteOptions(condition: ["category": "open"], confirm: true))
+let values = try await Post.increment(id: postId, fields: ["views": 1], in: db3Id)
+```
+
+A failed guard is refused `.db3ConditionNotMet` with the record's current row
+under `details["current"]`; an increment of a record this device does not hold
+is refused `.db3RecordNotFound`. `client.codegen` gains the methods they call:
+`save(_:id:values:in:changedFields:options:)`, `delete(_:id:in:options:)` and
+`increment(_:id:fields:in:options:)`. The generated members name the options
+type `JsBaoClient.Db3WriteOptions`, a new public alias (with
+`CodegenAPI.WriteOptions`), so a model named `Db3WriteOptions` does not shadow
+it. A field named `increment` stays allowed. Models regenerate at build; no
+existing type or method changes.
+
+### Added: sharing and blobs in `client.db3`
+
+`client.db3.permissions(_:)` (`Db3PermissionsAPI`) is a db3's sharing over
+its own routes, with the `client.documents` sharing types: `list()`,
+`set(_:)`, `remove(_:)`, `listPendingInvitations()`,
+`listGroups(includeSystem:)`, `grantGroup(_:)`, `revokeGroup(_:)`,
+`getLinkAccess()`, `setLinkAccess(_:)`, `clearLinkAccess()`,
+`requestAccess(_:)`, `listAccessRequests()`,
+`approveAccessRequest(_:options:)` and `denyAccessRequest(_:options:)`.
+Removing your own grant keeps the db3's copy on the device readable (the
+next subscribe is refused); `listGroups()` filters nothing on the client; an
+empty user id or email throws `.invalidArgument` before any request. A
+grant-adding call on a sync-off db3 is refused `DB3_SYNC_OFF_NO_SHARING`.
+
+`client.db3.blobs(_:)` (`Db3BlobContext`) is a db3's blobs, with the method
+set of `DocumentBlobContext`. Its uploads follow the JS client's offline
+contract: while the client is offline `upload` stores and queues the bytes,
+sends nothing and answers `bytesTransferred == 0`; an upload that cannot
+reach the server answers the same instead of throwing, and is sent once the
+client is online, by the next client over the same storage too. A refusal,
+`NOT_A_DB3` included, throws and queues nothing. With no local copy, `read`
+throws `JsBaoError` `.offline` while the client is offline. Its local copies
+and queue verbs are its own; the app-wide `client.documents` queue verbs
+still reach every upload of an id.
+
+A document that is not a db3 is refused `HttpError` 409 `NOT_A_DB3` by every
+call of both. No existing type or method changes, and `client.documents`
+blobs behave as before.
+
+### Added: `client.db3.create` works with networking stopped
+
+A create of a db3 you hold, with sync on and no `custodian`, mints its id on
+the device. Online it still waits for the server and sends that id in
+`POST db3`. With networking stopped, or when the request cannot reach the
+server, it returns at once with the db3 created on the device: models save and
+query, and `state.pendingCreate` is `true` until the create is saved on
+reconnect, retried with backoff.
+
+- `Db3CreatedEvent` (`.db3Created`) and `Db3CreateFailedEvent`
+  (`.db3CreateFailed`), which `client.db3.create` and `getOrCreateWithAlias`
+  emit. A refused deferred create keeps its records and carries its `id`;
+  `commitOfflineCreate(documentId:)` tries again, as a fresh round retried
+  with backoff (it answers `["scheduled": true]`; the events report the
+  outcome).
+- `Db3State.pendingCreate` (its initializer parameter defaults to `false`);
+  `LocalMetadataEntry.db3Create`, `db3Type` and `commitRefused`, and
+  `CommitError.code`, all optional, so stored rows decode as before.
+
+### Added: bulk loads in `client.db3`
+
+`client.db3.ingests` (`Db3IngestsAPI`) is the `client.documents.ingests`
+bulk load over a db3's own routes: `buildChunks(rows:options:)`,
+`create(db3Id:options:)`, `uploadChunk(db3Id:sessionId:chunk:)`,
+`commit(db3Id:sessionId:)`, `abort(db3Id:sessionId:)`,
+`get(db3Id:sessionId:)` and `list(db3Id:limit:cursor:)`, with the same
+`DocumentIngest*` types, chunks and multipart body. A document that is not a
+db3 is refused `HttpError` 409 `NOT_A_DB3`. No existing type or method changes.
+
+### Added: `DocumentAccessSource.resource`
+
+- A member of the platform resource that holds a db3, such as an agent
+  session, reads it as a `reader`, and `client.db3.get(_:)` answers
+  `accessSource == .resource`. `Db3Info.custodian` can name that resource
+  (`agentSession:<sessionId>`). A `switch` over `DocumentAccessSource` with no
+  `default` needs the new case.
+
+### Breaking: groups and collections have roles; the type-config namespaces are gone
+
+Groups and collections now have fixed roles, one custodian, and groups are
+addressed by `groupId` alone. The client follows the server and the JS client.
+
+- **Removed:** `client.groupTypeConfigs` and `client.collectionTypeConfigs`,
+  with `GroupTypeConfigsAPI`, `CollectionTypeConfigsAPI` and their types
+  (`GroupTypeConfigInfo`, `CreateGroupTypeConfigParams`,
+  `UpdateGroupTypeConfigParams`, `CollectionTypeConfigInfo`,
+  `CreateCollectionTypeConfigParams`, `UpdateCollectionTypeConfigParams`).
+  Their routes were already gone, so every call answered 404.
+  `client.databaseTypeConfigs` is unchanged.
+- **Groups:** every per-group call takes `groupId:` alone
+  (`get(groupId:)`, `update(groupId:params:)`, `listMembers(groupId:…)`, …).
+  New `transfer(groupId:to:)` (`to` is `"user:<userId>"`) and
+  `setMemberRole(groupId:userId:role:)`. `GroupInfo` carries `custodian` and
+  `settings` (`ResourceSettings`, `memberList: .members | .managers`), member
+  and membership rows carry `role`, and `.userId(_:role:)` / `.email(_:role:)`
+  add with a `GroupRole`. `UpdateGroupParams` takes `settings`.
+- **Collections:** `listMembers(collectionId:)` answers users and groups as
+  principals (`CollectionMemberEntry`) with a `CollectionRole`.
+  `addMember` takes `.user(_:role:…)` / `.email(_:role:…)`; new
+  `addGroupMember(collectionId:groupId:role:)`,
+  `setMemberRole(collectionId:principal:role:)`,
+  `removeMember(collectionId:principal:)` (a user's id, or `group:<groupId>`),
+  `transfer(collectionId:to:)` and `resolveRole(collectionId:userId:)`.
+  `CollectionInfo` carries `custodian`, `settings` and `role`;
+  `CreateCollectionParams` and `UpdateCollectionParams` take `settings`.
+- **Documents:** `GrantGroupPermissionParams(groupId:permission:)` and
+  `revokeGroupPermission(documentId:groupId:)` name a group by id.
+- **Deprecated, removed by #4718** (each still works and its warning names
+  the replacement): the `groupType:` labels on every group call,
+  `groups.create(params:)` and `CreateGroupParams` (the server refuses every
+  session's group create: create from a server function or the admin API),
+  `ListGroupsOptions.type` and `init(type:…)`; `collections.getAccess`,
+  `grantGroupPermission`, `revokeGroupPermission`,
+  `removeMember(collectionId:userId:)`, the `permission:` factories and init,
+  `CollectionPermission`, `GrantCollectionGroupPermissionParams`, and the
+  compatibility fields `collectionType`, `permission`, member-row `addedBy`
+  and grant-row `groupType`; `CreateCollectionParams.collectionType` and its
+  init; `GrantGroupPermissionParams.groupType`, its typed init and the typed
+  `revokeGroupPermission(documentId:groupType:groupId:)`.
+
+### Added: create and manage a db3 from `client.db3`
+
+```swift
+let orders = try await client.db3.create(title: "Orders", type: "orders")
+// Resident at once: its models save and query here before any subscribe.
+let sub = try client.db3.subscribe(orders.id)   // the first subscribe sends those writes
+try await sub.ready()
+```
+
+- `client.db3.create(title:type:sync:custodian:tags:metadata:)` creates a db3
+  on the server and answers its `Db3Info`. A synced db3 is on the device from
+  the answer on: `stored()` lists it, its models save and query before any
+  subscribe, and the first subscribe sends those writes. A sync-off db3
+  (`sync: false`, an app owner or admin only) is never stored on a device.
+- `get(_:)`, `delete(_:)`, `listMine(options:)`,
+  `getOrCreateWithAlias(_:)`, `getSync(_:)`/`setSync(_:sync:)`,
+  `getType(_:)`/`setType(_:type:)`, `getAppAccess(_:)`/`setAppAccess(_:level:)`,
+  `transfer(_:to:)` and `setOwnerRow(_:present:)`, with their answer types
+  (`Db3Info`, `Db3GetOrCreateWithAliasOptions`/`Result`, `Db3SyncState`/`Change`,
+  `Db3TypeState`/`Change`, `Db3TypeRevision`, `Db3InstalledType`,
+  `Db3AppAccessLevel`, `Db3AppAccess`/`Change`, `Db3OwnerRowChange`). A refusal
+  throws the route's `HttpError`, its `serverCode` naming why.
+- A db3 whose sync is turned off is gone with `Db3GoneEvent.Reason.syncOff`
+  (`DB3_SYNC_OFF`): `ready()` throws `.db3SyncOff`, its rows stay readable, new
+  writes are refused, and once the sync is on again a subscribe opens it as
+  before. `Db3GoneEvent.Reason` gains `.syncOff`: a `switch` over it with no
+  `default` needs the new case.
+- `DocumentAccessSource` gains `.app` (a db3's app access), and an
+  `accessSource` this client does not know decodes as `nil` instead of failing
+  the whole `DocumentInfo` or `Db3Info`. A `switch` over `DocumentAccessSource`
+  with no `default` needs the new case.
+
+### Added: typed db3s
+
+- `JsBaoErrorCode` gains `.db3DeclarationRefusedTyped`
+  (`DB3_DECLARATION_REFUSED_TYPED`) and `.db3ModelNotDeclared`
+  (`DB3_MODEL_NOT_DECLARED`), the JS client's strings.
+- On a db3 with a type, the room's refusal of the client's declaration is taken
+  as acknowledged, so the db3 opens as any other; a write to a model the type
+  does not declare is handed back with `.db3ModelNotDeclared`.
+
+### Added: increments, write guards and the format-1 warning
+
+- `DynamicModel.increment(id:fields:options:)` adds to numeric fields of a
+  db3 record, synchronously inside `transact` and `async` (with `confirm` or
+  a `condition`, the platform's values) outside it.
+- `save(id:values:changedFields:options:)` and `delete(id:options:)` take a
+  `Db3WriteOptions` with `condition`, `ifNotExists` (save only) and
+  `confirm`. A refused guard is handed back as `.db3ConditionNotMet` with
+  `details["current"]`, and `DocumentWriteRefusedEvent.current` carries the
+  record.
+- New error codes `.db3ConditionNotMet`, `.db3RecordNotFound`,
+  `.db3ClientOutdated` and `.db3SyncOff` (the JS client's strings), and
+  `Db3GoneEvent.Reason.clientOutdated`.
+- Saving a model into a format-1 document logs a deprecation warning, once
+  per model per document.
+- `RecordLogWriteKind` gains `.increment` and `Db3GoneEvent.Reason` gains
+  `.clientOutdated`: a `switch` over either with no `default` needs the new
+  case.
+
+### The `denied` function run status
+
+A webhook or cron fire of a function whose `authorize` denied it now leaves a
+run that settled `denied`, before its handler ran; the deny's code leads the
+run's error message. `FunctionRunStatus.terminalStatuses` and `statusValues`
+include it, so `functions.waitFor` returns such a run instead of refusing its
+status.
+
+### Breaking: a db3 is queried as the room queries it
+
+On a format-3 document (a db3), `query`, `queryPaged`, `count` and
+`aggregate` on a generated model, a `DynamicModel` or the cross-document
+store, and `client.documents.records(id).query` and `count`, now answer from
+the document's own rows with the room's statement and its limits:
+
+- The stored JSON type decides a comparison: `["n": 5]` no longer matches a
+  stored `"5"`, `["b": true]` matches a stored `true` or `1`, and a field
+  answers as stored. `["f": nil]` matches a field that is absent or null,
+  `["f": ["$eq": nil]]` matches nothing, and nulls sort first ascending and
+  last descending.
+- A page answers 100 records when no `limit` is sent and at most 10,000; a
+  `limit` outside 1 to 10,000 throws `.invalidArgument`. A page ends before
+  the record that would take it past 8 MiB of JSON, with `hasMore` set. Read
+  every row by following `nextCursor`. A cursor carries the document, so a
+  cursor from the JS client pages a Swift query and the reverse; a cursor
+  minted before this update is refused.
+- An include resolves within each parent's own document, and a `hasMany`
+  leg is attached whole. An include nesting a fourth level, or an invalid
+  one, throws `.invalidArgument` (`Invalid include: <reason>`). A `hasMany`
+  leg reading more than 1,000 related rows for the page, a page whose
+  `_related` passes 8 MiB, and an aggregate whose rows pass 8 MiB throw the
+  new `.db3PageTooLarge` (`DB3_PAGE_TOO_LARGE`).
+- An aggregate groups a declared string-set field as a facet (one row per
+  member) and sums, averages and compares the stored values.
+- The store's indexes come from the room's index list (`db3/:id/indexes`),
+  read when the document opens and when the room acknowledges a declaration,
+  not from the model's `indexed` and `unique` fields directly.
+- The client runs its own SQLite, 3.53.4, the release the JS client's
+  sqlite-wasm carries, so every OS answers the same SQL. A package that opens
+  the client's database file links the `JsBaoSQLite` product of this package,
+  not the OS's `SQLite3`.
+- The first open after the update migrates the local store once (storage
+  version 2): the tables a db3's models were projected into are dropped. No
+  record is touched.
+
+Format-1 documents are unchanged.
+
+### `client.db3`: subscribe to a db3 and read its copy on this device
+
+`client.db3.subscribe(id)` keeps a db3 up to date with its room while any
+subscription is held, and answers a `Db3Subscription` at once: `available()`
+returns as soon as a readable copy is on the device, `ready()` once it is up
+to date (it throws `DB3_READY_TIMEOUT` after `readyTimeout`, default 30 s,
+with no progress, `DB3_ACCESS_REFUSED`, `DB3_DISPOSED` or `NOT_A_DB3`),
+`state` is its `Db3State`, and `stream()` / `observe(_:)` deliver its own
+events. `dispose()` gives it up; the last one stops the room's updates and
+the copy stays readable. Also on `client.db3`: `unsubscribe`, `refresh`,
+`evict` (`DB3_PENDING_WRITES` without `force`), `stored()`, `state`,
+`setRetentionPolicy`, and `indexes` (`list`, `register`, `drop`). The client
+emits `Db3StateEvent`, `Db3ReadyEvent`, `Db3RowsEvent`,
+`Db3WriteRefusedEvent`, `Db3EvictedEvent`, `Db3GoneEvent` and `Db3ErrorEvent`
+under the JS client's `db3:*` keys.
+
+A db3 this device holds is resident: bound when storage is ready, after a
+sign-in, and at its create, it answers queries and takes writes while
+unsubscribed, and its writes are sent at the next subscribe.
+`QueryOptions(db3:)` and `AggregateOptions(db3:)` scope a read to db3s, and
+`client.setDefaultDb3(_:)` records one as the default document.
+
+Breaking, on a db3 only:
+
+- `closeDocument` / `documents.close` keep the db3's copy readable: the
+  model API and `documents.records(id)` still answer after the close, and the
+  close ends this client's subscriptions to it. A close that evicts
+  (`evictLocal`, or an open with `retainLocal: false`) removes it as before.
+  `openDocument` / `documents.open` and the closes log one warning per client
+  naming the `client.db3` form.
+- A db3 whose first load has not completed here is left out of an unscoped
+  read, and naming it (`QueryOptions(db3:)`, `save(in:)`,
+  `setDefaultDb3`, a `documents.records(id)` read) throws the new
+  `DB3_NOT_RESIDENT`; a `documents.records(id)` write to it is queued.
+- A db3 whose access was revoked, or which a listing or a metadata sync no
+  longer reports, stays on the device: it turns `.gone`, its rows stay
+  readable, new writes throw `WRITE_ACCESS_DENIED`, and unsent writes are
+  kept. `client.db3.evict` removes it. `documents.evict` counts its unsent
+  writes as unsynced changes.
+- A logout, with or without a wipe, ends every subscription and takes every
+  db3 out of reads and writes; the same user's next sign-in brings them back.
+
+### Blob uploads survive a restart
+
+A queued or in-flight upload, document or session, now outlives the process.
+With `storageConfig: .sqlite(...)` (the default database included), the
+upload's record and bytes are written to the client's database before its
+first PUT, and the next `JsBaoClient` for the same app and user restores it
+once `waitForStorageReady()` returns: it is listed in `uploadsAsync()` /
+`view.attachments.uploads()`, retried on its existing backoff, and pause,
+resume, cancel and the `blobs:upload-*` events work on it as on any upload.
+A paused upload stays paused and a refused session upload stays `.failed`
+until resumed. Nothing is restored for another app or another user; the
+owner gets it back at their next sign-in. `.memory` storage keeps the queue
+in memory only, as before. No API changes.
+
+**Behaviour change:** a document upload queued while a user is signed in now
+belongs to that user, as session uploads already did. It is listed, retried,
+paused and cancelled only while that user is signed in, each attempt
+(the first PUT inside `upload` included) sends that user's token, and it
+resumes when they sign in again. A 401 answered after the client refreshed
+that user's token is sent once more with the new one. Before, an upload ran
+under whichever token was signed in when it was sent. An upload queued with
+nobody signed in is unchanged. `destroy()` now ends a pending
+`view.attachments.waitUntilUploaded`, and a send waiting on an upload, with
+`.unavailable`; the upload itself stays stored for the next launch.
+
+### Format-3 documents: records of any model, with no generated model
+
+`client.documents.records(documentId)` reads and writes the records of an
+open format-3 document by model name, whether or not a model declares them,
+and `client.documents.schema(documentId)` answers what the document holds:
+
+```swift
+let records = client.documents.records(documentId)
+let note = try records.put("Note", ["title": "Groceries", "n": 1, "tags": ["home"]])
+try records.patch("Note", id: note["id"]!.stringValue!, ["tags": .setChange(add: ["weekly"])])
+let page = try records.query("Note", ["tags": ["$contains": "home"]], options: QueryOptions(limit: 20))
+let stop = try records.subscribe("Note") { print("notes changed") }
+```
+
+- `DocumentRecords`: `put`, `patch`, `delete` (each also with `confirm:`),
+  `get`, `query`, `count` and `subscribe`. Reads answer from the local copy,
+  offline too; a query takes the model API's filter grammar on any field.
+- `DocumentRecordValue`: a string, a number, a boolean, `nil`, a string set
+  (an array literal), or `.setChange(add:remove:clear:)`.
+- A document that is not open throws `.notFound`; one that is not format 3
+  throws `.documentFormatMismatch`. A write the room would refuse throws
+  `.documentEntryInvalid` before it is sent and arrives as a
+  `DocumentWriteRefusedEvent`.
+- Generated models on a format-3 document: a field whose stored value does
+  not fit its declared type reads as missing from `find`; `query` answers it
+  as stored (see "a db3 is queried as the room queries it"). A save that names a string set without changing it sends it as an
+  empty change, and an object or a non-string array in a field is refused
+  before it is sent, as the room refuses it.
+
+### Agent sessions: files, waiting sends and session-gone, by `sessionId` alone
+
+A session view now carries the session's files, so an app needs no document
+ID to upload, send or read them:
+
+```swift
+let view = try await client.agents.sessions.open(sessionId: sessionId)
+let file = try await view.attachments.upload(
+    png, options: AgentSessionAttachmentUploadOptions(filename: "chart.png", contentType: "image/png")
+)
+try await view.send(text: "What does this show?", files: [AgentSessionFileRef(blobId: file.blobId)])
+```
+
+- `view.attachments` (`AgentSessionAttachments`): `upload`, `uploads`,
+  `pause`, `resume`, `cancel`, `waitUntilUploaded` and `read`. An upload is
+  queued and retried, also after `view.close()` and across a restart; it
+  belongs to the signed-in user who made it and is never sent with another
+  user's token. When another user signs in or the token is cleared, waits
+  on it throw `.agentSessionUploadIdentityChanged`, and it resumes when its
+  user signs in again. A refused upload stays in `uploads()` as `.failed`, with its
+  bytes, until `resume` retries it or `cancel` drops it.
+- A send that names an upload still queued waits for it. **Source change:**
+  `AgentSessionPendingMessage.State` gains `case waiting`, so an exhaustive
+  `switch` over it needs one more case.
+- `view.artifact(of:)` shares one download among concurrent calls for the
+  same artifact.
+- Once the client sees a session is gone (its own `delete`, or a session call
+  answered `AGENT_SESSION_NOT_FOUND`), the session's queued uploads and the
+  messages waiting on them fail with that error.
+- `client.agents.sessions.inspect.storage(_:)` answers the backing document
+  for diagnostics; `uploadAttachment`, `downloadAttachment` and
+  `attachmentHeaders` are the one-request calls.
+- `AgentSessionInfo.documentId`, `AgentSessionListItem.documentId` and
+  `AgentSessionView.documentId` are deprecated: use `sessionId` and the calls
+  above.
+
+### Breaking: function runs are read and stopped on `functions` routes
+
+`FunctionsAPI.getStatus(runId:)`, `waitFor` and `terminate` now call
+`GET functions/runs/{runId}/status` and
+`POST functions/{functionKey}/instances/{runKey}/terminate`. The server no
+longer serves the `workflows/runs/...` and `workflows/{key}/instances/...`
+routes earlier builds called, so an app on an earlier build gets `.notFound`
+from each of these methods until it takes this update. The methods take and
+return what they did before.
+
+| Before | Now |
+| --- | --- |
+| `GET workflows/runs/{runId}/status` | `GET functions/runs/{runId}/status` |
+| `GET workflows/{key}/instances/{runKey}/status` | `GET functions/{functionKey}/instances/{runKey}/status` |
+| `POST workflows/{key}/instances/{runKey}/terminate` | `POST functions/{functionKey}/instances/{runKey}/terminate` |
+| `GET workflows/runs`, `GET workflows/runs/{runId}/steps` | `client.functions.listRuns`, `client.functions.listRunSteps` |
+| `mode` in the body of `POST functions/{key}` | `client.functions.start` (a body carrying `mode` is refused 400 `RETIRED_REQUEST_KEY`) |
+
+### Breaking: `client.workflows` and `client.cronTriggers` are removed
+
+The server no longer runs DSL workflows or standalone cron triggers, so the
+client no longer has `client.workflows` or `client.cronTriggers`. Call a server
+function with `client.functions` instead, and schedule one by declaring
+`[[function.triggers.cron]]` in its config. `functions.waitFor` now throws
+`.functionWaitTimeout` (`FUNCTION_WAIT_TIMEOUT`) when its timeout passes.
+
+| Before | Now |
+| --- | --- |
+| `client.workflows.start` | `client.functions.start` |
+| `client.workflows.getStatus`, `waitFor`, `terminate` | `client.functions.getStatus(runId:)`, `waitFor`, `terminate` |
+| `client.workflows.listRuns`, `listStepRuns` | `client.functions.listRuns`, `listRunSteps` |
+| `client.workflows.define` and the apply trio | A function writes the document itself; nothing to apply |
+| `client.cronTriggers.*` | `[[function.triggers.cron]]` in the function's config |
+| The `.workflowStatus` and `.workflowStarted` events | Poll with `client.functions.getStatus` or `waitFor` |
+| `WorkflowStatusResult`, `WorkflowRunInfo`, `WorkflowRunError`, `WaitForWorkflowResult` and the other workflow types | `FunctionRunStatus`, `FunctionRunInfo`, `FunctionRunError`, `FunctionRunResult` |
+| `WorkflowSliceInfo` | `FunctionRunSlice` |
+| `StartWorkflowOptions`, `TerminateWorkflowOptions`, `ListWorkflowRunsOptions` | The `client.functions` method parameters, `FunctionRunRef` |
+| `CronTriggersAPI` and its types | None |
+| `.workflowWaitTimeout` | `.functionWaitTimeout` |
+| `.workflowApplyNotConfirmed` | None: nothing the client calls returns it |
+| `.functionModeMismatch` | None: `invoke` returns the server's answer as it came, and a `start` answer with no run id is a decode failure |
+
+### Breaking: an output-schema refusal is `FUNCTION_OUTPUT_INVALID` on every run
+
+A run whose output its function's `outputSchema` refuses reports
+`FUNCTION_OUTPUT_INVALID` in `FunctionRunError.code` and
+`FunctionRunInfo.errorCode`, whether it was invoked or started; a run that
+failed this way before the change reads back the same way. Code that compared
+against `"OUTPUT_SCHEMA_VIOLATION"` compares against
+`"FUNCTION_OUTPUT_INVALID"`.
+
+### A function run says which runtime it ran on
+
+`FunctionRunInfo.runtime` is `"request"` for a run that answered within one
+request (a webhook fire) and `"task"` for a started run. It is on the `run`
+block of `functions.getStatus` and `functions.waitFor` and on every item of
+`functions.listRuns`, and `nil` when the server did not report it.
+
+### Opening a large document with no local copy is faster
+
+A client that opens a large record-log document it holds no copy of (a new
+device, or after its local copy was evicted) now receives the catch-up as a stream of
+pages after one request, instead of asking for each page in turn, so its time
+no longer grows with one round trip per page. When the document has no segment
+that covers the client, the server builds one and the open waits briefly for
+it, reporting progress, then downloads it; segments are also built a few
+seconds after a large change. The rows the client ends with are unchanged.
+The JS client behaves the same way. There is nothing to configure.
+
+### A client that holds a segment downloads only what changed
+
+A large document's next segment reuses the parts of the previous one that no
+write has touched. A client that received the previous segment, and is pointed
+at the next one, keeps the rows it already holds for those parts and downloads
+only the parts that changed and the writes since; it ends with the same rows as
+before. When its rows for a part do not match what the segment lists (another
+client of the same store changed them, or a receipt was interrupted), it
+downloads that part. There is nothing to configure.
+
+### Record-log saves made offline are acknowledged sooner after a reconnect
+
+A client reconnecting to a record-log document with saves made offline now
+sends them right behind its open, instead of waiting for the room to answer
+the open first, so they are acknowledged one round trip sooner. A reconnect
+with nothing pending sends what it did before, and the JS client behaves the
+same way. The ordering, refusals and hand-backs of those saves are unchanged.
+A reconnect right after the client switched writer ids (an earlier session's
+saves sent first, or a restored local store) waits for the open as before,
+also when the document was closed and opened again in between.
+There is nothing to configure.
+
+### Fixed: a created document no longer stays a pending create after its commit
+
+The server answers a create and tells the creating client about the new
+document at the same moment. When the two landed together, the metadata
+merge for the server's notice could put back the `pendingCreate: true` the
+commit had just cleared, and nothing retried it: the document stayed a
+pending create for the rest of the session. The merge and the commit no
+longer overwrite each other.
+
+### Presentations from an agent session
+
+`view.presentations(of:names:)` answers the presentations an agent message
+carries — calls to tools declared `runs = "presentation"` that are
+`output-available` — as `AgentPresentation` values with `name`, `input`,
+`part`, and `call(_:)`, which resolves a call number the input names to that
+call's part in the view's window. Pass the generated
+`<Agent>Agent.presentationNames`, and decode one with the generated
+`<Agent>AgentPresentation(_:)`. `PrimitiveToolCallPartContent` carries
+`callNumber`, the call's number in its turn.
+
+### Breaking: a field named after a generated model's member is refused (#4505)
+
+A model field can no longer take a name the generated model already uses on
+either client: `related`, `CodingKeys`, `discardChanges`, `markAllChanged`,
+`primitiveValues` and `hashValue` on the Swift struct, and `syncState`,
+`save`, `delete`, `isDirty`, `toJSON`, `constructor` and the rest of
+`BaseModel`'s members on the JavaScript client — the full list is
+`packages/js-bao/src/utils/reservedFieldNames.json`, rendered into the client
+as `ReservedFieldNames`, and the Reserved Field Names section of the documents
+and databases pages lists every one. The Swift codegen plugin now refuses such
+a schema with js-bao's sentence,
+`[models.<model>.fields.<field>]: Field '<name>' is reserved (<reason>)`, as it
+does `type` and `_`-prefixed names, and exits before writing any file; the
+record-log pre-check refuses the field with `.documentEntryInvalid`. Matching is
+exact: `Save` and `syncStatus` are fine, and `id` stays allowed.
+
+Stored schemas and records still load; the refusal appears at the next
+codegen, push or record write. A Swift-only app may hold a field the Swift
+struct compiled with — `syncState`, `save`, `delete`, … — that is reserved
+only because the JavaScript model breaks on it: it is refused too, so a schema
+written for one platform builds on the other. Rename the field and regenerate.
+
+### Your own record-log saves come back smaller
+
+A client writing to a record-log document no longer downloads each of its own
+saves back in full. It asks the room for compact acknowledgements when it opens
+the document, and for a save the room applied exactly as written the
+acknowledgement carries only its log number, epoch, writer and sequence number;
+the client derives the row from the save it already holds. A save the room
+changed — a field another writer set later, an upsert that resolved to an
+existing record — is still acknowledged in full. Rows, sync states and events
+are the same as before, and there is nothing to configure. A room that predates
+the change ignores the request and keeps acknowledging in full.
+
+### Bulk loads from Swift: `client.documents.ingests`
+
+`client.documents.ingests` drives a bulk load into a record-log document:
+`buildChunks(rows:options:)` turns `DocumentIngestRow`s into upload-ready
+`DocumentIngestChunk`s (for the same rows, the same decompressed text,
+`rows`, `rawBytes`, `firstId`, `lastId` and `index` as the JS client's chunks;
+the gzip bytes, and so `bytes` and `sha256`, are each platform's own, and a
+chunk whose compressed size passes 8 MiB is split by the platform's compressor,
+which can cut it differently), `create(documentId:options:)` opens a session with
+`DocumentIngestCreateOptions(mode:models:reserveEpoch:)` (no body when none is
+set), and `uploadChunk`, `commit`, `get`, `list` and `abort` drive it.
+A refusal throws `HttpError` with the server's code (`INGEST_OPTION_INVALID`,
+`INGEST_SESSION_NOT_ABORTABLE`, …); the builder throws `JsBaoError`
+`.invalidArgument` for a row or an artifact the platform would refuse.
+
+### Added: a client tool call's wait is a `client_call` step (#4467)
+
+An agent session's steps gain `PrimitiveStepKind.clientCall`: one step per
+client tool call the turn waited on, from the call being written until its
+answer arrived, with `PrimitiveStep.resolvedByUserId` naming the member whose
+answer or cancel made it final. A call that ends unanswered has its step
+`failed` with how it ended (`AGENT_CALL_CANCELLED`, `AGENT_CALL_SUPERSEDED`,
+`AGENT_CALL_EXPIRED` or the failed turn's code). An earlier client reads the
+kind as `.unknown("client_call")`.
+
+### Bursts of record-log saves leave in a few frames
+
+A client now keeps one `record.entries` frame in flight per record-log
+document instead of 8 entries. Saves made while it is out leave together as the
+next frame, up to 64 entries, so a burst of 200 saves is acknowledged in a few
+round trips instead of 25. A lone save leaves as before. Nothing public
+changed.
+
+### Session views read a tool call's artifact
+
+`view.artifact(of: part)` answers a tool call's artifact as a `JSONValue`, the
+same value whether the server stored it on the part or, being large, as a blob
+on the session's document. The blob is downloaded only when `artifact(of:)` is
+called; opening, refreshing and `loadOlder()` never read one. It answers `nil`
+for a part that is not a tool call or a call with no artifact, and throws the
+blob read's error for a failed download and a `DecodingError` for a blob that
+is not JSON.
+
+### Breaking: large documents (`documentFormat: 2`) are removed
+
+The platform no longer serves large documents, and the Swift client no longer
+holds their code. A create that asks for one — `documents.create`,
+`createDocument`, `createWithAlias` and `getOrCreateWithAlias` with
+`documentFormat: 2` — throws `JsBaoError(.documentFormatUnsupported)` before
+any request. An open whose format resolves to 2, from the local row or from the
+server, throws the same code before any frame is sent; the document is left
+closed and whatever an older build stored for it stays on the device until
+`logout(wipeLocal: true)`. Use `documentFormat: 3` (record-log documents) for
+large data; an export of a large document made by an earlier release loads
+into a record-log document with
+`primitive documents ingest <document-id> --input <export-dir>`.
+
+Removed:
+
+- `JsBaoClientOptions.largeDocumentStorage` and `LargeDocumentStorageOptions`.
+- `JsBaoErrorCode.clientUpgradeRequired`, `.format2ReloadRequired`,
+  `.format2FoldBroken` and `.format2SnapshotLoadIncomplete`.
+- The `.documentSnapshotLoad` and `.documentOfflineWritesResolved` events with
+  `DocumentSnapshotLoadEvent` and `DocumentOfflineWritesResolvedEvent`.
+- Every public large-document type: `Format2RecordStore`, `Format2Coordinator`,
+  `Format2DocumentBinding`, `Format2Transport`, `Format2QueryProjection`,
+  `Format2Observer`, `Format2WritePath`, `Format2SnapshotLoader`,
+  `Format2StorageCapability`, `OverlayDocument`, `OverlayMutation`,
+  `OverlayKeys`, `SnapshotManifest`, `SnapshotChunkReader` and the types they
+  carried.
+- `DocumentManager.sendLocalUpdate(documentId:update:mergedUpdateCount:claiming:)`
+  loses `claiming:`.
+
+`syncStep1` no longer carries `formats` or `manifestVersion`. Kept under their
+names, because the record-log store runs on them: `Format2SqlHost`,
+`Format2SqlConnection`, `Format2SqlValue`, `Format2Storage`,
+`.format2StorageUnavailable`, `.format2QueryScope` and
+`.format2ModelNotHydrated`. A refusal frame from the room
+(`DOCUMENT_FORMAT_UNSUPPORTED`) now closes the document under the app, as a
+format mismatch does.
+
+### Record-log documents receive bulk loads and checkpoint segments as chunks
+
+A `documentFormat: 3` document's bulk loads and the room's checkpoint segment
+now reach the Swift client as compressed chunks read through a short-lived
+grant, live and on reconnect, rather than as rows over the socket. Listeners
+hear a load once per chunk. A save to a record-log document with a field named
+`type` or starting with `_` now throws `.documentEntryInvalid` locally ("Field
+'…' is reserved … Rename the field."), as the room refuses it. Nothing to
+change in apps; give each `JsBaoClient` its own storage directory.
+
+### Breaking: `client.databases` is removed; reach records through a server function
+
+The client's direct database surface is gone: `client.databases` (database
+lifecycle, the `DoDb` records handle from `connect`, permissions, group
+permissions, operation CRUD and change subscriptions), with `DatabasesAPI`,
+`DoDb` and its types, `DatabaseInfo`, `CreateDatabaseParams`,
+`UpdateDatabaseParams`, `DatabaseOperationInfo`, `DatabaseChangeEvent` and
+`DatabaseSubscribeOptions`. Every `databases/*` route now answers only an app
+admin or owner, so an app's own code reads and writes its records in a server
+function, which runs with the app's authority. `client.databaseTypeConfigs`
+stays for admin tooling; its `metadataAccess` key and the deprecated
+initializers that took it are removed, and the server refuses the key.
+
+| Before | Now |
+| --- | --- |
+| `client.databases.connect(databaseId:)` then `query`, `save`, `count`, `aggregate` on the `DoDb` handle | a server function: `ctx.db(id, "<type>").model("<Model>").query(...)` / `.save(...)`, invoked with `client.functions.invoke` or the generated `<Key>Function` invoker |
+| `client.databases.create`, `get`, `list`, `update`, `delete`, `addManager`, `removeManager` | `ctx.api.databases.*` in a server function, or the admin console and `primitive databases` |
+| `client.databases.subscribe(...)` | a server function that writes and then publishes with `ctx.channels.publish`; the app joins the channel with `client.subscribeToChannel` |
+| `client.databases.createOperation`, `getOperation`, `updateOperation`, `deleteOperation` | the operation's logic as a server function |
+| `metadataAccess` on `CreateDatabaseTypeConfigParams`, `UpdateDatabaseTypeConfigParams`, `DatabaseTypeConfigInfo` (`celContextAccess` in the type's TOML), and the type's `defaultAccess` | the function's own `access` gate, and resource metadata categories read as `md.self.<category>.<key>`; `config push` and the type-config routes refuse all three keys by name |
+
+The `db.*` WebSocket frames are retired with subscriptions, so the client
+neither routes them nor re-subscribes on reconnect.
+
+### Added: record-log documents (`documentFormat: 3`)
+
+A Swift app can create, open and use a record-log document through the same
+model facade as any document (`docs/record-log.md`). Additive only — nothing
+existing changes shape:
+
+- `CreateDocumentOptions.documentFormat` accepts `3`; the open resolves a
+  document's format before the handshake, through the documents API when this
+  device never saw it.
+- `DocumentWriteRefusedEvent` gains `writes` (every handed-back write with its
+  values) and `conflictingRecord`, both `nil` for a format-2 refusal; the
+  existing four-parameter initializer is unchanged, and a second one takes
+  both.
+- `JsBaoErrorCode` gains, appended: `documentFormatUnsupported`,
+  `documentConstraintViolated`, `documentEpochFrozen`, `documentStorePurged`,
+  `documentEpochBudget`, `documentEntryTooLarge`, `documentEntryInvalid`,
+  `documentEpochNotOpen`, `writeAccessDenied` — the JS client's strings.
+- `DynamicModel.save(id:values:changedFields:confirm:)` and
+  `CodegenAPI.save(_:id:values:in:changedFields:confirm:)` (async): with
+  `confirm: true` on a record-log document, return once the room has
+  acknowledged the save.
+- `PrimitiveRecord.syncState` (`pending`, `confirmed`, `refused`, or `nil` off
+  format 3) and `PrimitiveRecord.recordLogSeq`.
+- `transact` on a record-log document lands its saves as one entry.
+- A record-log document's store commits saves issued together in one group at
+  `synchronous=NORMAL`: an app or process crash loses nothing; an OS crash or
+  power loss may lose the last few commits. Format-1 storage keeps the
+  provider's own setting.
+
+### Added: a local `aggregate` groups a date field by month, quarter or year (#4266)
+
+`AggregateGroupBy.datePeriod(field:period:)`, with `DatePeriod` `.month`,
+`.quarter` or `.year`, buckets a `.date` (or `.string`) field by calendar
+period, beside any other `groupBy` levels. Its key in `group` is
+`<field>_<period>` and its value `YYYY-MM`, `YYYY-Qn` or `YYYY`, read from the
+stored text with no time-zone conversion — the same buckets js-bao answers for
+the same stored strings. A missing or non-date value is `.null`. A field of
+another type throws `JsBaoError(.invalidArgument)` before anything is read.
+
+```swift
+let monthly = try Transaction.aggregate(AggregateOptions(
+  groupBy: ["categoryId", .datePeriod(field: "date", period: .month)],
+  operations: [AggregateOperation(type: .sum, field: "amount"), AggregateOperation(type: .count)],
+  filter: ["date": ["$gte": "2025-11-01", "$lte": "2026-10-31"]]
+))
+// [["group": ["categoryId": "food", "date_month": "2025-11"], "sum_amount": -50, "count": 2], ...]
+```
+
+An exhaustive `switch` over `AggregateGroupBy` in app code needs the new case.
+
+### Breaking: a local `aggregate` answers rows with a `group` (#4347)
+
+`aggregate` on a model (`DynamicModel`, `MultiDocModel`, a generated
+model's static `aggregate`) now answers the rows the JavaScript client
+answers: each row holds the `groupBy` values under `group`, and every
+operation's value beside it.
+
+```swift
+// before: ["category": "work", "count": 8]
+// after:  ["group": ["category": "work"], "count": 8]
+```
+
+- **Migrate:** read a group value as `row["group"]?["category"]` where you
+  read `row["category"]`. Operation values stay where they were
+  (`row["count"]`, `row["sum_estimatedHours"]`). An aggregate with no
+  `groupBy` is one row whose `group` is empty.
+- A membership key is written raw: `contains: "a-b"` is `has_tags_a-b`, no
+  longer `has_tags_a_b`.
+- Two `groupBy` entries that would share a key in `group` (the same field
+  twice, two identical memberships, or a field named like a membership key)
+  throw `JsBaoError(.invalidArgument)` with
+  `Ambiguous aggregation group keys: '<key>' names more than one groupBy level`.
+  A repeated membership used to come back as `has_<field>_<value>_1`.
+- A `groupBy` field named like an operation key (`count`, `sum_amount`) keeps
+  both values: the group value under `group`, the operation's beside it.
+- An operation with no value to report is present as `null` rather than
+  missing from the row.
+- `group` is the row's own key, so an operation whose `outputField` is
+  `group` throws `JsBaoError(.invalidArgument)` before anything is read; give
+  it another name.
+
+### Breaking: a registered `aggregate` operation's result is rows (#4265)
+
+`DBAggregateResult.result` is now `[[String: JSONValue]]`: one row per group,
+each with a `group` object holding the `groupBy` values and every operation's
+value beside it (`count`, `<op>_<field>`). `DoDb.aggregate` still returns a
+`JSONValue`, now an array of those rows.
+
+### Added: agent session lists and open views stay live (#4380)
+
+`client.agents.sessions.watch(options:)` answers an `AgentSessionList`: the
+first page of `list`, kept current as sessions change — new activity and the
+unread dot, a read mark from the user's other devices, a rename, a status
+change, a member change, a removal or a delete — without polling and without
+opening any document. `items` (`AgentSessionWatchedItem`: the list item, read
+through directly, and the `members` once a change has named them) are
+ordered by last activity, newest first; `loadMore()` reads the next page,
+`refresh()` reads the loaded pages again (the list does this itself after
+every reconnect, merging each field with what the changes already said),
+`onChange` hears every change and `close()` stops it. A `userId` in
+`WatchAgentSessionsOptions` throws `.invalidArgument` before any request.
+
+An open view's `info` now follows the same changes (title, last activity,
+`hasUnread`, members and status) and is read again after a reconnect;
+`AgentSessionInfo`'s `title`, `scope`, `lastActivityAt`, `members` and
+`status` are `internal(set) var` for it. `OpenAgentSessionOptions(markRead:
+.whileOpen)` marks the session read once it is open and again whenever new
+activity arrives while it is open.
+
+`AgentSessionListItem` gains `status: PrimitiveSessionStatus?`, decoded open
+and `nil` for an entry written before it was listed, and each change is the
+`.agentSessionChanged` event (`AgentSessionChangedEvent`, streamed by
+`client.stream(for:)`); a frame that does not decode is dropped with a
+warning.
+
+### Added: agent sessions show unseen activity in the list (#4256)
+
+`AgentSessionListItem` and `AgentSessionInfo` carry `hasUnread` and
+`lastReadAt`: whether the user has activity in the session they have not
+marked read (an agent's answer or pause, a turn's end, or another member's
+message or event) and when they last marked it. Mark a session read with
+`client.agents.sessions.markRead(sessionId:)`, or `view.markRead()` on an
+open session, which also updates the view's `info`. The mark is stored on the
+server, so it holds on every device; the user's own messages, events and
+cancels never make a session unread for them. `hasUnread` decodes as `false`
+when a server does not send it.
+
+### Breaking: `DeferredGrantListResult` drops the `grants` alias (#4282)
+
+#3985 removed the legacy list-envelope keys but missed this page type. The
+deprecated `grants` property and the `init(grants:nextCursor:hasMore:)`
+initializer are gone, and the decoder reads only `items`, `hasMore` and
+`nextCursor`. The server has sent only `items` since #3985, so `grants` was
+already an alias of `items`, not a key on the wire.
+
+Migration: read `page.items` where you read `page.grants`, and build pages
+with `init(items:nextCursor:hasMore:)`.
+
+### Breaking: `runSync`, `client.prompts`, `client.integrations` and the operation execute methods are removed (#3188)
+
+The client methods that called a member route for a one-request workflow run,
+a prompt, an integration or a registered database operation are gone with
+those routes. Each piece of work now runs inside a server function the app
+calls with `client.functions.invoke`:
+
+| Removed | Use instead |
+|---|---|
+| `client.workflows.runSync(...)` (both overloads), `RunSyncWorkflowResult`, `RunSyncResult<Output>` | `client.functions.invoke(...)` for a result in one request, or `client.workflows.start(...)` and `client.workflows.waitFor(runId:)` for a workflow run |
+| `client.prompts.execute(...)`, `PromptsAPI` and its option and result types | `ctx.prompts.run(...)` inside a function |
+| `client.integrations.call(...)`, `IntegrationsAPI` and its request and response types | `ctx.integrations.call(...)` inside a function |
+| `client.databases.executeOperation(...)` (both overloads), `ExecuteOperationOptions` | `ctx.db(...)` inside a function |
+| `client.databases.executeBatch(...)`, `client.databases.importRows(...)`, `client.databases.importCsv(...)`, `DatabaseBatchOperation`, `DatabaseBatchResult`, `CsvImportOptions`, `CsvImportResult` | write the rows from a function, or `primitive databases import-csv` |
+| `client.databases.listOperations(databaseId:)` | `primitive databases operations list` (owner or admin) |
+
+`createOperation`, `getOperation`, `updateOperation`, `deleteOperation` and
+`DatabaseOperationInfo` stay unchanged for now; they are removed together with
+database operations in a later release. The generated
+`workflows codegen --lang swift` invokers no longer carry `runSync`, and the
+generated `databases codegen --lang swift` files no longer carry an `Ops`
+factory.
+
+### Run an agent's client tools with `view.handleClientTools` (#4263)
+
+Register an `AgentClientToolHandler` per client tool on an `AgentSessionView`,
+and the view answers the tool's calls for you: when the active turn is the
+current user's, each call of a named tool that waits for its result runs its
+handler, and the handler's `AgentClientToolResult` answers it. Calls already
+waiting when you register, or found again when the session's document
+re-syncs after a reconnect, run too. Build a handler untyped over `JSONValue`,
+or with `AgentClientToolHandler.typed` over the generated
+`<Base>Tool<Name>Input` / `Output` types; an input that does not decode or an
+output that does not encode answers the call with the error.
+
+A thrown error answers the call with its message. A lost race is silent; any
+other failed answer reaches `HandleClientToolsOptions.onError`, with the
+server's `code` for a refusal and none for an offline or network failure,
+which runs again on the next refresh or re-sync. `runningClientToolCalls`
+lists the calls a handler is running now. `close()` cancels running handlers
+and sends no answer after it.
+
+### Fixed: a large document keeps writing when its epoch moves during a write (#4228)
+
+When the server refused a write it could not integrate just after it sealed
+the document's epoch, its `epoch.resync` named the epoch the seal opened, and
+the client stopped the document with `FORMAT2_RELOAD_REQUIRED` (plan
+`epoch.resync`). The client now asks the server for the document's epochs
+again and catches up onto that epoch, as it does when a seal leaves it behind,
+then goes on writing with no reload. When the sealed epoch was a bulk load, its
+unacknowledged writes wait for the new base instead of being sent across it.
+
+### A large document's string sets are read sorted, and keep every spelling (#3881)
+
+A `stringset` field is a set, and a large document now returns its values in
+one order: sorted by Unicode code point (`"Z"` before `"a"`), each value once.
+The folded record and `members(model:recordId:field:)` answer that order,
+which is the order the server and the JS client return. Two values Swift
+`String` calls equal but that are spelled with different code points (`"é"`
+as one code point, or as `e` plus a combining accent) stay two values through
+an arriving update, a snapshot load and the fold, as they are everywhere else;
+removing one leaves the other. A local store written before this release reads
+sorted without being rewritten. `OverlayRecordEntry.stringSets` and
+`OverlayMutation.stringSetDeltas` key members by `ByteKey`, which now orders
+by bytes and can be written as a string literal.
+
+### `client.agents.sessions`: agent sessions from Swift (#3810)
+
+The Swift client carries the agent sessions surface the JS client has, one
+operation for one: `list`, `get`, `rename`, `delete`, `addMember`,
+`removeMember`, `send` (with file blobs and the turn-context keys `context`,
+`timezone` and `locale`), `answer`, `cancel`, `recordEvent`, and `open`, which
+answers a live `AgentSessionView`:
+
+```swift
+let view = try await client.agents.sessions.open(sessionId: sessionId)
+let stop = view.onChange { render(view.messages) }
+try await view.send(text: "Plan my week")
+```
+
+A refusal throws `HttpError` with the server's code on `serverCode`
+(`AGENT_SESSION_NOT_FOUND`, `AGENT_SESSION_PARTICIPANT_ONLY`, …). Two
+client-side codes join `JsBaoErrorCode`: `.agentSessionNoActiveTurn` and
+`.agentSessionModelNameTaken`. Read a part through its typed `content`; the AI
+SDK `uiMessages()` adapter is the JS client's only.
+
+### `me.update` accepts only `http:` and `https:` avatar URLs (#4156)
+
+`client.me.update(params:)` now throws a 400 when the avatar URL is not an
+`http:` or `https:` URL, with the message `avatarUrl must be an http or https
+URL`. A `javascript:` or `data:` URL used to be stored; it is refused and
+nothing is written. `avatarUrl: .clear` still removes the avatar, and an
+uploaded avatar (`uploadAvatar(imageData:contentType:)`) is unaffected. The
+admin and server-function profile writes apply the same rule.
+
+### Breaking: `validateAccess` no longer answers `DOCUMENT_DELETED` (#4159)
+
+`documents.validateAccess(documentId:userId:)` on a document the server does
+not hold — one that was deleted, one that never existed, or one in another
+app — now throws an `HttpError` with status 404 and `serverCode` `NOT_FOUND`,
+the answer every other document route gives. The old `DOCUMENT_DELETED` code
+is gone; an app that matched on it should match on `NOT_FOUND` (or on status
+404).
+
+`validateAccess` on a document just made with `documents.create`, whose
+create has not reached the server yet, no longer reports it missing. Online,
+the call waits for the commit and then answers, so the creator gets
+`hasAccess == true` and `permission == .owner`. Offline, when the client goes
+offline during the wait, or when the commit has not landed within 30 seconds,
+it throws `JsBaoError` with code `.pendingCreate` and
+`details["documentId"]`.
+
+A create committed over HTTP now emits `PendingCreateCommittedEvent` even when
+the document is not open, as the JS client does; before, only the WebSocket
+confirmation emitted it.
+
+### Fixed: an open that waits on the network always settles inside `availabilityWait`, and `setLogLevel` traces it (#4191)
+
+An `openDocument` that has to wait for the server (no local copy, or
+`waitForLoad: .network`) now resolves or throws `.networkTimeout` within
+`availabilityWait` of starting that wait, whatever is still in flight. The
+budget used to start only once the open's first `syncStep1` send returned, so
+an open whose send was held up neither resolved nor threw; and a
+`syncComplete` that arrived while that send was in flight was missed, leaving
+the open to wait out its whole budget for a document that had already synced.
+
+`client.setLogLevel(_:)` now changes every component logger, not only the
+client's root one, so a runtime `setLogLevel(.debug)` reaches the document,
+HTTP and documents-API lines it used to leave silent. With debug on, an open
+logs an `[open]` trace: its start, the local open (origin, local data, whether
+it waits), the network wait and its budget, each `syncStep2` download (start,
+end, byte count) and apply, and the event that resolved or failed it. A large
+document adds its handshake plan and each fold (`[format2] folded`). The
+`.networkTimeout` warning now says how far the handshake got. The
+`EventEmitter` log category is now `JsBaoClient:EventEmitter`.
+
+### List a user's function runs and a run's steps from `client.functions` (#4145)
+
+`client.functions.listRuns(options:)` answers one page of the function runs the
+signed-in user started, as `FunctionRunPage` (`items: [FunctionRunInfo]`,
+`hasMore`, `nextCursor`, `scanned`). `FunctionRunListOptions` filters by
+`functionKey`, `contextDocId` and `status` (they combine) and pages with
+`limit`, `cursor` and `forward`:
+
+```swift
+let page = try await client.functions.listRuns(
+    options: FunctionRunListOptions(contextDocId: documentId, status: "running")
+)
+```
+
+`client.functions.listRunSteps(runId:)` answers the run's recorded steps,
+oldest first, as `FunctionRunSteps` (`items: [FunctionStepRun]`). A run id that
+does not exist or that another user started throws `.notFound`; an empty one
+throws `.invalidArgument`.
+
+Both read the new `GET functions/runs` routes and reference no workflow type,
+so an app can move off the deprecated `workflows.listRuns` /
+`workflows.listStepRuns` now. An item the client cannot decode is dropped
+rather than failing the page.
+
+### Breaking: the email sign-in request aliases are removed (#3993)
+
+Email sign-in starts with one call, `auth.emailSignInRequest(email:redirectUri:)`
+(or `emailSignInRequest(_: EmailSignInRequestParams)`), which returns
+`EmailSignInRequestResult`. It sends one email carrying a 6-digit code and,
+when the redirect target is on the app's allow-list, a sign-in link; finish
+with `otpVerify` or `magicLinkVerify` as before.
+
+- Removed: `auth.magicLinkRequest`, `auth.otpRequest`, `client.magicLinkRequest`,
+  `client.otpRequest`, `MagicLinkRequestParams`, `MagicLinkRequestResult` and
+  `OtpRequestResult`. Call `auth.emailSignInRequest(email:redirectUri:)`, with
+  a `redirectUri` for an email that carries a link and without one for a
+  code-only email.
+- Removed: `AuthConfigInfo.magicLinkEnabled` and `AuthConfigInfo.otpEnabled`.
+  Read `AuthConfigInfo.emailSignInEnabled`, which now decodes from its own key
+  alone (absent reads `false`).
+- Renamed: `AppConfigInfo.magicLinkEnabled` is `AppConfigInfo.emailSignInEnabled`,
+  including the memberwise initializer's parameter.
+- Removed: the `magicLinkRequest:` and `otpRequest:` parameters of
+  `AuthAPI.init`. Wire `emailSignInRequest:` instead.
+
+The server no longer serves `POST /auth/magic-link/request` or
+`POST /auth/otp/request`, so an older client calling either method gets a 404.
+
+### `HttpClient`'s untyped `request` / `requestRaw` are removed (#4005)
+
+`HttpClient.request(method: String, path:, data: Any?) -> Any?` and
+`requestRaw(method: String, path:, data: Any?)` were the last `Any` methods on
+the public `HttpClient` class, left over when #2367 removed the client-level
+untyped entry points. No app could call them: `HttpClientConfig`'s initializer
+is internal, so an `HttpClient` exists only inside `JsBaoClient`. Document
+metadata sync and the offline-create commit now read the server's answer
+through the typed `Transport` helpers.
+
+One visible difference: a 2xx answer to `syncMetadata` or to a pending-create
+commit whose body is not JSON used to be ignored silently. It now fails the
+call with an `HttpError` (decoding failure), as it does in the JS client. A
+single-document sync that fails this way keeps the local row; only a 404 or
+403 evicts.
+
+### Breaking: the database CEL context is removed (#3991)
+
+The per-database `metadata`/`celContext` dict is gone. `DatabaseInfo` no
+longer has `metadata` or `celContext`; `CreateDatabaseParams` keeps only its
+plain initializer (`title`, `databaseType`, `initialMetadata`); and
+`DatabasesAPI` loses `getCelContext`, `updateCelContext`, `getMetadata` and
+`updateMetadata`, with the `CelContextResult` type. The server no longer
+serves `databases/{databaseId}/metadata`, answers `400` to a create that sends
+`metadata` or `celContext`, and refuses a rule naming `database.metadata` or
+`database.celContext` when it is saved. The CEL `database` object exposes only
+`id`.
+
+Migration: keep per-database values in a resource metadata category. Stamp
+them at create with `initialMetadata` (`["settings": ["teamId": .string("t1")]]`),
+change them at `resources/database/{databaseId}/metadata/{category}`, and read
+them from rules as `md.self.<category>.<key>`.
+
+### Breaking: blob buckets drop `accessPolicy` (#3996)
+
+A bucket's access is `preset` (or a `ruleSetId` for a custom bucket). The
+`BlobBucketAccessPolicy` enum and `BlobBucketInfo.accessPolicy` are removed,
+and the `accessPolicy:` label is gone from `CreateBlobBucketParams.init` and
+`UpdateBlobBucketParams.init`, so a call that passes it no longer compiles.
+Read `bucket.preset` and pass `preset:` with the mapped value: `.publicRead` →
+`.publicAccess`, `.authenticated` → `.authenticated`, `.ownerOnly` →
+`.adminOnly` (it always meant app admins; `.personalUploads` is the preset for
+uploader-scoped access). The server refuses a body that still carries
+`accessPolicy` with 400 `RETIRED_REQUEST_KEY`. `BlobBucketInfo` now uses
+synthesized `Decodable`, so a response from an older server that still
+carries the key still decodes.
+
+### A stalled task run ends with `FUNCTION_STALLED`, and its slice shows its last progress (#3766)
+
+The platform now ends a task run whose engine reports it running but which has
+shown no progress for 30 minutes past its open step's own timeout and next
+retry delay. The run reads `failed` with error code `FUNCTION_STALLED`. A
+sleep, a wait, a retry delay and a long step within its own `timeout` never
+count.
+
+`FunctionRunSlice` gains four optional properties, `nil` when unknown:
+`lastProgressAt`, the newest instant the platform saw the run do anything;
+`openStep` and `openStepStartedAt`, the step it is inside; and `parkedAt`, when
+it began waiting. The memberwise initializer takes them as trailing defaulted
+parameters, so existing calls compile unchanged.
+
+### Breaking: `AnalyticsEventInput.user_created_at_epoch_s` is removed (#4003)
+
+The field was deprecated in the 2026-09-30 release. The server records when
+the user joined the app and ignored the value, so the stored property and the
+`user_created_at_epoch_s:` initializer parameter are gone, and neither
+`asJSONObject()` nor `asDictionary()` emits the key. Delete the argument from
+any `AnalyticsEventInput(...)` call.
+
+The other JS removals in this release have no Swift counterpart: `waitForSync`
+was already removed (#2367), and the rest never existed here.
+
+### Breaking: page types carry `nextCursor` only (#3985)
+
+Every list endpoint answers `{ items, hasMore, nextCursor? }`; the server no
+longer sends a `cursor` alias of `nextCursor` or a `documents` key beside
+`items`. The page types follow: the deprecated `cursor` property and the
+`cursor:` initializer parameter are gone from `PaginatedResult`,
+`DocumentListPage`, `SharedDocumentListResult`, `DocumentBlobListResult`,
+`BucketBlobListResult`, `InvitationListResult` and `ListWorkflowRunsResult`,
+and their decoders read only `items`, `hasMore` and `nextCursor`.
+`NotificationListResult` replaces `cursor` with `hasMore` and `nextCursor`.
+
+Migration: read `page.nextCursor` where you read `page.cursor`, and build
+pages with `nextCursor:`. The request parameter is still named `cursor`.
+
+### HTTP calls throw `.offline` while networking is off (#4025)
+
+An HTTP call made while the client may not use the network now throws
+`JsBaoError` with code `.offline` and does not attempt the request. That is
+the case when the app pinned `.offline`, and in `.auto` when no network is
+reachable. Before, the request went out anyway: it failed in transit with
+`JsBaoNetworkError`, or, with the mode pinned `.offline` and a network
+available, it succeeded. The JS client already behaved this way (`OFFLINE`).
+
+This covers every namespace (`client.documents`, `client.me`,
+`client.databases`, …) and `client.request`, `requestJSON` and `requestData`.
+The error's `details` carry `method` and `path`. A request that is attempted
+and fails in transit still throws `JsBaoNetworkError`. Calls in `client.auth`
+and the blob manager's queued uploads and downloads are not gated.
+
+If you catch `JsBaoNetworkError` to detect "no network", also catch
+`JsBaoError` with code `.offline`.
+
+### Breaking: collection `contextId` is removed (#3926)
+
+`CollectionInfo.contextId`, `CreateCollectionParams.contextId` and the
+deprecated `CreateCollectionParams(…, contextId:)` initializer are gone. The
+server no longer returns the field and refuses a create that sends it.
+
+Migration: bind the collection with a resource metadata category instead —
+declare the category, list it in the collection type config's
+`metadataManifest`, pass it as `initialMetadata` when you create the collection,
+and read it in rules as `md.self.<category>.<key>`. Copy the value of any
+existing collection into that category before the release that removes the
+field is deployed; the collections docs ("Migrating off `contextId`") give the
+recipe.
+
+### The blocking `locks.acquire` waits server-side (#3930)
+
+`acquire(key:ttl:timeout:owner:)` now asks the server to wait for the key on
+every poll (`waitMs`, at most 30 s and never more than the time left), so a
+release is noticed within a second and a wait costs one acquire attempt per
+half-minute rather than one per poll. The signature, the backoff after an
+early answer, the 429 handling and the `.lockTimeout` error are unchanged, and
+`tryAcquire` sends exactly the body it did. Additive: nothing to migrate.
+
 ### Breaking: the direct LLM and Gemini sub-APIs are removed (#3857)
 
 All LLM access goes through prompts. `client.llm` and `client.gemini` are gone,

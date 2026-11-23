@@ -70,7 +70,20 @@ public struct QueryOptions: Sendable {
     /// `nil` returns every field.
     public var projection: [String: Int]?
 
-    /// `offset` was removed in #2367: offset paging is unstable in
+    /// Scope the read to these db3s: `documents` under its db3 name. A db3 it
+    /// names that is not resident on this device (its rows not loaded here)
+    /// is refused `DB3_NOT_RESIDENT`, where `documents` leaves it out. Both
+    /// set with different values is refused `.invalidArgument`.
+    public var db3: [String]?
+
+    /// Refuse a device answer from a db3 copy further behind the server than
+    /// this, `DB3_DRIFT_EXCEEDED`, instead of answering it. Judged on the
+    /// drift read with the rows; it never waits. A synced db3 that has not
+    /// heard the server's position yet is always refused, a db3 that lives
+    /// only on this device always passes, and a format-1 read ignores it.
+    public var maxDrift: Db3MaxDrift?
+
+    /// `offset` was removed: offset paging is unstable in
     /// CRDT-backed datasets, because a concurrent insert from another client
     /// shifts the rows before offset N and makes the same row appear twice or
     /// be skipped across a page boundary. Page with `cursor` + `direction`
@@ -84,7 +97,9 @@ public struct QueryOptions: Sendable {
         cursor: String? = nil,
         direction: CursorDirection = .forward,
         documents: [String]? = nil,
-        projection: [String: Int]? = nil
+        projection: [String: Int]? = nil,
+        db3: [String]? = nil,
+        maxDrift: Db3MaxDrift? = nil
     ) {
         self.sort = sort
         self.sortOrder = sortOrder
@@ -93,8 +108,56 @@ public struct QueryOptions: Sendable {
         self.direction = direction
         self.documents = documents
         self.projection = projection
+        self.db3 = db3
+        self.maxDrift = maxDrift
     }
 
+}
+
+/// The documents a read is scoped to, from its `documents` and `db3` forms:
+/// `nil` for none, refused `.invalidArgument` when both name different ids.
+func resolvedDocumentScope(documents: [String]?, db3: [String]?) throws -> [String]? {
+    guard let db3 else { return documents }
+    guard let documents else { return db3 }
+    guard Set(documents) == Set(db3) else {
+        throw JsBaoError(
+            code: .invalidArgument,
+            message: "A read names both `documents` and `db3` with different ids; `db3` is `documents` under its db3 "
+                + "name, so pass one of them.",
+            details: ["documents": .array(documents.map { .string($0) }), "db3": .array(db3.map { .string($0) })]
+        )
+    }
+    return documents
+}
+
+extension QueryOptions {
+    /// The documents the read is scoped to: `documents` or its `db3` form.
+    func documentScope() throws -> [String]? {
+        try resolvedDocumentScope(documents: documents, db3: db3)
+    }
+
+    /// The sort a paged query runs: `sortOrder` when set, else `sort`'s
+    /// fields in name order, with `id` ascending appended as the tiebreaker
+    /// when the sort lacks it, as js-bao's `extractSortFields` does.
+    var pagingSort: (fields: [String], directions: [Int]) {
+        var fields: [String]
+        var directions: [Int]
+        if let ordered = sortOrder, !ordered.isEmpty {
+            fields = ordered.map { $0.0 }
+            directions = ordered.map { $0.1 == -1 ? -1 : 1 }
+        } else if let sort, !sort.isEmpty {
+            fields = sort.keys.sorted()
+            directions = fields.map { sort[$0] == -1 ? -1 : 1 }
+        } else {
+            fields = []
+            directions = []
+        }
+        if !fields.contains("id") {
+            fields.append("id")
+            directions.append(1)
+        }
+        return (fields, directions)
+    }
 }
 
 /// Ordering spec for aggregation results. `field` can name either a
@@ -112,19 +175,51 @@ public struct AggregateSort: Sendable {
     }
 }
 
-/// A group-by clause: a plain field, or a StringSet-membership check
-/// (`{ field, contains }`). Mirrors js-bao's `GroupByField`
-/// (`string | StringSetMembership`). A bare string literal is a field,
-/// so existing `groupBy: ["category"]` call sites keep working; a
+/// A calendar period a `.date` field can be grouped by.
+public enum DatePeriod: String, Sendable, Equatable {
+    case month, quarter, year
+}
+
+/// A group-by clause: a plain field, a StringSet-membership check
+/// (`{ field, contains }`), or a calendar period of a date field
+/// (`{ field, period }`). Mirrors js-bao's `GroupByField`
+/// (`string | StringSetMembership | DatePeriodGroup`). A bare string literal
+/// is a field, so existing `groupBy: ["category"]` call sites keep working; a
 /// stringset *field* name groups by member value (facet), and
 /// `.stringSetMembership` groups by whether the set contains a value.
+///
+/// `.datePeriod` groups a `.date` or `.string` field by the calendar month,
+/// quarter or year of its stored text, with no time-zone conversion. Its key
+/// in a row's `group` is `<field>_<period>` (`dueDate_month`), holding
+/// `YYYY-MM`, `YYYY-Qn` or `YYYY`; a missing value, or text that does not
+/// begin `YYYY-MM`, is `.null`. A field of any other type throws
+/// `JsBaoError(.invalidArgument)` before anything is read.
 public enum AggregateGroupBy: Sendable, Equatable, ExpressibleByStringLiteral {
     case field(String)
     case stringSetMembership(field: String, contains: String)
+    case datePeriod(field: String, period: DatePeriod)
     public init(stringLiteral value: String) { self = .field(value) }
 }
 
 /// Options for aggregate operations.
+///
+/// `aggregate` answers one row per group, as js-bao does. Each row holds the
+/// `groupBy` values under `group`, keyed by the field name (or
+/// `has_<field>_<contains>` for a membership check, `<field>_<period>` for a
+/// period level) with the value as stored,
+/// and every operation's value beside it under its `resultKey`:
+///
+/// ```swift
+/// ["group": ["category": "work"], "count": 8, "sum_estimatedHours": 40]
+/// ```
+///
+/// An aggregate with no `groupBy` is one row with an empty `group`. Two
+/// levels that would share a key in `group` (the same field twice, or a field
+/// named like a membership key) throw `JsBaoError(.invalidArgument)`,
+/// `Ambiguous aggregation group keys: '<key>' names more than one groupBy
+/// level`, before anything is read.
+/// An operation whose `resultKey` is `group` throws
+/// `JsBaoError(.invalidArgument)` too: that key holds the group values.
 public struct AggregateOptions {
     /// Fields to group by
     public var groupBy: [AggregateGroupBy]
@@ -138,7 +233,7 @@ public struct AggregateOptions {
     /// Optional cap on returned groups.
     public var limit: Int?
     /// Aggregate only these documents, with exactly the meaning `documents`
-    /// has on `QueryOptions` (#3760). `nil` applies no scope of its own; an
+    /// has on `QueryOptions`. `nil` applies no scope of its own; an
     /// explicit EMPTY list matches nothing.
     ///
     /// On a model bound to ONE document the option NARROWS rather than
@@ -147,6 +242,10 @@ public struct AggregateOptions {
     /// groups. Appended last, and defaulted, so every existing call site
     /// compiles unchanged.
     public var documents: [String]?
+    /// Aggregate only these db3s: `documents` under its db3 name, refusing a
+    /// db3 not resident on this device `DB3_NOT_RESIDENT` (see
+    /// ``QueryOptions/db3``).
+    public var db3: [String]?
 
     public init(
         groupBy: [AggregateGroupBy] = [],
@@ -154,7 +253,8 @@ public struct AggregateOptions {
         filter: DocumentFilter? = nil,
         sort: AggregateSort? = nil,
         limit: Int? = nil,
-        documents: [String]? = nil
+        documents: [String]? = nil,
+        db3: [String]? = nil
     ) {
         self.groupBy = groupBy
         self.operations = operations
@@ -162,6 +262,7 @@ public struct AggregateOptions {
         self.sort = sort
         self.limit = limit
         self.documents = documents
+        self.db3 = db3
     }
 }
 

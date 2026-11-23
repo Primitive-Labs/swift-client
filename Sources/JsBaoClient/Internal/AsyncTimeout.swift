@@ -4,7 +4,7 @@ extension TimeInterval {
     /// This interval as the whole milliseconds the wire format,
     /// `withTimeout(ms:)` and the client's own millisecond thresholds speak.
     ///
-    /// The `*Ms: Int` → `TimeInterval` migration (#2367) turned this
+    /// The `*Ms: Int` → `TimeInterval` migration turned this
     /// conversion into a repo-wide idiom at every wire boundary, so it has one
     /// home rather than nine copies. The JSON keys did not change — only the
     /// Swift parameters did.
@@ -63,7 +63,7 @@ struct AsyncTimeoutError: Error {}
 /// constraint the Swift 6 language mode requires.
 ///
 /// Shared by every `serverTimeoutMs` implementation in the client so the
-/// bound means the same thing everywhere (#2360); the timeout *policy* on
+/// bound means the same thing everywhere; the timeout *policy* on
 /// expiry stays with each caller.
 func withTimeout<R: Sendable>(
     ms: Int,

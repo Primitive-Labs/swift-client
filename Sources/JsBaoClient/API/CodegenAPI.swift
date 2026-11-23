@@ -10,7 +10,7 @@ import Foundation
 /// so ~20 codegen-backing entry points stay out of `client.`'s autocomplete
 /// without hiding them from the generated code that needs them.
 ///
-/// ## Why a facade rather than `@_spi(Codegen)` (#2367)
+/// ## Why a facade rather than `@_spi(Codegen)`
 ///
 /// SPI narrows *discoverability*, not access, and — decisively — it is not
 /// re-exported through `@_exported import JsBaoClient`. `PrimitiveApp`
@@ -60,6 +60,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// position), so when the owning client has been released it returns a
     /// detached target whose `query` throws `.unavailable` — the include fails
     /// where it is resolved, with a message, rather than trapping here.
+    /// - Stability: production
     public func includeTarget(for schema: PrimitiveSchema) -> any IncludeTarget {
         guard let client else { return DetachedIncludeTarget(modelName: schema.name) }
         return client.sharedModel(for: schema)
@@ -68,17 +69,19 @@ public final class CodegenAPI: @unchecked Sendable {
     // MARK: - Reads
 
     /// Cross-document query → raw rows. The facade maps rows to the model type.
+    /// - Stability: production
     public func query(
         _ schema: PrimitiveSchema,
         filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
     ) throws -> [[String: JSONValue]] {
-        try requireClient("query").sharedModel(for: schema).query(filter, options: options)
+        try requireClient("query").sharedModel(for: schema).query(Self.storedFilter(schema, filter), options: Self.storedOptions(schema, options))
     }
 
     /// Cross-document query with query-time relationship includes. Returns raw
     /// rows with related records attached under `_related`, matching JS
     /// `BaseModel.query(filter, { include })`.
+    /// - Stability: production
     public func query(
         _ schema: PrimitiveSchema,
         filter: DocumentFilter? = nil,
@@ -86,24 +89,26 @@ public final class CodegenAPI: @unchecked Sendable {
         include: [Include]
     ) throws -> [[String: JSONValue]] {
         try requireClient("query").sharedModel(for: schema)
-            .query(filter, options: options, include: include)
+            .query(Self.storedFilter(schema, filter), options: Self.storedOptions(schema, options), include: Self.storedIncludes(schema, include))
     }
 
     /// Cross-document paginated query → raw rows + cursors. The facade maps
     /// rows to the model type while preserving `nextCursor`/`prevCursor`/
     /// `hasMore` — so a caller passing `options.cursor`/`options.limit` can
     /// actually obtain the next page. Mirrors js-bao's `BaseModel.query()`
-    /// return shape (#946); ``query(_:filter:options:)`` stays the flat-array
+    /// return shape; ``query(_:filter:options:)`` stays the flat-array
     /// convenience.
+    /// - Stability: production
     public func queryPaged(
         _ schema: PrimitiveSchema,
         filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
     ) throws -> PagedQueryResult<PrimitiveRow> {
-        try requireClient("queryPaged").sharedModel(for: schema).queryPaged(filter, options: options)
+        try requireClient("queryPaged").sharedModel(for: schema).queryPaged(Self.storedFilter(schema, filter), options: Self.storedOptions(schema, options))
     }
 
     /// Cross-document paginated query with query-time relationship includes.
+    /// - Stability: production
     public func queryPaged(
         _ schema: PrimitiveSchema,
         filter: DocumentFilter? = nil,
@@ -111,38 +116,44 @@ public final class CodegenAPI: @unchecked Sendable {
         include: [Include]
     ) throws -> PagedQueryResult<PrimitiveRow> {
         try requireClient("queryPaged").sharedModel(for: schema)
-            .queryPaged(filter, options: options, include: include)
+            .queryPaged(Self.storedFilter(schema, filter), options: Self.storedOptions(schema, options), include: Self.storedIncludes(schema, include))
     }
 
-    /// Cross-document count.
-    public func count(_ schema: PrimitiveSchema, filter: DocumentFilter? = nil) throws -> Int {
-        try requireClient("count").sharedModel(for: schema).count(filter)
+    /// Cross-document count. `options` scopes it (`documents`, `db3`) and
+    /// bounds a db3's drift (`maxDrift`, refused `DB3_DRIFT_EXCEEDED` as a
+    /// page is); sort and paging do not apply to a count.
+    /// - Stability: production
+    public func count(_ schema: PrimitiveSchema, filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> Int {
+        try requireClient("count").sharedModel(for: schema).count(Self.storedFilter(schema, filter), options: Self.storedOptions(schema, options))
     }
 
     /// First record with `id` across every open doc (raw row), or `nil`.
     /// Answers `nil` once the owning client has been released — the same
     /// answer it gives for a record that isn't there.
+    /// - Stability: production
     public func find(_ schema: PrimitiveSchema, id: String) -> [String: JSONValue]? {
         client?.sharedModel(for: schema).find(id: id)?.row
     }
 
     /// First record matching a unique `constraint` and `value` across every
     /// open doc (raw row), or `nil`. Mirrors js-bao's `BaseModel.findByUnique`.
+    /// - Stability: production
     public func findByUnique(
         _ schema: PrimitiveSchema, constraint: String, value: PrimitiveValue
     ) throws -> [String: JSONValue]? {
         try requireClient("findByUnique").sharedModel(for: schema)
-            .findByUnique(constraint: constraint, value: value)?.row
+            .findByUnique(constraint: Self.constraintName(schema, constraint), value: value)?.row
     }
 
     /// First record matching `filter` across every open doc (raw row), or
     /// `nil` — `query(...).first`. Mirrors js-bao's `BaseModel.queryOne`.
+    /// - Stability: production
     public func queryOne(
         _ schema: PrimitiveSchema,
         filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
     ) throws -> [String: JSONValue]? {
-        try requireClient("queryOne").sharedModel(for: schema).query(filter, options: options).first
+        try requireClient("queryOne").sharedModel(for: schema).query(Self.storedFilter(schema, filter), options: Self.storedOptions(schema, options)).first
     }
 
     /// First record matching `filter` across every open doc with query-time
@@ -155,6 +166,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// overloads stay consistent with each other; the include resolver runs over
     /// the full match set and the first row (with its `_related`) is returned. A
     /// filter that matches nothing returns `nil` with no related decode.
+    /// - Stability: production
     public func queryOne(
         _ schema: PrimitiveSchema,
         filter: DocumentFilter? = nil,
@@ -162,24 +174,47 @@ public final class CodegenAPI: @unchecked Sendable {
         include: [Include]
     ) throws -> [String: JSONValue]? {
         try requireClient("queryOne").sharedModel(for: schema)
-            .query(filter, options: options, include: include).first
+            .query(Self.storedFilter(schema, filter), options: Self.storedOptions(schema, options), include: Self.storedIncludes(schema, include)).first
     }
 
     /// Aggregate (group / count / sum / avg / …) across every open document.
+    /// - Stability: production
     public func aggregate(
         _ schema: PrimitiveSchema, options: AggregateOptions
     ) throws -> [[String: JSONValue]] {
-        try requireClient("aggregate").sharedModel(for: schema).aggregate(options)
+        let names = schema.fieldNames
+        let sent = Self.storedAggregate(schema, options)
+        let rows = try requireClient("aggregate").sharedModel(for: schema).aggregate(sent)
+        guard !names.isEmpty else { return rows }
+        // Group and operation keys answer under the fields' current names:
+        // only the keys the request's own levels and operations make over a
+        // renamed field are renamed.
+        let keys = Self.currentAggregateKeys(names, sent: sent)
+        guard !keys.group.isEmpty || !keys.row.isEmpty else { return rows }
+        return rows.map { row in
+            var out: [String: JSONValue] = [:]
+            for (key, value) in row {
+                if key == "group", case .object(let group) = value {
+                    var renamed: [String: JSONValue] = [:]
+                    for (g, v) in group { renamed[keys.group[g] ?? g] = v }
+                    out[key] = .object(renamed)
+                } else {
+                    out[keys.row[key] ?? key] = value
+                }
+            }
+            return out
+        }
     }
 
     /// Subscribe to any add/update/delete in any open doc's copy of the model.
     ///
-    /// The callback is `@Sendable` (#1992): it runs on whichever thread
+    /// The callback is `@Sendable`: it runs on whichever thread
     /// committed the change — a local writer's thread, or the observer-drain
     /// queue — so state it captures must be safe to touch from either.
     ///
     /// Once the owning client has been released there is nothing left to
     /// observe, so this registers nothing and returns a no-op unsubscribe.
+    /// - Stability: production
     public func subscribe(
         _ schema: PrimitiveSchema, _ callback: @escaping @Sendable () -> Void
     ) -> @Sendable () -> Void {
@@ -196,7 +231,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// - Parameter changedFields: the fields the caller actually assigned,
     ///   js-bao's `_localChanges`. On an update only these are written, so a
     ///   save built from a stale fetch doesn't re-write — and clobber — the
-    ///   fields another device changed concurrently (#2459). `nil` means "no
+    ///   fields another device changed concurrently. `nil` means "no
     ///   tracking information": every supplied value counts as a change.
     ///   Either way an update still drops values that already equal what's
     ///   persisted — see `DynamicModel.save(id:values:changedFields:)`.
@@ -206,7 +241,8 @@ public final class CodegenAPI: @unchecked Sendable {
     /// than assuming its own values won: on an update the fields it didn't
     /// write keep whatever another device put there, and on an insert the
     /// schema defaults and `auto_stamp` values are filled in. The generated
-    /// `save(in:)` rebuilds its return value from this (#2459).
+    /// `save(in:)` rebuilds its return value from this.
+    /// - Stability: production
     @discardableResult
     public func save(
         _ schema: PrimitiveSchema, id: String,
@@ -215,6 +251,40 @@ public final class CodegenAPI: @unchecked Sendable {
     ) throws -> PrimitiveRecord {
         try requireClient("save").requireMember(schema, in: docId)
             .save(id: id, values: values, changedFields: changedFields)
+    }
+
+    /// ``save(_:id:values:in:changedFields:)``, and on a record-log
+    /// (format-3) document, with `confirm: true`, return once the room has
+    /// acknowledged the save — throwing the hand-back's error when it refuses
+    /// it. See `DynamicModel.save(id:values:changedFields:confirm:)`.
+    /// - Stability: production
+    @discardableResult
+    public func save(
+        _ schema: PrimitiveSchema, id: String,
+        values: [String: PrimitiveValue], in docId: String,
+        changedFields: Set<String>? = nil,
+        confirm: Bool
+    ) async throws -> PrimitiveRecord {
+        try await requireClient("save").requireMember(schema, in: docId)
+            .save(id: id, values: values, changedFields: changedFields, confirm: confirm)
+    }
+
+    /// ``save(_:id:values:in:changedFields:)`` with a db3 write's guards: on a
+    /// record-log (format-3) document `options.condition` and
+    /// `options.ifNotExists` ride the save and the room judges them, and with
+    /// `options.confirm` it returns once the room acknowledged the save,
+    /// throwing its refusal. On any other document the options are ignored.
+    /// See `DynamicModel.save(id:values:changedFields:options:)`.
+    /// - Stability: production
+    @discardableResult
+    public func save(
+        _ schema: PrimitiveSchema, id: String,
+        values: [String: PrimitiveValue], in docId: String,
+        changedFields: Set<String>? = nil,
+        options: Db3WriteOptions
+    ) async throws -> PrimitiveRecord {
+        try await requireClient("save").requireMember(schema, in: docId, source: "save")
+            .save(id: id, values: values, changedFields: changedFields, options: Self.storedWriteOptions(schema, options))
     }
 
     /// Insert-or-update a record in document `docId`, matched by the
@@ -234,6 +304,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// - Parameter changedFields: the fields the caller actually assigned
     ///   (see ``save(_:id:values:in:changedFields:)``). Applies to the merge
     ///   path only; the insert path writes every supplied value.
+    /// - Stability: production
     @discardableResult
     public func upsert(
         _ schema: PrimitiveSchema, id: String,
@@ -241,11 +312,32 @@ public final class CodegenAPI: @unchecked Sendable {
         explicitId: Bool = false,
         changedFields: Set<String>? = nil
     ) throws -> UpsertResult {
-        try requireClient("upsert").requireMember(schema, in: docId)
-            .upsert(
-                values, on: field, id: id, explicitId: explicitId,
+        let client = try requireClient("upsert")
+        let member = try client.requireMember(schema, in: docId)
+        // On a model that renames a field, the target resolves as the room
+        // resolves it: a unique constraint's name first, else the field by
+        // its stored name. A single-field constraint upserts on its field; a
+        // compound one through `upsertByUnique`, which takes a constraint.
+        if !schema.fieldNames.isEmpty,
+           let constraint = schema.resolvedUniqueConstraints.first(where: { $0.name == field }) {
+            if constraint.fields.count == 1 {
+                return try member.upsert(
+                    values, on: constraint.fields[0], id: id, explicitId: explicitId,
+                    changedFields: changedFields
+                )
+            }
+            return try client.sharedModel(for: schema).upsertByUnique(
+                constraint: constraint.name, data: values, mode: .either, id: id,
+                explicitId: explicitId, targetDocId: docId,
+                uniqueLookupValue: nil,
                 changedFields: changedFields
             )
+        }
+        return try member.upsert(
+            values, on: PrimitiveFieldNames.upsertTarget(field, constraintNames: [], in: schema.fieldNames),
+            id: id, explicitId: explicitId,
+            changedFields: changedFields
+        )
     }
 
     /// Insert-or-update a record matched by the NAMED unique constraint
@@ -272,6 +364,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// - Parameter changedFields: the fields the caller actually assigned
     ///   (see ``save(_:id:values:in:changedFields:)``). Applies to the merge
     ///   path only; the insert path writes every supplied value.
+    /// - Stability: production
     @discardableResult
     public func upsertByUnique(
         _ schema: PrimitiveSchema, id: String,
@@ -286,7 +379,7 @@ public final class CodegenAPI: @unchecked Sendable {
         let client = try requireClient("upsertByUnique")
         _ = try client.requireMember(schema, in: docId)
         return try client.sharedModel(for: schema).upsertByUnique(
-            constraint: constraint, data: values, mode: mode, id: id,
+            constraint: Self.constraintName(schema, constraint), data: values, mode: mode, id: id,
             explicitId: explicitId, targetDocId: docId,
             uniqueLookupValue: uniqueLookupValue,
             changedFields: changedFields
@@ -294,8 +387,169 @@ public final class CodegenAPI: @unchecked Sendable {
     }
 
     /// Delete a record from document `docId`. Throws if the doc isn't open.
+    /// - Stability: production
     public func delete(_ schema: PrimitiveSchema, id: String, in docId: String) throws {
         try requireClient("delete").requireMember(schema, in: docId).delete(id: id)
+    }
+
+    /// Delete a record from document `docId` with a db3 write's
+    /// `options.condition` and `options.confirm`; with neither, it deletes as
+    /// ``delete(_:id:in:)`` does. See `DynamicModel.delete(id:options:)`.
+    /// - Stability: production
+    public func delete(
+        _ schema: PrimitiveSchema, id: String, in docId: String,
+        options: Db3WriteOptions
+    ) async throws {
+        try await requireClient("delete").requireMember(schema, in: docId, source: "delete")
+            .delete(id: id, options: Self.storedWriteOptions(schema, options))
+    }
+
+    /// Add each of `fields` to record `id`'s number fields in db3 `docId`,
+    /// answering each field's new value — the room's, once it applied the
+    /// increment, with `options.confirm` or an `options.condition`. A record
+    /// the document's view does not hold throws `.db3RecordNotFound`; a
+    /// document that is not a db3 throws `.invalidArgument`. See
+    /// `DynamicModel.increment(id:fields:options:)`.
+    /// - Stability: production
+    @discardableResult
+    public func increment(
+        _ schema: PrimitiveSchema, id: String, fields: [String: Double], in docId: String,
+        options: Db3WriteOptions = Db3WriteOptions()
+    ) async throws -> [String: Double] {
+        let names = schema.fieldNames
+        let values = try await requireClient("increment").requireMember(schema, in: docId, source: "increment")
+            .increment(id: id, fields: PrimitiveFieldNames.storedKeys(fields, in: names), options: Self.storedWriteOptions(schema, options))
+        guard !names.isEmpty else { return values }
+        // Each value answers under the field's current name, whichever name the caller wrote.
+        var out: [String: Double] = [:]
+        for name in fields.keys {
+            let stored = PrimitiveFieldNames.stored(name, in: names)
+            out[PrimitiveFieldNames.current(stored, in: names)] = values[stored]
+        }
+        return out
+    }
+
+    // MARK: - Renamed fields
+
+    /// A filter in stored names, for a schema that renames a field.
+    static func storedFilter(_ schema: PrimitiveSchema, _ filter: DocumentFilter?) -> DocumentFilter? {
+        guard let filter, !schema.fieldNames.isEmpty else { return filter }
+        return PrimitiveFieldNames.storedFilter(filter, in: schema.fieldNames)
+    }
+
+    /// Include specs in stored names, each field by the model it belongs to:
+    /// `sourceField` and `localField` by `schema` (the parent), `foreignKey`,
+    /// `filter`, `sort` and `projection` by the target, and nested specs by
+    /// the target's own schema.
+    static func storedIncludes(_ schema: PrimitiveSchema, _ includes: [Include]) -> [Include] {
+        includes.map { spec in
+            let target = (spec.target as? MultiDocModel)?.schema
+            let parentNames = schema.fieldNames
+            let targetNames = target?.fieldNames ?? [:]
+            let nested = spec.include.map { inner in target.map { storedIncludes($0, inner) } ?? inner }
+            if parentNames.isEmpty && targetNames.isEmpty && nested == nil { return spec }
+            return Include(
+                type: spec.type,
+                target: spec.target,
+                sourceField: spec.sourceField.map { PrimitiveFieldNames.stored($0, in: parentNames) },
+                foreignKey: spec.foreignKey.map { PrimitiveFieldNames.stored($0, in: targetNames) },
+                localField: spec.localField.map { PrimitiveFieldNames.stored($0, in: parentNames) },
+                filter: spec.filter.map { PrimitiveFieldNames.storedFilter($0, in: targetNames) },
+                sort: spec.sort.map { PrimitiveFieldNames.storedKeys($0, in: targetNames) },
+                limit: spec.limit,
+                projection: spec.projection.map { PrimitiveFieldNames.storedKeys($0, in: targetNames) },
+                resultKey: spec.resultKey,
+                include: nested
+            )
+        }
+    }
+
+    /// Query options with their sort and projection in stored names.
+    static func storedOptions(_ schema: PrimitiveSchema, _ options: QueryOptions?) -> QueryOptions? {
+        guard var options, !schema.fieldNames.isEmpty else { return options }
+        let names = schema.fieldNames
+        if let sort = options.sort { options.sort = PrimitiveFieldNames.storedKeys(sort, in: names) }
+        if let order = options.sortOrder { options.sortOrder = order.map { (PrimitiveFieldNames.stored($0.0, in: names), $0.1) } }
+        if let projection = options.projection { options.projection = PrimitiveFieldNames.storedKeys(projection, in: names) }
+        return options
+    }
+
+    /// Aggregate options with their levels, operations, filter and sort in stored names.
+    static func storedAggregate(_ schema: PrimitiveSchema, _ options: AggregateOptions) -> AggregateOptions {
+        let names = schema.fieldNames
+        guard !names.isEmpty else { return options }
+        var out = options
+        out.groupBy = options.groupBy.map { level in
+            switch level {
+            case .field(let field): return .field(PrimitiveFieldNames.stored(field, in: names))
+            case .stringSetMembership(let field, let contains): return .stringSetMembership(field: PrimitiveFieldNames.stored(field, in: names), contains: contains)
+            case .datePeriod(let field, let period): return .datePeriod(field: PrimitiveFieldNames.stored(field, in: names), period: period)
+            }
+        }
+        out.operations = options.operations.map { op in
+            var copy = op
+            if let field = op.field { copy.field = PrimitiveFieldNames.stored(field, in: names) }
+            return copy
+        }
+        if let filter = options.filter { out.filter = PrimitiveFieldNames.storedFilter(filter, in: names) }
+        if let sort = options.sort {
+            // The sort key resolves against the request's own shapes: an
+            // operation's result key, a level's group key, else a field.
+            var key = PrimitiveFieldNames.stored(sort.field, in: names)
+            if let index = options.operations.firstIndex(where: { $0.resultKey == sort.field }) {
+                key = out.operations[index].resultKey
+            } else if let index = options.groupBy.firstIndex(where: { QueryTranslator.aggregationGroupKey($0) == sort.field }) {
+                key = QueryTranslator.aggregationGroupKey(out.groupBy[index])
+            }
+            out.sort = AggregateSort(field: key, direction: sort.direction)
+        }
+        return out
+    }
+
+    /// The renames an aggregate answer's keys take, for options as sent (in
+    /// stored names): each group key and operation result key a level or an
+    /// operation makes over a renamed field, to the same key over the
+    /// field's current name. A key no level or operation makes is not here.
+    static func currentAggregateKeys(_ names: [String: String], sent: AggregateOptions) -> (group: [String: String], row: [String: String]) {
+        var group: [String: String] = [:]
+        var row: [String: String] = [:]
+        for level in sent.groupBy {
+            let current: AggregateGroupBy
+            switch level {
+            case .field(let field): current = .field(PrimitiveFieldNames.current(field, in: names))
+            case .stringSetMembership(let field, let contains): current = .stringSetMembership(field: PrimitiveFieldNames.current(field, in: names), contains: contains)
+            case .datePeriod(let field, let period): current = .datePeriod(field: PrimitiveFieldNames.current(field, in: names), period: period)
+            }
+            let key = QueryTranslator.aggregationGroupKey(level)
+            let renamed = QueryTranslator.aggregationGroupKey(current)
+            if key != renamed { group[key] = renamed }
+        }
+        for op in sent.operations where op.outputField == nil {
+            guard let field = op.field else { continue }
+            var current = op
+            current.field = PrimitiveFieldNames.current(field, in: names)
+            if op.resultKey != current.resultKey { row[op.resultKey] = current.resultKey }
+        }
+        return (group, row)
+    }
+
+    /// A db3 write's options with their `condition` in stored names.
+    static func storedWriteOptions(_ schema: PrimitiveSchema, _ options: Db3WriteOptions) -> Db3WriteOptions {
+        guard let condition = options.condition, !schema.fieldNames.isEmpty else { return options }
+        var out = options
+        out.condition = PrimitiveFieldNames.storedFilter(condition, in: schema.fieldNames)
+        return out
+    }
+
+    /// The constraint `name` addresses: a constraint of that name first; else,
+    /// for a renamed field's current or stored name, that field's own constraint.
+    static func constraintName(_ schema: PrimitiveSchema, _ name: String) -> String {
+        let names = schema.fieldNames
+        let constraints = schema.resolvedUniqueConstraints
+        guard !names.isEmpty, !constraints.contains(where: { $0.name == name }) else { return name }
+        let stored = PrimitiveFieldNames.stored(name, in: names)
+        guard stored != name || names.values.contains(name) else { return name }
+        return constraints.first(where: { $0.fields == [stored] })?.name ?? name
     }
 
     // MARK: - Cross-document relationship traversal
@@ -318,6 +572,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// Returns the target's raw row, or `nil` when the FK is unset or
     /// points at a missing record. Mirrors JS `generateRefersToMethod`
     /// (`targetModelClass.find(relatedId)`).
+    /// - Stability: production
     public func refersTo(
         target: PrimitiveSchema,
         foreignKey sourceForeignKey: String?
@@ -331,6 +586,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// optional `orderByField` / `orderDirection` sort. Returns raw rows.
     /// Mirrors JS `generateHasManyMethod`
     /// (`targetModelClass.query({ [relatedIdField]: this.id }, { sort })`).
+    /// - Stability: production
     public func hasMany(
         target: PrimitiveSchema,
         relatedIdField: String,
@@ -352,6 +608,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// in **target `id ASC`** — the declared join order governs which rows are
     /// selected, not the final order. Mirrors JS `generateHasManyThroughMethod`
     /// (sort join leg → `query({ id: { $in } })` → `id ASC` tiebreaker).
+    /// - Stability: production
     public func hasManyThrough(
         target: PrimitiveSchema,
         joinModel: PrimitiveSchema,
@@ -368,7 +625,9 @@ public final class CodegenAPI: @unchecked Sendable {
         let joinRows = try query(
             joinModel, filter: [joinModelLocalField: .string(sourceId)], options: joinOptions
         )
-        let targetIds = joinRows.compactMap { $0[joinModelRelatedField]?.stringValue }
+        // The join rows come back keyed by the join model's stored names.
+        let relatedKey = PrimitiveFieldNames.stored(joinModelRelatedField, in: joinModel.fieldNames)
+        let targetIds = joinRows.compactMap { $0[relatedKey]?.stringValue }
         guard !targetIds.isEmpty else { return [] }
         return try query(
             target,
@@ -388,7 +647,7 @@ public final class CodegenAPI: @unchecked Sendable {
     /// The cursor is the engine's **opaque** token (a `String?`), the same
     /// composite `(field, id)` cursor `queryPaged` mints — so a cursor issued
     /// here or by the JS client round-trips through the shared decoder. This
-    /// fixes the tie-straddle skip/duplicate defect (#1607) the old
+    /// fixes the tie-straddle skip/duplicate defect the old
     /// hand-rolled raw-scalar cursor had. `limit` is required so a bare
     /// `hasManyThrough(...)` call still binds to the unpaginated overload
     /// above.
@@ -396,13 +655,14 @@ public final class CodegenAPI: @unchecked Sendable {
     /// Envelope contract: the returned `nextCursor` / `prevCursor` / `hasMore`
     /// are COPIED verbatim from the join leg's paged result, and `data` is
     /// REPLACED with the `$in`-resolved targets. Targets come back **target
-    /// `id ASC`** (the `$in` tiebreaker, #1201) — the join order governs which
+    /// `id ASC`** (the `$in` tiebreaker) — the join order governs which
     /// rows are on the page, not the intra-page order. `hasMore` is the
     /// engine's over-fetch signal: more rows remain in the CURRENT paging
     /// direction (forward → later rows, backward → earlier rows) — it is NOT
     /// "a prevCursor is present".
     ///
     /// A non-positive `limit` returns an empty page without querying.
+    /// - Stability: production
     public func hasManyThrough(
         target: PrimitiveSchema,
         joinModel: PrimitiveSchema,
@@ -424,7 +684,7 @@ public final class CodegenAPI: @unchecked Sendable {
 
         // D7 / Fork B (#1607): warn on a nullable join order field.
         RelationshipPaginationValidator.warnIfOrderFieldNullable(
-            schema: joinModel, orderByField: orderByField,
+            schema: joinModel, orderByField: PrimitiveFieldNames.stored(orderByField, in: joinModel.fieldNames),
             relationshipDescription:
                 "hasManyThrough(\(target.name) via \(joinModel.name))"
         )
@@ -440,23 +700,47 @@ public final class CodegenAPI: @unchecked Sendable {
         let joinPage = try queryPaged(
             joinModel, filter: [joinModelLocalField: .string(sourceId)], options: joinOptions
         )
-        let relatedIds = joinPage.data.compactMap { $0[joinModelRelatedField]?.stringValue }
+        // The join rows come back keyed by the join model's stored names.
+        let relatedKey = PrimitiveFieldNames.stored(joinModelRelatedField, in: joinModel.fieldNames)
+        let relatedIds = joinPage.data.compactMap { $0[relatedKey]?.stringValue }
         guard !relatedIds.isEmpty else {
             return PagedQueryResult(
                 data: [], nextCursor: joinPage.nextCursor,
-                prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore
+                prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore, drift: joinPage.drift
             )
         }
-        let rows = try query(
+        // A page of the target, so its drift comes with its rows (#5221).
+        let targets = try queryPaged(
             target,
             filter: ["id": ["$in": .array(relatedIds.map { .string($0) })]],
             options: nil
         )
         return PagedQueryResult(
-            data: rows.map(PrimitiveRow.init(raw:)), nextCursor: joinPage.nextCursor,
-            prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore
+            data: targets.data, nextCursor: joinPage.nextCursor,
+            prevCursor: joinPage.prevCursor, hasMore: joinPage.hasMore,
+            drift: mergedDrift(joinPage.drift, targets.drift)
         )
     }
+}
+
+// The generated db3 writes name their options `JsBaoClient.Db3WriteOptions`,
+// never bare `Db3WriteOptions`: a generated model is a type in the app's own
+// module, so one a schema names `Db3WriteOptions` (`class_name`, or a model
+// `db3_write_options`) would shadow the imported type in every generated file.
+// Generated code already depends on the name `JsBaoClient`, so reaching the
+// type through it adds no name a model could take. The module name cannot
+// qualify it (`JsBaoClient` resolves to the class first), and a member alias
+// cannot name its own target, hence the hop through `CodegenAPI`.
+extension CodegenAPI {
+    /// ``Db3WriteOptions``, under a second name so `JsBaoClient.Db3WriteOptions`
+    /// can refer to it.
+    public typealias WriteOptions = Db3WriteOptions
+}
+
+extension JsBaoClient {
+    /// ``Db3WriteOptions``, reachable through the client's name: the spelling
+    /// generated models use, which no model of that name shadows.
+    public typealias Db3WriteOptions = CodegenAPI.WriteOptions
 }
 
 /// What ``CodegenAPI/includeTarget(for:)`` answers with once its owning client

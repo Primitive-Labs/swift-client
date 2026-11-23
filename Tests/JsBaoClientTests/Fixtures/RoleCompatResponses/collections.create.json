@@ -1,0 +1,24 @@
+{
+  "name": "collections.create",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "POST",
+  "path": "/app/<appId>/api/collections",
+  "caller": "owner",
+  "request": {
+    "name": "Baseline Collection",
+    "description": "Compatibility baseline"
+  },
+  "status": 201,
+  "body": {
+    "collectionId": "<ulid>",
+    "appId": "<appId>",
+    "name": "Baseline Collection",
+    "description": "Compatibility baseline",
+    "collectionType": "default",
+    "documentCount": 0,
+    "createdBy": "<ulid>",
+    "createdAt": "<iso>",
+    "modifiedAt": "<iso>"
+  }
+}

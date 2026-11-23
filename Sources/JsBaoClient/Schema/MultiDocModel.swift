@@ -30,7 +30,7 @@ import YSwift
 /// store through `JsBaoClient.queryShared`/`saveShared`/etc. (and the
 /// generated facade methods that call them).
 ///
-/// ## `@unchecked Sendable` — safety argument (#1992, Phase C)
+/// ## `@unchecked Sendable` — safety argument (Phase C)
 ///
 /// A class with mutable state, so the conformance is unchecked. Every stored
 /// property is either immutable-and-`Sendable` or confined to a named lock:
@@ -73,7 +73,7 @@ import YSwift
 /// being connected/disconnected. That is the same visibility contract a remote
 /// change already has, not a new one.
 ///
-/// Listener closures are `@Sendable` (#1992): confining the `activeSubs`
+/// Listener closures are `@Sendable`: confining the `activeSubs`
 /// dictionary under a lock says nothing about state a callback captures, so
 /// the closure type carries the requirement instead.
 final class MultiDocModel: IncludeTarget, @unchecked Sendable {
@@ -92,6 +92,19 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     /// `find` / `findByUnique` (first-match-wins matches js-bao).
     private var orderedDocIds: [String] = []
     private let lock = NSLock()
+    /// Hears a save of this model into a format-1 document (the model, the
+    /// document); each member it connects is given it. The client sets it.
+    private var _format1SaveWarning: (@Sendable (String, String) -> Void)?
+    private var format1SaveWarning: (@Sendable (String, String) -> Void)? { _format1SaveWarning }
+
+    /// Install the format-1 save warning on this store and every member it holds or connects.
+    func setFormat1SaveWarning(_ hook: (@Sendable (String, String) -> Void)?) {
+        let current = lock.withLock { () -> [DynamicModel] in
+            _format1SaveWarning = hook
+            return Array(members.values)
+        }
+        for member in current { member.setFormat1SaveWarning(hook) }
+    }
 
     /// Result of a per-doc lookup. `docId` tells the caller which
     /// doc holds the match so follow-up writes can target the right
@@ -174,6 +187,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
             doc: doc, schema: schema,
             docId: docId, sharedEngine: engine
         )
+        model.setFormat1SaveWarning(format1SaveWarning)
         members[docId] = model
         orderedDocIds.append(docId)
         // Install any subscribers that were registered before this
@@ -217,19 +231,19 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         // unreachable error locally to keep `findAll` non-throwing
         // (fixed-shape read, per the #1119 design).
         //
-        // #3436 — except while a large document is connected, where `query`
+        // Except while a record-log document is connected, where `query`
         // refuses because it would answer from the engine alone. There is no
         // filter to push down here, so this read answers COMPLETELY instead:
-        // the engine's rows for the ordinary documents, and each large
+        // the engine's rows for the ordinary documents, and each record-log
         // document's rows from its own store. Silently returning the ordinary
         // half is the one thing it must not do.
-        let engineRows = (try? queryIgnoringLargeDocuments()) ?? []
-        return engineRows + format2Rows()
+        let engineRows = (try? queryIgnoringLocalStores()) ?? []
+        return engineRows + localRows()
     }
 
-    /// The engine half of `findAll`, with the large-document refusal skipped
+    /// The engine half of `findAll`, with the mixed-store refusal skipped
     /// because the caller supplies the other half.
-    private func queryIgnoringLargeDocuments() throws -> [[String: JSONValue]] {
+    private func queryIgnoringLocalStores() throws -> [[String: JSONValue]] {
         drainAllObservers()
         return try engine.query(
             modelName: schema.name, filter: nil, options: nil,
@@ -261,7 +275,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
             filter: ["id": .string(id)],
             stringsetFields: stringsetFieldNames
         )) ?? []
-        guard !rows.isEmpty else { return format2Located(id: id) }
+        guard !rows.isEmpty else { return localLocated(id: id) }
         let connectOrder = snapshot.enumerated().reduce(
             into: [String: Int]()
         ) { $0[$1.element.docId] = $1.offset }
@@ -272,27 +286,24 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         if let first = sorted.first, let docId = first["_meta_doc_id"]?.stringValue {
             return Located(docId: docId, row: first)
         }
-        return format2Located(id: id)
+        return localLocated(id: id)
     }
 
-    /// The record in a connected LARGE document, if one holds it (#3436).
+    /// The record in a connected record-log document, if one holds it.
     ///
-    /// A miss in the shared engine is not an answer while a large document is
-    /// open: its rows are not in there. Connect order, first hit wins — the
+    /// A miss in the shared engine is not an answer while a record-log
+    /// document is open: its rows are not in there. Connect order, first hit wins — the
     /// same rule the engine rows follow.
     ///
     /// Asked of each store BY ID, one keyed read at a time, stopping at the
-    /// first hit. Materializing every row to find one is the shape a large
-    /// document is least able to afford: at the sizes this format exists for it
-    /// turns an ordinary lookup into a full read of the document.
-    private func format2Located(id: String) -> Located? {
-        for (docId, model) in format2Members() {
-            guard let delegate = model.format2,
+    /// first hit. Materializing every row to find one would turn an ordinary
+    /// lookup into a full read of the document.
+    private func localLocated(id: String) -> Located? {
+        for (docId, model) in localMembers() {
+            guard let delegate = model.local,
                   var row = try? delegate.row(id: id) else { continue }
-            for field in stringsetFieldNames {
-                let members = (try? delegate.members(id: id, field: field)) ?? []
-                row[field] = .array(members.map { .string($0) })
-            }
+            Self.fillStringSets(&row, id: id, fields: stringsetFieldNames, delegate: delegate)
+            markHeldCleared(&row, model: model)
             row["_meta_doc_id"] = .string(docId)
             return Located(docId: docId, row: row)
         }
@@ -313,7 +324,8 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         constraint name: String,
         values: [PrimitiveValue]
     ) throws -> Located? {
-        for (docId, model) in snapshotMembersInOrder() {
+        // A bound db3 whose rows have not loaded here answers no lookup.
+        for (docId, model) in snapshotMembersInOrder() where Self.isReadable(model) {
             guard let rec = try model.findByUnique(
                 constraint: name, values: values
             ) else { continue }
@@ -322,6 +334,11 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
             for (fname, _) in schema.fields where fname != "id" {
                 if let v = snap[fname] {
                     row[fname] = rowRepresentation(of: v)
+                } else if !stringsetFieldNames.contains(fname), model.holds(recordId: rec.id, field: fname) == true {
+                    // A db3 record holding the field as `null` (a cleared
+                    // field): its row carries the `null`, as `find` and a
+                    // query's rows do, so a read does not fill its default.
+                    row[fname] = .null
                 }
             }
             // A record with no members has no snapshot entry at all, so give
@@ -330,10 +347,29 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
             for fname in stringsetFieldNames where row[fname] == nil {
                 row[fname] = .array([])
             }
+            // A db3 record that does not hold a set is listed as unheld, as
+            // `find`'s and a query's rows list it.
+            PrimitiveRecord.markUnheld(
+                stringsetFieldNames.filter { model.holds(recordId: rec.id, field: $0) == false }, in: &row
+            )
+            markHeldCleared(&row, model: model)
+            // A stored value the snapshot converted or dropped is listed as
+            // stored, as a query's rows list it (#6304).
+            if let stored = PrimitiveRecord.storedKinds(of: schema.fields, raw: { model.readRaw(recordId: rec.id, field: $0) }) {
+                row[PrimitiveRecord.storedKindsKey] = .object(stored)
+            }
             row["_meta_doc_id"] = .string(docId)
             return Located(docId: docId, row: row)
         }
         return nil
+    }
+
+    /// List in `row` the fields `model`'s db3 holds cleared (#6021), so a
+    /// model built from the row reads them unset and fills no default
+    /// (`PrimitiveRecord.holds(_:in:)`). Nothing for a db3 that clears none.
+    private func markHeldCleared(_ row: inout [String: JSONValue], model: DynamicModel) {
+        guard let names = (model.local as? RecordLogModelDelegate)?.binding.heldCleared?[schema.name] else { return }
+        PrimitiveRecord.markCleared(names, in: &row)
     }
 
     /// Cross-doc "find by constraint OR create" — mirrors js-bao's
@@ -397,14 +433,14 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         )
 
         // Cross-doc search: first connected doc that holds the key wins.
-        // The ordered values travel with the key so a LARGE member can answer
-        // from its merged view, which is the only place its uniqueness lives
-        // (#3436). `resolveUpsertConstraintKey` has already established that
+        // The ordered values travel with the key so a record-log member can
+        // answer from its view, which is the only place its uniqueness lives. `resolveUpsertConstraintKey` has already established that
         // every constraint field is present in `data` and that an explicit
         // lookup value agrees with it field by field.
         let orderedValues = constraint.fields.compactMap { data[$0] }
         var matchRecordId: String?
-        for (_, model) in members {
+        // A bound db3 whose rows have not loaded here holds no match.
+        for (_, model) in members where Self.isReadable(model) {
             if let rid = model.existingRecordId(
                 constraintName: name, key: key, orderedValues: orderedValues
             ) {
@@ -468,35 +504,43 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     }
 
 
-    // MARK: - Large documents (#3436)
+    // MARK: - Documents with a local record store
 
-    /// The connected members whose document is a large one, in connect order.
+    /// The connected members whose document keeps its records in a local
+    /// store (a record-log document), in connect order.
     ///
     /// Their records are in the documents' own stores, not in this
     /// aggregator's shared engine — the file-backed projection that will put
     /// them there is behavior 13 — so every read below has to say what it does
     /// about them rather than quietly answer without them.
-    private func format2Members() -> [(docId: String, model: DynamicModel)] {
-        snapshotMembersInOrder().filter { $0.1.format2 != nil }
+    private func localMembers() -> [(docId: String, model: DynamicModel)] {
+        // A bound db3 whose rows have not loaded here answers no read.
+        snapshotMembersInOrder().filter { $0.1.local != nil && Self.isReadable($0.1) }
             .map { (docId: $0.0, model: $0.1) }
     }
 
+    /// Whether a member answers reads: an ordinary document's always, a db3's
+    /// once it is resident (its load completed here, or it was created here).
+    private static func isReadable(_ model: DynamicModel) -> Bool {
+        (model.local as? RecordLogModelDelegate)?.binding.isResident ?? true
+    }
+
     /// The refusal a filtered read gives when this model has members of BOTH
-    /// kinds (#3436, behavior 12, mirroring #3430's Decision R by name).
+    /// kinds (mirroring #3430's Decision R by name).
     ///
-    /// An ordinary document's rows are in the in-memory mirror and a large
-    /// document's are in the file-backed query tables. One SQL statement
+    /// An ordinary document's rows are in the in-memory mirror and a
+    /// record-log document's are in the file-backed query tables. One SQL statement
     /// cannot span two databases, and merging two result sets in Swift would
     /// mean a second implementation of sort, limit and cursor — so the read
     /// says it cannot answer rather than answering from one of them. Scoping
     /// the read to documents of one kind makes it answerable again.
-    private func format2QueryScope(
+    private func mixedQueryScope(
         _ large: [String], _ ordinary: [String]
     ) -> JsBaoError {
         JsBaoError(
             code: .format2QueryScope,
             message: "`\(schema.name)` cannot answer one filtered read across both "
-                + "large document(s) \(large.joined(separator: ", ")) and ordinary "
+                + "record-log document(s) \(large.joined(separator: ", ")) and ordinary "
                 + "document(s) \(ordinary.joined(separator: ", ")): their rows are in "
                 + "different query stores. Scope the read to documents of one kind "
                 + "(`QueryOptions.documents`), or use `findAll()` / `find(id:)`, which "
@@ -509,61 +553,133 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         )
     }
 
-    /// Which engine answers a filtered read, or the refusal.
+    /// Where a filtered read is answered, or the refusal.
     ///
     /// - `nil` — the shared in-memory mirror, which is every client with no
-    ///   large document open and is the unchanged path.
-    /// - a projection and a scope — every connected member is large, so the
-    ///   read runs on the file-backed tables restricted to those documents.
+    ///   record-log document open and is the unchanged path.
+    /// - a reader — every member the read names is a db3, so it is answered
+    ///   from their view (`record_log_view`) in one statement over those
+    ///   documents, with the room's statement and the db3 limits.
     /// - a throw — members of both kinds, which one statement cannot span.
     ///
     /// Decided against the documents the read ASKED for, not against everything
     /// connected: a read scoped to one kind is answerable however many
     /// documents of the other kind happen to be open, which is what the
-    /// refusal's own message tells the caller to do. The scope handed back is
-    /// the requested one narrowed to this model's large members — never "every
-    /// large document", which would answer a one-document read from two.
-    private func format2Route(
-        _ options: QueryOptions?
-    ) throws -> (Format2QueryProjection, [String])? {
-        let requested = options?.documents
+    /// refusal's own message tells the caller to do. The reader's scope is the
+    /// requested one narrowed to this model's db3 members — never "every
+    /// record-log document", which would answer a one-document read from two.
+    private func localRoute(_ options: QueryOptions?) throws -> RecordLogViewReader? {
+        let requested = try options?.documentScope()
         let members = snapshotMembersInOrder()
             .filter { requested?.contains($0.0) ?? true }
-        let large = members.filter { $0.1.format2 != nil }
+        // A `db3` scope names resident db3s only; `documents` keeps its
+        // silent narrowing.
+        if let named = options?.db3 {
+            let resident = Set(members.filter { $0.1.local != nil && Self.isReadable($0.1) }.map(\.0))
+            let missing = named.filter { !resident.contains($0) }
+            if !missing.isEmpty { throw db3NotResidentError(missing, source: "db3") }
+        }
+        // A bound db3 whose rows have not loaded here is left out.
+        let large = members.filter { $0.1.local != nil && Self.isReadable($0.1) }
             .map { (docId: $0.0, model: $0.1) }
         guard !large.isEmpty else { return nil }
-        let ordinary = members.filter { $0.1.format2 == nil }.map(\.0)
+        let ordinary = members.filter { $0.1.local == nil }.map(\.0)
         guard ordinary.isEmpty else {
-            throw format2QueryScope(large.map(\.docId), ordinary)
+            throw mixedQueryScope(large.map(\.docId), ordinary)
         }
-        guard let projection = large.first?.model.format2?.binding.projection else {
-            return nil
+        guard let store = large.first?.model.local?.viewStore else { return nil }
+        // Documents on two files are read by two connections, which one
+        // statement cannot span either.
+        let others = large.filter { $0.model.local.map { $0.viewStore.host !== store.host } ?? false }
+        guard others.isEmpty else {
+            throw localQueryScope(
+                large.filter { member in !others.contains { $0.docId == member.docId } }.map(\.docId),
+                others.map(\.docId)
+            )
         }
-        // Every one of them has to be projected, not just reachable: a
-        // document whose projection did not commit has no rows in these
-        // tables, and a read that ran anyway would answer short and say
-        // nothing. The per-document facade refuses for the same reason.
-        for (_, model) in large {
-            guard let delegate = model.format2 else { continue }
-            delegate.binding.settleFolds()
-            try delegate.requireProjection()
+        for (_, model) in large { model.local?.settle() }
+        var reader = RecordLogViewReader(store: store, documents: large.map(\.docId))
+        // Each db3's held cleared fields read as unset on its own rows only (#6021).
+        for (docId, model) in large {
+            if let cleared = (model.local as? RecordLogModelDelegate)?.binding.heldCleared { reader.cleared[docId] = cleared }
         }
-        return (projection, large.map(\.docId))
+        return reader
     }
 
-    /// Every row a large document's member holds, in the shape the engine's
+    /// The options the in-memory mirror reads: a `db3` scope folded into
+    /// `documents`, which is the only form the engine knows, so an explicitly
+    /// empty `db3` scope answers nothing there as `documents: []` does.
+    private static func mirrorOptions(_ options: QueryOptions?) throws -> QueryOptions? {
+        guard var options, options.db3 != nil else { return options }
+        options.documents = try options.documentScope()
+        options.db3 = nil
+        return options
+    }
+
+    /// How the model API answers a db3's record.
+    /// Each record-log member's vector fields read as their numbers,
+    /// an included record's as its own model's in the same db3.
+    private func viewShape(_ include: [Include]? = nil) -> RecordLogViewReader.RowShape {
+        let models = RecordLogViewReader.models(schema.name, include)
+        var decoders: [String: (RecordLogDocumentBinding, [String: [String: VectorEncoding]])] = [:]
+        for (docId, model) in localMembers() {
+            guard let delegate = model.local as? RecordLogModelDelegate else { continue }
+            var encodings: [String: [String: VectorEncoding]] = [:]
+            for name in models {
+                let fields = delegate.binding.vectorEncodings(model: name)
+                if !fields.isEmpty { encodings[name] = fields }
+            }
+            if !encodings.isEmpty { decoders[docId] = (delegate.binding, encodings) }
+        }
+        guard !decoders.isEmpty else { return .model(setFields: stringsetFieldNames) }
+        return .model(setFields: stringsetFieldNames, decode: { model, row, document in
+            guard let (binding, encodings) = decoders[document], let fields = encodings[model] else { return row }
+            return binding.decodedVectors(row, model: model, encodings: fields)
+        })
+    }
+
+    /// The refusal a filtered read gives when this model's members are in
+    /// documents whose local stores differ: their rows are read by different engines.
+    private func localQueryScope(_ first: [String], _ second: [String]) -> JsBaoError {
+        JsBaoError(
+            code: .format2QueryScope,
+            message: "`\(schema.name)` cannot answer one filtered read across document(s) "
+                + "\(first.joined(separator: ", ")) and document(s) \(second.joined(separator: ", ")): "
+                + "their rows are in different query stores. "
+                + "Scope the read to documents of one store (`QueryOptions.documents`), or use "
+                + "`findAll()` / `find(id:)`, which read both.",
+            details: [
+                "model": .string(schema.name),
+                "largeDocuments": .array((first + second).map { .string($0) }),
+                "documents": .array([]),
+            ]
+        )
+    }
+
+    /// Give `row` each string set field in `fields` as its members (`[]` for
+    /// none), listing those the record does not hold as unheld
+    /// (`PrimitiveRecord.holds(_:in:)`), as the view's rows are shaped.
+    private static func fillStringSets(
+        _ row: inout [String: JSONValue], id: String, fields: Set<String>, delegate: any LocalRecordDelegate
+    ) {
+        PrimitiveRecord.markUnheld(fields.filter { (try? delegate.holds(id: id, field: $0)) == false }, in: &row)
+        for field in fields {
+            let members = (try? delegate.members(id: id, field: field)) ?? []
+            row[field] = .array(members.map { .string($0) })
+        }
+    }
+
+    /// Every row a record-log document's member holds, in the shape the engine's
     /// rows use — `_meta_doc_id` tag included, stringsets as arrays.
-    private func format2Rows() -> [[String: JSONValue]] {
+    private func localRows() -> [[String: JSONValue]] {
         var out: [[String: JSONValue]] = []
-        for (docId, model) in format2Members() {
-            guard let delegate = model.format2,
+        for (docId, model) in localMembers() {
+            guard let delegate = model.local,
                   let ids = try? delegate.allIds() else { continue }
             for id in ids {
                 guard var row = try? delegate.row(id: id) else { continue }
-                for field in stringsetFieldNames {
-                    let members = (try? delegate.members(id: id, field: field)) ?? []
-                    row[field] = .array(members.map { .string($0) })
-                }
+                Self.fillStringSets(&row, id: id, fields: stringsetFieldNames, delegate: delegate)
+                markHeldCleared(&row, model: model)
                 row["_meta_doc_id"] = .string(docId)
                 out.append(row)
             }
@@ -578,16 +694,12 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
     ) throws -> [[String: JSONValue]] {
-        if let (projection, scope) = try format2Route(options) {
-            return try projection.engine.query(
-                modelName: schema.name, filter: filter,
-                options: Format2ModelDelegate.scoped(options, to: scope),
-                stringsetFields: stringsetFieldNames
-            )
+        if let reader = try localRoute(options) {
+            return try reader.page(schema.name, filter ?? [:], options: options, shape: viewShape()).rows
         }
         drainAllObservers()
         return try engine.query(
-            modelName: schema.name, filter: filter, options: options,
+            modelName: schema.name, filter: filter, options: Self.mirrorOptions(options),
             stringsetFields: stringsetFieldNames
         )
     }
@@ -597,25 +709,22 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     }
 
     /// Count variant that accepts `QueryOptions` — used when callers
-    /// want the `documents` scoping shortcut (or future options) on a
-    /// count call. `sort`/`limit`/`cursor` on the options are ignored
-    /// since they don't apply to a count.
+    /// want the `documents` scoping shortcut (or `maxDrift`, refused
+    /// `DB3_DRIFT_EXCEEDED` as a page is) on a count call.
+    /// `sort`/`limit`/`cursor` on the options are ignored since they don't
+    /// apply to a count.
     public func count(
         _ filter: DocumentFilter? = nil,
         options: QueryOptions?
     ) throws -> Int {
-        if let (projection, scope) = try format2Route(options) {
-            return try projection.engine.count(
-                modelName: schema.name, filter: filter,
-                stringsetFields: stringsetFieldNames,
-                documents: scope
-            )
+        if let reader = try localRoute(options) {
+            return try reader.count(schema.name, filter ?? [:], maxDrift: options?.maxDrift, options: options)
         }
         drainAllObservers()
         return try engine.count(
             modelName: schema.name, filter: filter,
             stringsetFields: stringsetFieldNames,
-            documents: options?.documents
+            documents: options?.documentScope()
         )
     }
 
@@ -623,28 +732,29 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     /// table. Group by `_meta_doc_id` to get per-doc rollups; omit
     /// grouping for a single global rollup.
     public func aggregate(_ options: AggregateOptions) throws -> [[String: JSONValue]] {
+        try QueryTranslator.validatePeriodLevels(options.groupBy, fields: schema.fields)
         // Routed on the documents the caller ASKED for (#3760), exactly as
         // `query` and `count` are: a read scoped to one kind is answerable
         // however many documents of the other kind happen to be open, and a
-        // read that names an ordinary document beside a large one is the mix
+        // read that names an ordinary document beside a record-log one is the mix
         // no single statement can serve.
         //
-        // `scope` is that request narrowed to this model's CONNECTED large
-        // members, and the engine intersects it with `options.documents` — so a
+        // `scope` is that request narrowed to this model's CONNECTED
+        // record-log members, and the engine intersects it with `options.documents` — so a
         // request naming a document this model no longer holds answers nothing
         // from it, which is what `query` answers for the same request. The query
         // tables keep a closed document's rows (#3756), so the narrowing is what
         // stands between the two reads agreeing and not.
-        let requested = QueryOptions(documents: options.documents)
-        if let (projection, scope) = try format2Route(requested) {
-            return try projection.engine.aggregate(
-                modelName: schema.name, options: options,
-                stringsetFields: stringsetFieldNames, documents: scope
-            )
+        let requested = QueryOptions(documents: options.documents, db3: options.db3)
+        if let reader = try localRoute(requested) {
+            return try reader.aggregate(schema.name, options, setFields: stringsetFieldNames)
         }
         drainAllObservers()
+        var mirrored = options
+        mirrored.documents = try requested.documentScope()
+        mirrored.db3 = nil
         return try engine.aggregate(
-            modelName: schema.name, options: options,
+            modelName: schema.name, options: mirrored,
             stringsetFields: stringsetFieldNames
         )
     }
@@ -668,6 +778,14 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     }
     private var activeSubs: [UUID: ActiveSub] = [:]
     private let subscribeLock = NSLock()
+
+    /// How many `subscribe` registrations are live. Internal — lets a test
+    /// prove a failed open left no subscription behind.
+    var activeSubscriptionCount: Int {
+        subscribeLock.lock()
+        defer { subscribeLock.unlock() }
+        return activeSubs.count
+    }
 
     /// Register a callback that fires on any change in any connected
     /// doc's model. Works whether called before or after `connect`:
@@ -755,23 +873,15 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         options: QueryOptions? = nil,
         include: [Include]
     ) throws -> [[String: JSONValue]] {
-        // #3436 — the base query routes exactly as the plain one does; a large
-        // document's rows are in the file-backed tables and are not in this
-        // engine at all. The include resolution that follows is unchanged: it
-        // runs against the rows the base query produced, whichever engine
-        // answered it.
-        if let (projection, scope) = try format2Route(options) {
-            var rows = try projection.engine.query(
-                modelName: schema.name, filter: filter,
-                options: Format2ModelDelegate.scoped(options, to: scope),
-                stringsetFields: stringsetFieldNames
-            )
-            try IncludeResolver.resolve(rows: &rows, includes: include, depth: 0)
-            return rows
+        // The base query routes exactly as the plain one does. On db3s the
+        // reader resolves the includes too, each parent's legs within its own
+        // db3 by its own statements; format 1 keeps the resolver it had.
+        if let reader = try localRoute(options) {
+            return try reader.page(schema.name, filter ?? [:], options: options, shape: viewShape(include), include: include).rows
         }
         drainAllObservers()
         var rows = try engine.query(
-            modelName: schema.name, filter: filter, options: options,
+            modelName: schema.name, filter: filter, options: Self.mirrorOptions(options),
             stringsetFields: stringsetFieldNames
         )
         try IncludeResolver.resolve(rows: &rows, includes: include, depth: 0)
@@ -787,20 +897,16 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         _ filter: DocumentFilter? = nil,
         options: QueryOptions? = nil
     ) throws -> PagedQueryResult<PrimitiveRow> {
-        // #3436 — routed like every other filtered read. A page answered from
-        // the in-memory mirror while a large document is connected would be a
+        // Routed like every other filtered read. A page answered from
+        // the in-memory mirror while a record-log document is connected would be a
         // page of the ordinary documents only, and its cursor would walk them
         // alone.
-        if let (projection, scope) = try format2Route(options) {
-            return try projection.engine.queryPaged(
-                modelName: schema.name, filter: filter,
-                options: Format2ModelDelegate.scoped(options, to: scope),
-                stringsetFields: stringsetFieldNames
-            )
+        if let reader = try localRoute(options) {
+            return RecordLogViewReader.paged(try reader.page(schema.name, filter ?? [:], options: options, shape: viewShape()))
         }
         drainAllObservers()
         return try engine.queryPaged(
-            modelName: schema.name, filter: filter, options: options,
+            modelName: schema.name, filter: filter, options: Self.mirrorOptions(options),
             stringsetFields: stringsetFieldNames
         )
     }
@@ -812,20 +918,16 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         options: QueryOptions? = nil,
         include: [Include]
     ) throws -> PagedQueryResult<PrimitiveRow> {
-        let base: PagedQueryResult<PrimitiveRow>
-        if let (projection, scope) = try format2Route(options) {
-            base = try projection.engine.queryPaged(
-                modelName: schema.name, filter: filter,
-                options: Format2ModelDelegate.scoped(options, to: scope),
-                stringsetFields: stringsetFieldNames
-            )
-        } else {
-            drainAllObservers()
-            base = try engine.queryPaged(
-                modelName: schema.name, filter: filter, options: options,
-                stringsetFields: stringsetFieldNames
+        if let reader = try localRoute(options) {
+            return RecordLogViewReader.paged(
+                try reader.page(schema.name, filter ?? [:], options: options, shape: viewShape(include), include: include)
             )
         }
+        drainAllObservers()
+        let base = try engine.queryPaged(
+            modelName: schema.name, filter: filter, options: Self.mirrorOptions(options),
+            stringsetFields: stringsetFieldNames
+        )
         // Unwrap → resolve includes (in-place mutation) → rewrap (#1992).
         var rows = base.data.map(\.raw)
         try IncludeResolver.resolve(rows: &rows, includes: include, depth: 0)
@@ -860,7 +962,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
     /// came out of a SQL query. In particular a stringset is `[String]`, the
     /// shape the engine's junction-table population pass writes and the
     /// generated row decoder casts to — a comma-joined `String` would fail
-    /// that cast and silently drop the field (#2485).
+    /// that cast and silently drop the field.
     private func rowRepresentation(of value: PrimitiveValue) -> JSONValue {
         switch value {
         case let .string(s):    return .string(s)
@@ -870,6 +972,7 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
         case let .date(s):      return .string(s)
         case let .stringset(s): return .array(Array(s).map { .string($0) })
         case let .json(d):      return .string(String(data: d, encoding: .utf8) ?? "")
+        case let .vector(v):    return .array(v.map { .number(Double($0)) })
         }
     }
 }

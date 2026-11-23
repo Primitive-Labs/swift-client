@@ -11,6 +11,7 @@ import YSwift
 /// way `NotificationsAPITests` drives its `notification` frame), and the one
 /// behavior that is only observable on the wire — the awareness re-broadcast —
 /// runs against the in-process `LoopbackWebSocketServer`.
+@available(*, deprecated)
 final class ServerPushFramesTests: XCTestCase {
 
     private func newDocId() -> String { "push-frames-\(UUID().uuidString.prefix(8))" }
@@ -226,6 +227,7 @@ final class ServerPushFramesTests: XCTestCase {
 
     // MARK: - C3: refreshAwareness
 
+    @available(*, deprecated)
     func testRefreshAwarenessFrameRebroadcastsLocalState() async throws {
         let server = try LoopbackWebSocketServer()
         let url = try server.start()

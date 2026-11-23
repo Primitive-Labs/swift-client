@@ -162,11 +162,12 @@ final class HttpClientTransportTests: XCTestCase {
         )
     }
 
-    func testLegacyAnyBodyStillEncodesAsJson() async throws {
+    func testTypedBodyEncodesAsJson() async throws {
         TransportStubURLProtocol.configure(refreshedToken: "", echoBody: true)
         let (_, http) = makeWiredClients(initialToken: makeTestJwt(userId: "u1"))
 
-        _ = try await http.request(method: "POST", path: "/echo", data: ["a": 1])
+        let body: JSONValue = ["a": 1]
+        try await http.send(method: .post, path: "/echo", body: body)
         let sent = try XCTUnwrap(TransportStubURLProtocol.lastRequestBody)
         let parsed = try XCTUnwrap(
             try JSONSerialization.jsonObject(with: sent) as? [String: Any]
@@ -174,11 +175,12 @@ final class HttpClientTransportTests: XCTestCase {
         XCTAssertEqual(parsed["a"] as? Int, 1)
     }
 
-    func testGetWithLegacyBodySendsNoBody() async throws {
+    func testGetWithABodySendsNoBody() async throws {
         TransportStubURLProtocol.configure(refreshedToken: "", echoBody: true)
         let (_, http) = makeWiredClients(initialToken: makeTestJwt(userId: "u1"))
 
-        _ = try? await http.request(method: "GET", path: "/echo", data: ["a": 1])
+        let body: JSONValue = ["a": 1]
+        let _: JSONValue? = try? await http.requestOptional(method: .get, path: "/echo", body: body)
         XCTAssertNil(TransportStubURLProtocol.lastRequestBody, "GET must not carry a body")
     }
 }

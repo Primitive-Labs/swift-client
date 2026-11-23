@@ -1,0 +1,13 @@
+[type]
+name = "workspace6026"
+
+[models.tasks6026]
+class_name = "Task6026"
+
+[models.tasks6026.fields.title]
+type = "string"
+
+[models.tasks6026.fields.state]
+ref = "Status"
+enforce_enum = true
+storedAs = "status"

@@ -9,7 +9,7 @@ import Foundation
 // A stored metadata object is caller-defined and the platform validates it
 // against the category's schema without the client introspecting it, so every
 // `data` payload is a `[String: JSONValue]` — the same choice
-// `databases.create(initialMetadata:)` already makes for metadata values.
+// `collections.create(initialMetadata:)` makes for metadata values.
 //
 // TypeScript models the read and the batch results as discriminated unions
 // (`{exists: true, schemaVersion: number}` | `{exists: false, schemaVersion:

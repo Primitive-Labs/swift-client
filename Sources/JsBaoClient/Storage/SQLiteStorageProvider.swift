@@ -1,9 +1,11 @@
 import Foundation
-import SQLite3
+import JsBaoSQLite
 
 /// SQLite-backed implementation of ``StorageProvider``.
 ///
-/// Uses the raw SQLite3 C API available on all Apple platforms.
+/// Uses the SQLite C API of the package's bundled SQLite (`JsBaoSQLite`, the
+/// release sqlite-wasm carries), not the OS's, so every supported OS runs the
+/// same SQL.
 /// Thread safety is achieved via an internal serial `DispatchQueue`
 /// that serializes all database access.
 public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
@@ -18,9 +20,8 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
 
     /// Where the database file is, once it is open.
     ///
-    /// Read by the format-2 storage probe (#3437, behavior 33): what a large
-    /// document may keep is a property of the volume this file is on. `nil`
-    /// for an in-memory provider, which has no file and no volume.
+    /// What a document may keep is a property of the volume this file is on.
+    /// `nil` for an in-memory provider, which has no file and no volume.
     public var databaseDirectory: String? {
         // The queue is the mutex, and this may be asked from inside a call
         // that already holds it — so the same re-entrancy check every other
@@ -43,6 +44,7 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
         // Tag the queue with this provider, so a nested `withRawConnection`
         // running on it can recognize that it already holds the lock (#3436).
         queue.setSpecific(key: Self.queueKey, value: queueToken)
+        recordLogGroup = RecordLogGroupCommit(host: self)
     }
 
     // MARK: - StorageProvider
@@ -102,6 +104,11 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
                     }
                     self.db = dbPointer
 
+                    // A device vector index's triggers convert its values with this function (#5230).
+                    guard RecordLogVectorFunction.register(on: dbPointer) == SQLITE_OK else {
+                        throw SQLiteStorageError.openFailed(message: "\(RecordLogVectorFunction.name) could not be registered: \(self.lastError())")
+                    }
+
                     // Enable WAL mode for better concurrent read performance.
                     try self.exec("PRAGMA journal_mode=WAL")
 
@@ -129,6 +136,12 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
     public func close() async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             queue.async { [self] in
+                flushDeferredRecordLogCommit()
+                // The record-log connection's compiled statements go first, and
+                // the connection with them: a reopened handle can land at the
+                // same address, and must not find statements of the closed one.
+                format2Connection?.finalizeStatements()
+                format2Connection = nil
                 if let db {
                     sqlite3_close_v2(db)
                     self.db = nil
@@ -304,10 +317,45 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
             sqlite3_bind_text(stmt, 1, store, -1, Self.SQLITE_TRANSIENT)
 
             var result: [String] = []
-            while sqlite3_step(stmt) == SQLITE_ROW {
+            var rc = sqlite3_step(stmt)
+            while rc == SQLITE_ROW {
                 if let ptr = sqlite3_column_text(stmt, 0) {
                     result.append(String(cString: ptr))
                 }
+                rc = sqlite3_step(stmt)
+            }
+            // A scan that stops short of `SQLITE_DONE` read part of the
+            // rows; a `wipeLocal` decides what to delete from these lists,
+            // so a partial one has to fail rather than pass for complete.
+            guard rc == SQLITE_DONE else {
+                throw SQLiteStorageError.executionFailed(message: self.lastError())
+            }
+            return result
+        }
+    }
+
+    func storeNames(withPrefix prefix: String) async throws -> [String] {
+        try await onQueue {
+            try self.ensureReady()
+
+            let sql = "SELECT DISTINCT store FROM kv_store WHERE substr(store, 1, ?) = ?"
+            var stmt: OpaquePointer?
+            try self.prepare(sql, statement: &stmt)
+            defer { sqlite3_finalize(stmt) }
+
+            sqlite3_bind_int(stmt, 1, Int32(prefix.unicodeScalars.count))
+            sqlite3_bind_text(stmt, 2, prefix, -1, Self.SQLITE_TRANSIENT)
+
+            var result: [String] = []
+            var rc = sqlite3_step(stmt)
+            while rc == SQLITE_ROW {
+                if let ptr = sqlite3_column_text(stmt, 0) {
+                    result.append(String(cString: ptr))
+                }
+                rc = sqlite3_step(stmt)
+            }
+            guard rc == SQLITE_DONE else {
+                throw SQLiteStorageError.executionFailed(message: self.lastError())
             }
             return result
         }
@@ -333,9 +381,9 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
 
     /// Run `body` on the serial queue with this provider's own connection.
     ///
-    /// A large document's records are real SQL tables, not `kv_store` rows —
-    /// a 2 GB document read one JSON blob at a time is not a document — so
-    /// the format-2 layer needs the handle itself. It reuses THIS connection
+    /// A record-log document's records are real SQL tables, not `kv_store`
+    /// rows — a large document read one JSON blob at a time is not a
+    /// document — so the record-log layer needs the handle itself. It reuses THIS connection
     /// and THIS queue deliberately: `JsBaoClient.setupStorage` records that a
     /// second handle on the same WAL file produced `SQLITE_BUSY` under
     /// concurrent auth and data writes, and serializing on one queue is what
@@ -344,7 +392,13 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
     /// `internal` to the module and reached through ``Format2SqlHost``, so the
     /// public ``StorageProvider`` surface is unchanged and no app can take a
     /// raw handle out of the provider.
-    func withRawConnection<T>(_ body: (OpaquePointer) throws -> T) throws -> T {
+    ///
+    /// Any other caller's work first closes a record-log group left open
+    /// (`flushingGroup`, see ``RecordLogGroupCommitHost``); only the record-log
+    /// store's own work joins it.
+    func withRawConnection<T>(
+        flushingGroup: Bool = true, _ body: (OpaquePointer) throws -> T
+    ) throws -> T {
         try withoutActuallyEscaping(body) { body in
             let work = QueueWork { () throws -> T in
                 guard self._isReady, let db = self.db else {
@@ -353,16 +407,19 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
                 return try body(db)
             }
             // RE-ENTRANT, and it has to be. The queue is the mutex, so being
-            // on it already means this call holds it — and the format-2 layer
-            // genuinely nests: a fold runs inside `transaction`, which is
-            // itself inside this call, and each `applyRemote` asks for the
-            // connection again. A plain `queue.sync` from the queue's own
+            // on it already means this call holds it — and the record-log layer
+            // genuinely nests: a store command runs inside `transaction`,
+            // which is itself inside this call, and asks for the connection
+            // again. A plain `queue.sync` from the queue's own
             // thread deadlocks (it traps under the test runner), so the
             // nested call runs inline on the lock it already owns.
             if DispatchQueue.getSpecific(key: Self.queueKey) == queueToken {
                 return try work.run()
             }
-            return try queue.sync { try work.run() }
+            return try queue.sync {
+                if flushingGroup { flushDeferredRecordLogCommit() }
+                return try work.run()
+            }
         }
     }
 
@@ -390,6 +447,22 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
         let created = SQLiteFormat2Connection(db: db)
         format2Connection = created
         return created
+    }
+
+    // MARK: - The record-log group commit
+
+    /// The record-log store's group of saves on this connection; set in `init`.
+    private var recordLogGroup: RecordLogGroupCommit?
+
+    /// The commit that closes an open record-log group, run before any other
+    /// work on the queue. Read and written only on `queue`.
+    private var deferredRecordLogCommit: ((any Format2SqlConnection) -> Void)?
+
+    /// Must be called on `queue`.
+    private func flushDeferredRecordLogCommit() {
+        guard let commit = deferredRecordLogCommit, let db else { return }
+        deferredRecordLogCommit = nil
+        commit(format2ConnectionOnQueue(db))
     }
 
     // MARK: - Private helpers
@@ -472,9 +545,9 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
     /// provider hands it is a plain `() throws -> Output` built from generic
     /// parameters the public ``StorageProvider`` protocol does not constrain to
     /// `Sendable`. Without this box the compiler reports the capture
-    /// (`#SendableClosureCaptures`, 11 diagnostics from the one site — #2318);
+    /// (`#SendableClosureCaptures`, 11 diagnostics from the one site);
     /// constraining the protocol instead would push the same annotation onto
-    /// every caller of `iterate` (#2318, Fork 1).
+    /// every caller of `iterate` (Fork 1).
     ///
     /// **What the `@unchecked` claim means here.** It contains the storage
     /// layer's *existing* API contract at the queue boundary; it is not a proof
@@ -502,6 +575,7 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
         let work = QueueWork(run: work)
         return try await withCheckedThrowingContinuation { continuation in
             queue.async {
+                self.flushDeferredRecordLogCommit()
                 do {
                     let result = try work.run()
                     continuation.resume(returning: result)
@@ -523,7 +597,7 @@ public final class SQLiteStorageProvider: StorageProvider, @unchecked Sendable {
 
     /// Stable default SQLite file path for a given `appId`, used by
     /// `JsBaoClient.setupStorage()` when no explicit storage directory
-    /// is supplied (issue #853). Keyed on `appId` only — NOT the full
+    /// is supplied. Keyed on `appId` only — NOT the full
     /// `initialize(namespace:)` string — so auth-scoped and
     /// user-scoped initialize calls resolve to the same file and the
     /// shared provider doesn't trip the re-bind guard. Logical
@@ -568,3 +642,30 @@ public enum SQLiteStorageError: Error, LocalizedError {
         }
     }
 }
+
+// MARK: - The record-log group commit (format 3)
+
+extension SQLiteStorageProvider: RecordLogGroupCommitHost {
+
+    var recordLogGroupCommit: RecordLogGroupCommit { recordLogGroup! }
+
+    func withRecordLogConnection<T>(_ body: (any Format2SqlConnection) throws -> T) throws -> T {
+        try withRawConnection(flushingGroup: false) { db in
+            try body(format2ConnectionOnQueue(db))
+        }
+    }
+
+    func registerDeferredCommit(_ commit: @escaping (any Format2SqlConnection) -> Void) {
+        deferredRecordLogCommit = commit
+    }
+
+    func clearDeferredCommit() {
+        deferredRecordLogCommit = nil
+    }
+
+    func scheduleOnQueue(afterMilliseconds milliseconds: Int, _ work: @escaping @Sendable () -> Void) {
+        queue.asyncAfter(deadline: .now() + .milliseconds(milliseconds), execute: work)
+    }
+}
+
+extension SQLiteStorageProvider: StoreNameListing {}

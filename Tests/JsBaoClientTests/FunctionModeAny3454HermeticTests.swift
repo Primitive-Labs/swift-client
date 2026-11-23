@@ -140,37 +140,34 @@ final class FunctionModeAny3454HermeticTests: XCTestCase {
         }
     }
 
-    // MARK: - The envelope backstop stands (a server that predates the routes)
+    // MARK: - No envelope backstop (#3190, M23)
 
-    func testAStartAnsweredWithAResultEnvelopeStillThrowsTheSameError() async throws {
-        // A server that predates #3482 has one route whose body field decided
-        // what it answered, so a `start` reaching it can still be handed a
-        // result. The shape check is what catches that, and it has to keep
-        // catching it (D3482-008).
+    /// The route is the runtime selector and the server refuses a body that
+    /// names one, so `.functionModeMismatch` is not a client code any more. A
+    /// start answered with no run identity is a body the client cannot read
+    /// as a start, and says so as a decode failure rather than inventing a run
+    /// id nobody could poll.
+    func testAStartAnsweredWithoutARunIsADecodeFailure() async throws {
         let (startApi, _) = api(
             status: 200, json: #"{"status":"completed","output":{"ok":true}}"#
         )
         do {
             _ = try await startApi.start("greet", input: nil as JSONValue?)
-            XCTFail("a result envelope from `start` must throw")
-        } catch let error as JsBaoError {
-            XCTAssertEqual(error.code, .functionModeMismatch)
-            XCTAssertTrue(error.message.contains("is a request function"), error.message)
+            XCTFail("a start answer with no run id must throw")
+        } catch let error as HttpError {
+            XCTAssertEqual(error.serverCode, HttpError.decodingFailedCode)
         }
     }
 
-    func testAnInvokeAnsweredWithAStartEnvelopeStillThrowsTheSameError() async throws {
+    /// An invoke hands back what the invoke route answered, as it came.
+    func testAnInvokeHandsBackTheAnswerAsItCame() async throws {
         let (invokeApi, _) = api(
             status: 201, json: #"{"runId":"r1","runKey":"r1","status":"running"}"#
         )
-        do {
-            _ = try await invokeApi.invoke(
-                "sweep", input: nil as JSONValue?
-            ) as FunctionResult<JSONValue>
-            XCTFail("a start envelope from `invoke` must throw")
-        } catch let error as JsBaoError {
-            XCTAssertEqual(error.code, .functionModeMismatch)
-            XCTAssertTrue(error.message.contains("is a task function"), error.message)
-        }
+        let result = try await invokeApi.invoke(
+            "sweep", input: nil as JSONValue?
+        ) as FunctionResult<JSONValue>
+        XCTAssertEqual(result.status, "running")
+        XCTAssertNil(result.output)
     }
 }

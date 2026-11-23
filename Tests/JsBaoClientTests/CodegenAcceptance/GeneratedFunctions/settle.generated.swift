@@ -1,6 +1,6 @@
 // AUTO-GENERATED FROM functions/settle.toml — DO NOT EDIT.
 // Run `primitive functions codegen --lang swift` to regenerate.
-// fingerprint: d2786dab0b79592e
+// fingerprint: d3965161741cd1d2
 
 import Foundation
 import JsBaoClient

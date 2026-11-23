@@ -153,6 +153,10 @@ model wrapper. Full explanation in
 emits a nested `<Field>Value` enum (advisory typed view; the wire stays a
 plain string) — the type name is sanitized so a keyword/leading-digit
 field name still produces a legal identifier (`default` → `DefaultValue`).
+`enforce_enum = true` beside it (a db3 type's opt-in to refusing values
+outside the set) changes nothing generated: the database enforces it, and a
+device refuses such a write with `.db3ValueNotInEnum`; any value but `true` or
+`false` is refused when the type is read.
 `auto_stamp = "create" | "update" | "both"` rides inside the field's
 `FieldDescriptor` literal, and the shared write path (`DynamicModel.save`)
 stamps `Date.now()`-style epoch millis on insert/update — matching JS
@@ -1031,6 +1035,34 @@ internal struct TaskRecord: PrimitiveModel, Equatable, Hashable, Codable {
 }
 ```
 
+The file also extends the struct with the app-facing facade: static reads
+(`query`, `queryPaged`, `count`, `find`, `findAll`, `findByUnique`,
+`queryOne`, `subscribe`, `aggregate`) and instance writes (`save(in:)`,
+`save(in:upsertOn:)`, `upsertByUnique`, `delete(in:)`). For a db3 it adds
+the write guards and counters, each calling `client.codegen` on the default
+client:
+
+```swift
+// Write only if the record still matches; confirm waits for the room's answer.
+task = try await task.save(in: db3Id, options: Db3WriteOptions(condition: ["category": "open"], confirm: true))
+try await Task(id: "daily-standup", title: "Standup").save(in: db3Id, options: Db3WriteOptions(ifNotExists: true))
+try await task.delete(in: db3Id, options: Db3WriteOptions(condition: ["completed": true]))
+
+// Add to number fields; answers the new values.
+let values = try await Post.increment(id: postId, fields: ["views": 1], in: db3Id)
+```
+
+A failed guard is refused `.db3ConditionNotMet` (the record as it is now
+under `details["current"]`), and an increment of a record the device does not
+hold `.db3RecordNotFound`. On a document that is not a db3 the options are
+ignored and `increment` throws `.invalidArgument`.
+
+The generated members spell the options type `JsBaoClient.Db3WriteOptions`
+(a public alias of `Db3WriteOptions`), so a schema that names a model
+`Db3WriteOptions` still compiles: that model shadows the bare name in the
+app's module, not the qualified one. App code where such a model exists
+passes `JsBaoClient.Db3WriteOptions(...)`.
+
 ### Change tracking (`_changedFields`)
 
 Every stored property carries a `didSet` that records the assignment in
@@ -1047,9 +1079,13 @@ Where the set starts:
 
 | Construction path | `_changedFields` | Why |
 |---|---|---|
-| Designated / auto-id `init` | every field carrying a value | a constructed record is new data (js-bao's `new Model({...})`) |
-| `init(from decoder:)` | every decoded field | decoding is a construction, not a store read |
+| Designated / auto-id `init` | every field carrying a value, but a default the model supplied | a constructed record is new data (js-bao's `new Model({...})`) |
+| `init(from decoder:)` | every decoded field, but a default the model supplied | decoding is a construction, not a store read |
 | `init?(record:)` / `init?(row:)` | empty | read back from the store — nothing is pending |
+
+A default the model supplied is one it filled in itself for a field with a
+default: a parameter left out, or a value it read or decoded without one (see
+[Fields with a default](#fields-with-a-default)).
 
 Property observers don't fire for an initializer's own assignments, so
 each init sets `_changedFields` explicitly to what that path means. The
@@ -1072,7 +1108,7 @@ holds it is an update that writes nothing — no error, no ops. (js-bao
 behaves the same way: `BaseModel.save` bails when `_diffWithYjsData` comes
 back empty and the target doc already has the record.) That's right for
 fetch–mutate–save and wrong for "copy this record over that one", so
-`markAllChanged()` re-arms the set:
+`markAllChanged()` re-arms the set, supplied defaults included:
 
 ```swift
 var copy = try TaskRecord.find(id)!
@@ -1085,14 +1121,79 @@ cost of asking for one.
 
 ### Field type mapping
 
-| TOML type | Swift type | Required-true override |
+| TOML type | Swift type | `required = true` or a literal `default` |
 |-----------|------------|------------------------|
 | `string`  | `String?`  | `String` |
 | `number`  | `Double?`  | `Double` |
 | `boolean` | `Bool?`    | `Bool` |
 | `date`    | `String?`  | `String` (ISO-8601, mirrors `record["x"]?.asDateString`) |
 | `id`      | `String`   | always non-optional |
-| `stringset` | `Set<String>?` | `Set<String>` |
+| `stringset` | `Set<String>?` | `Set<String>` with `required = true`; a `default` leaves it optional |
+
+### Fields with a default
+
+A `string`, `number`, `boolean`, `date` or `id` field that declares a literal
+`default` is a non-optional property. A record that has no value of the
+field's kind for it reads the default, so a read needs no fallback:
+
+```toml
+[models.institution.fields.disconnectPending]
+type = "boolean"
+default = false
+```
+
+```swift
+let institution = try InstitutionRecord.find(id)!
+if institution.disconnectPending { showReconnect() }   // Bool, not Bool?
+
+let fresh = InstitutionRecord(name: "Acme")             // parameter left out
+try fresh.save(in: docId)                              // the create stores false
+```
+
+Every way of building a model reads the field this way. `init?(record:)`,
+`init?(row:)` and `init(from:)` answer the default when the record or the
+JSON lacks the field, holds `null`, or holds a value of another kind, judged
+as stored: `"5"` in a number field, `1` in a boolean field, and a string that
+is not an ISO date in a date field all read the default. On a Y.Map document a
+stored `0` or `1` in a boolean field reads `false` or `true`, and any other
+number reads the default. A query row reads as its record does (a Y.Map row
+lists under `_meta_stored` a stored value its columns hold converted).
+`init(from:)` does not throw for such a field. A `date` default reads as its
+ISO string, read whole as the web client reads it: `"2026-01-01"` reads
+`"2026-01-01T00:00:00.000Z"` and `"2026-04-05 13:14:15+02:00"` reads
+`"2026-04-05T11:14:15.000Z"`; a time without an offset is local time where
+the code is generated, and text after the date makes it no date literal.
+Both initializers take the field as `T? = nil` and store the default when it
+is left out.
+
+The default is the model's own, never a write:
+
+- The read stores nothing, and a stored `null` stays `null`.
+- A default the model supplied is listed in `_suppliedDefaults` and left out of
+  `primitiveValues()`, a required field included, so saving the value over an
+  existing record does not write it and an upsert on it is refused as a
+  missing key rather than matching the record that holds the default. Inserting a new
+  record writes the default. Assigning the field, or calling
+  `markAllChanged()`, makes the value the caller's.
+- Queries, filters and sorts read stored values.
+
+A field without a `default`, a generator default (`"$now"`), a string default
+that starts with `$` (an escaped `"$$..."` included), a string set's default
+and a JSON field keep their optional types. A ref'd field with a
+default has a non-optional `<field>Raw`; its typed accessor stays optional,
+and assigning `nil` to it leaves the value unchanged.
+
+**Gotchas**
+
+- A filter on the default does not match a record that only reads it:
+  `{ done: false }` leaves out a record stored without `done`. Match the
+  missing field with `{ done: { $exists: false } }` too.
+- A model generated while a field had a default does not build records from
+  a db3 whose held revision clears that field: `init?(record:)` and
+  `init?(row:)` answer `nil`, because a non-optional property cannot read as
+  unset. Remove the `default` and ship that build before you clear the field;
+  the server refuses a push that clears a field with a default
+  (`cleared-field-defaulted`).
 
 ### Conformances are auto-emitted
 
@@ -1316,6 +1417,8 @@ behavior is pinned by a test in
 | Change | Behavior on existing records | Migration needed? |
 |---|---|---|
 | **Add an optional field** | Reads back as `nil` | No |
+| **Add a literal `default` to a field** | The property becomes non-optional; a record without a value of the field's kind reads the default | No — drop the `??` fallbacks and unwraps the compiler then flags |
+| **Clear a field that has a `default`** | The push is refused (`cleared-field-defaulted`); a model generated with the default builds no record from a db3 holding the clear | Yes — push the field without its `default`, ship that build, then clear it |
 | **Remove a field** | Data stays in Y.Map; `record[fieldName]` still reads it; never auto-overwritten | No (orphan is benign; can be cleaned up at leisure) |
 | **Rename a field** | Old data orphans at old key; new field reads `nil` | Yes — read old via `record[oldName]`, write new via `update(values: [newName: ...])`, optionally delete old |
 | **Add `required: true` to existing optional** | Typed `init?(record:)` returns `nil`; dynamic layer still surfaces the record (required is enforced at write, not read) | Yes — backfill the field on all existing records before deploying v2 |

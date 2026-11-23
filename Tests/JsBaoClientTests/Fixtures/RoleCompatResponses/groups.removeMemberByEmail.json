@@ -1,0 +1,16 @@
+{
+  "name": "groups.removeMemberByEmail",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "DELETE",
+  "path": "/app/<appId>/api/groups/team/baseline/members?email=<email>",
+  "caller": "owner",
+  "request": null,
+  "status": 200,
+  "body": {
+    "success": true,
+    "status": "pending_cancelled",
+    "email": "<email>",
+    "deferredCount": 1
+  }
+}

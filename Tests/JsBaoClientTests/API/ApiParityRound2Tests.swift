@@ -114,11 +114,11 @@ final class ApiParityRound2Tests: XCTestCase {
         XCTAssertNil(r.path, "refreshFromServer: false must not issue a server request")
     }
 
-    /// `ownedDocumentsPage` returns the `{ items, cursor }` envelope, mirroring
+    /// `ownedDocumentsPage` returns the `{ items, hasMore, nextCursor? }` envelope, mirroring
     /// JS's `ownedDocuments({ returnPage: true })` overload.
     func test_me_ownedDocumentsPage_returnsCursor() async throws {
         let r = CallRecorder()
-        r.response = ["items": [["documentId": "d1"]], "cursor": "next-page"]
+        r.response = ["items": [["documentId": "d1"]], "hasMore": true, "nextCursor": "next-page"]
         let api = MeAPI(transport: r)
 
         let page = try await api.ownedDocumentsPage(limit: 1)
@@ -128,6 +128,7 @@ final class ApiParityRound2Tests: XCTestCase {
 
     // MARK: - DocumentsAPI getOrCreateWithAlias
 
+    @available(*, deprecated)
     func test_documents_getOrCreateWithAlias_POST() async throws {
         let r = CallRecorder()
         let api = DocumentsAPI(
@@ -159,6 +160,7 @@ final class ApiParityRound2Tests: XCTestCase {
         XCTAssertEqual(body?["tags"] as? [String], ["pinned"])
     }
 
+    @available(*, deprecated)
     func test_documents_getOrCreateWithAlias_serializesUserScope() async throws {
         // The typed `DocumentAliasScope` enum makes "bad scope" values
         // (e.g. the JS test's `"bogus"`) unrepresentable at compile time —
@@ -188,6 +190,7 @@ final class ApiParityRound2Tests: XCTestCase {
         XCTAssertEqual(alias?["aliasKey"] as? String, "x")
     }
 
+    @available(*, deprecated)
     func test_documents_getOrCreateWithAlias_forwardsAliasKey() async throws {
         // The typed Swift surface forwards a non-empty `aliasKey` verbatim.
         let r = CallRecorder()
@@ -212,6 +215,7 @@ final class ApiParityRound2Tests: XCTestCase {
         XCTAssertEqual(alias?["aliasKey"] as? String, "notes")
     }
 
+    @available(*, deprecated)
     func test_documents_getOrCreateWithAlias_requiresAliasKey() async {
         // Parity with JS (`documentsApi.ts:583-584`): an empty `aliasKey`
         // throws client-side before any request is made.
@@ -238,6 +242,7 @@ final class ApiParityRound2Tests: XCTestCase {
         }
     }
 
+    @available(*, deprecated)
     func test_documents_createWithAlias_requiresAliasKey() async {
         // Parity with JS (`documentsApi.ts:532-533`).
         let r = CallRecorder()
@@ -269,6 +274,7 @@ final class ApiParityRound2Tests: XCTestCase {
     /// #2367 removed `CollectionsAPI.init(makeRequest:)`, so this now builds
     /// the API on the typed transport spine. The route assertions are what the
     /// test is for and are unchanged.
+    @available(*, deprecated)
     func test_collections_listAll_GET() async throws {
         let r = CallRecorder()
         let api = CollectionsAPI(transport: r)
@@ -303,6 +309,7 @@ final class ApiParityRound2Tests: XCTestCase {
 
     // MARK: - GroupsAPI new list helpers
 
+    @available(*, deprecated)
     func test_groups_listDatabases_GET() async throws {
         let r = CallRecorder()
         let api = GroupsAPI(transport: r)
@@ -312,6 +319,7 @@ final class ApiParityRound2Tests: XCTestCase {
         XCTAssertEqual(r.path, "/groups/team/g1/databases")
     }
 
+    @available(*, deprecated)
     func test_groups_listPendingInvitations_unwrapsItems() async throws {
         let r = CallRecorder()
         let api = GroupsAPI(transport: r)

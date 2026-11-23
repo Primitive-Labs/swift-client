@@ -1,0 +1,2769 @@
+import Foundation
+
+/// The socket a client's record-log sessions send on.
+protocol RecordLogConnection: AnyObject, Sendable {
+    /// Send one frame, in the order frames are handed over; it carries its
+    /// `type` and `documentId`.
+    func send(_ frame: [String: JSONValue])
+    /// Whether the socket is open and the client may use the network.
+    func connected() -> Bool
+    /// Whether the client may use the network, whatever the socket. The
+    /// socket stays open across `setNetworkMode(.offline)`; while this is
+    /// `false` what the room sends waits, and applies once it is `true` again.
+    var networkingAllowed: Bool { get }
+    /// Whether ``fetchArtifact(_:)`` reads the room's artifacts. A connection
+    /// that cannot is served rows: its opens declare no `accepts`.
+    var fetchesArtifacts: Bool { get }
+    /// Fetch one artifact the room granted (a load's manifest or chunk, a
+    /// segment's chunk) at its origin-relative `path`; the path carries the
+    /// grant, so no other credential is sent. Throws on any answer but 200.
+    func fetchArtifact(_ path: String) async throws -> Data
+}
+
+extension RecordLogConnection {
+    var networkingAllowed: Bool { true }
+
+    var fetchesArtifacts: Bool { false }
+
+    func fetchArtifact(_ path: String) async throws -> Data {
+        throw RecordLogReceiptFailure("the connection cannot fetch artifacts")
+    }
+}
+
+/// What one document's session needs of the client it belongs to.
+struct RecordLogSessionHost: Sendable {
+    /// The connection, once the client has given one.
+    var connection: @Sendable () -> (any RecordLogConnection)?
+    /// Every registered model's declaration, as `record.declare` carries it.
+    var declarations: @Sendable () -> [String: JSONValue]
+    /// The document's open handshake and catch-up completed as this client's writer.
+    var synced: @Sendable (String) -> Void
+    /// An open attempt ended without a handshake; the client may try again.
+    var syncFailed: @Sendable (String, String) -> Void
+    /// A receipt of chunks or a catch-up page made progress: the client's open
+    /// watchdog waits longer.
+    var progress: @Sendable (String) -> Void = { _ in }
+    /// The room acknowledged this session's declarations (`record.declared`):
+    /// an index it created for them is in its list from now.
+    var declared: @Sendable (String) -> Void = { _ in }
+    /// The room said the document's index list changed (`record.indexes`):
+    /// an index was registered or dropped there, by anyone, and the
+    /// list is read again.
+    var indexesChanged: @Sendable (String) -> Void = { _ in }
+    /// The session's status changed: its phase, or a progress step.
+    var status: @Sendable (String, RecordLogSessionStatus) -> Void = { _, _ in }
+    /// Whether an open of a store the room has not yet told whether its db3
+    /// is typed (its typed mark `unknown`) waits for `record.opened` before
+    /// it declares, as the client's does: a typed room refuses every
+    /// declaration. Without it the first open of a connection sends the
+    /// declaration ahead whatever the mark says, as before.
+    var waitsForTypeBeforeDeclaring = false
+    /// The per-db3 form of ``declarations``: the declarations of the
+    /// models one db3 uses, given the document and the models its copy holds
+    /// or its entries in hand write (sorted). With it an untyped open declares
+    /// that answer, a model's first write while open declares it, and an
+    /// earlier writer's drain declares what its entries write. Absent, the
+    /// session sends today's frames: every open and registration declares
+    /// ``declarations`` whole, and the drain declares nothing.
+    var scopedDeclarations: (@Sendable (_ documentId: String, _ held: [String]) -> [String: JSONValue])? = nil
+    /// The clock a frame's receipt is stamped with, epoch ms.
+    var now: @Sendable () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
+    /// Whether the client opens a db3 of the named type (#6024). Asked at
+    /// every `record.opened` of a typed db3, when the room answers a
+    /// declaration as typed, and before an open of a store holding a type.
+    /// Answered `false`, the session applies nothing of that open and ends
+    /// with `DB3_TYPE_UNKNOWN_TO_CLIENT`. Every type opens without it.
+    var acceptsType: @Sendable (_ documentId: String, _ name: String) -> Bool = { _, _ in true }
+}
+
+/// Where a db3's session is in its conversation with the room: `idle` (no
+/// open, or released), `opening` (`record.open` unanswered), `loading` (a
+/// cold load, a receipt of chunks or a full replacement), `catchingUp`
+/// (paged changes applying from the cursor), `live` (open as this client's
+/// writer). js-bao's `RecordLogSessionPhase`.
+enum RecordLogSessionPhase: String, Sendable, Equatable {
+    case idle
+    case opening
+    case loading
+    case catchingUp = "catching-up"
+    case live
+}
+
+/// How far a load or a catch-up is: chunks of a receipt, or entries of a paged catch-up.
+struct RecordLogSessionProgress: Sendable, Equatable {
+    enum Unit: String, Sendable, Equatable {
+        case chunks
+        case entries
+    }
+
+    var done: Int
+    var total: Int
+    var unit: Unit
+}
+
+/// A session's phase, with its progress while it loads or catches up.
+struct RecordLogSessionStatus: Sendable, Equatable {
+    var phase: RecordLogSessionPhase
+    var progress: RecordLogSessionProgress? = nil
+}
+
+/// How long the session waits, in milliseconds: the JS client's numbers by
+/// default, shorter in a test.
+struct RecordLogSessionTimings: Sendable {
+    var tickMs = RecordLogTransport.tickMs
+    var resultGapMs = RecordLogTransport.resultGapMs
+    var drainWaitMs = RecordLogTransport.drainWaitMs
+    /// The first wait before a refused own writer is opened again; it doubles up to 30 s.
+    var writerTakenRetryMs = 500
+    /// The first wait before an open whose catch-up page failed starts over; it doubles up to 30 s.
+    var catchUpRetryMs = 250
+    /// How long an open another client's replacement of the store overtook
+    /// waits for that replacement to complete; past it the other is taken to
+    /// be gone.
+    var replacementWaitMs = 30_000
+    /// How often that wait looks whether the other replacement completed.
+    var replacementPollMs = 100
+    /// How long an open waits on `building` answers (a segment being built for
+    /// it) before it opens without declaring `building` and takes pages.
+    var buildingMaxWaitMs = 60_000
+}
+
+/// What a document's sessions keep for as long as the client keeps its
+/// connection id: across reconnects, and across the document closed and opened
+/// again. The room may hold that id's subscription, and deliver what it queued
+/// on it, for as long.
+///
+/// `@unchecked Sendable`: both mutable properties, `_opened` and `_stale`, are
+/// read and written only under `lock`, a leaf lock held for the access alone.
+final class RecordLogWriterHistory: @unchecked Sendable {
+    /// A restored store's writer was re-minted while the room still owed
+    /// answers to entries sent ahead under its old id.
+    struct Stale {
+        /// The old id.
+        let writer: String
+        /// The number its `record.open` names.
+        let nextSeq: Int
+        /// Its numbers the room has not answered.
+        var seqs: Set<Int>
+    }
+
+    private let lock = NSLock()
+    private var _opened = Set<String>()
+    private var _stale: Stale?
+
+    /// The writers a `record.open` was sent for since the room last answered
+    /// the own writer's. A first open sends ahead only when none is another
+    /// writer: a server that judges the frames under a surviving subscription
+    /// would judge them as that writer's.
+    var opened: Set<String> {
+        get { lock.withLock { _opened } }
+        set { lock.withLock { _opened = newValue } }
+    }
+
+    /// The re-minted writer's old id the new id's open waits for, or `nil`.
+    var stale: Stale? {
+        get { lock.withLock { _stale } }
+        set { lock.withLock { _stale = newValue } }
+    }
+}
+
+/// What a connection that fetches artifacts declares it takes beside rows: a
+/// load's chunks, a segment's, and an answer to wait for a segment being built
+/// (`building`).
+private let recordLogAccepts: JSONValue = ["load", "segment", "building"]
+
+/// ``recordLogAccepts`` once an open has waited on `building` answers past its cap.
+private let recordLogAcceptsWithoutBuilding: JSONValue = ["load", "segment"]
+
+/// A streamed catch-up's reader credits the room after every this many pages that have `next`.
+let recordLogStreamCreditPages = 4
+
+/// The wait before opening again after a `building` answer that names none.
+private let recordLogBuildingRetryMs = 1_000
+
+/// Consecutive failed receipts after which the next open declares it takes rows only.
+let recordLogReceiptFailuresBeforeRows = 2
+
+/// A grant path as a log line shows it: the token is a credential, so it is left out.
+func recordLogShownPath(_ path: String) -> String {
+    guard let range = path.range(of: "/doc-artifact/") else { return path }
+    let rest = path[range.upperBound...]
+    let tail = rest.firstIndex(of: "/").map { String(rest[$0...]) } ?? ""
+    return String(path[..<range.lowerBound]) + "/doc-artifact/…" + tail
+}
+
+/// A format-3 document's conversation with its room over the client's socket:
+/// the port of js-bao's `session.ts`, rule for rule.
+///
+/// A paged catch-up starts as a stream: `record.catchUp` carries a
+/// fresh `stream` id, the room pushes every page marked with it, and the
+/// session credits every ``recordLogStreamCreditPages``th page that has
+/// `next`. A page marked with another id is ignored, so an abandoned attempt's
+/// last page never completes a newer one; a page with no mark is an older
+/// room's answer, and the next is asked for per `next` as before. A room that
+/// is building a segment for an open answers `building`, and the session
+/// opens again after the wait it names.
+///
+/// The session opens the document — first as each writer of the store that an
+/// earlier session left entries under (it resubmits them so the room answers
+/// each one, then moves on), then as this client's own writer. Each open
+/// applies the catch-up the room sends, records the epochs and constraints, and
+/// resubmits every unjudged entry of that writer in `seq` order. Once the own
+/// writer is open, the models are declared, entries are sent as their group
+/// commits, results and refusals are applied, and a refusal's withdrawn writes
+/// are handed back.
+///
+/// The connection's first open, when it is the own writer's (no orphan was
+/// opened before it), does not wait for `record.opened`: the declaration and
+/// the unacknowledged entries leave right behind `record.open`, so a reconnect
+/// with pending writes has them answered one round trip sooner. They go only
+/// when no `record.resume` can be owed: the lowest unacknowledged number is
+/// above the writer's `resumedAt`, so every number below it was judged by the
+/// room. The answers to those frames that arrive before the catch-up completes
+/// are held and applied in arrival order once it does, and a server that
+/// refuses them (`DOCUMENT_NOT_OPEN`) gets them again after the catch-up, as
+/// every other open sends them. Any later open on the connection (a reopen, an
+/// orphan's, the own writer's after an orphan's, a re-minted writer's) may
+/// replace the writer the socket's frames are judged under, so it sends
+/// `record.open` alone. So does a first open while the room may still hold the
+/// connection's subscription for another writer (one opened on an earlier
+/// connection since the own writer's last `record.opened`): a server that
+/// judges the frames under a surviving subscription would judge them as that
+/// writer's. A restored store's writer, re-minted at `record.opened`, opens
+/// under its new id only once the room answered what went ahead under the old
+/// one. Both are kept per document for as long as the client keeps its
+/// connection id (a reconnect, the document closed and opened again), as long
+/// as the room may hold that id's subscription.
+///
+/// **Concurrency.** An actor whose frame handlers contain no `await`: every
+/// store call is synchronous (it runs on the storage provider's queue), and
+/// frames go out through ``RecordLogConnection/send(_:)``, which keeps their
+/// order. So a handler is one decision region, and a later frame or a
+/// disconnect cannot interleave with it. Timers are tasks that hop back onto
+/// the actor and check the connection generation they were armed under.
+actor RecordLogSession {
+
+    private enum Phase { case idle, opening, catchingUp, loading, draining, open, closed }
+
+    /// An answer held until the catch-up completes, applied in arrival order.
+    private enum HeldAnswer {
+        /// Results, with what their frame said of the head and when it arrived.
+        case results([RecordLogResultItem], RecordLogHeard)
+        case refused(RecordLogRefusal)
+    }
+
+    /// What `frame` said of the room's head, stamped with when it arrived.
+    private static func heard(_ frame: [String: JSONValue], at receivedAt: Int64) -> RecordLogHeard {
+        RecordLogHeard(head: frame["head"]?.wholeNumber.flatMap { $0 >= 0 ? $0 : nil }, receivedAt: receivedAt)
+    }
+
+    /// When the frame being handled arrived, epoch ms.
+    private var receivedAt: Int64 = 0
+
+    /// What the open in progress sent ahead of its `record.opened`.
+    private struct SentAhead {
+        /// The server answered them `DOCUMENT_NOT_OPEN`: the catch-up's end sends them again.
+        var refused = false
+        /// The declaration that went with them, or `nil` when none did (none
+        /// goes to a typed db3).
+        var declarations: [String: JSONValue]?
+        /// A declaration went with them.
+        var declared: Bool { declarations != nil }
+        /// The numbers its `record.entries` frame carried.
+        var seqs: Set<Int> = []
+    }
+
+    /// The paged catch-up in progress. `released` once the room dropped the
+    /// subscription while a page request was out: the open goes again when
+    /// that request is answered.
+    private struct Paging {
+        var cursor: Int
+        var upTo: Int
+        /// The room walks its whole table (`record.catchUp {full: true}`).
+        var full: Bool
+        var high: Int
+        var released = false
+        /// The replacement's generation, when the pages complete a replacement of the table.
+        var generation: Int?
+        /// The receipt whose remainder these pages are.
+        var receipt: Receipt?
+        /// The id its start asked the room to stream under; `nil` once an older
+        /// room answered with a page that carries none (its pages are then
+        /// asked for one at a time).
+        var stream: String?
+        /// A page marked with `stream` arrived: the room streams, and no request is out.
+        var streamed = false
+        /// Pages with `next` applied, counted for credits.
+        var pages = 0
+        /// The entries the room said the catch-up carries (`catchUp.count`), when it did.
+        var total: Int?
+        /// The rows and removals applied so far, for the status's progress.
+        var applied = 0
+    }
+
+    /// Streamed catch-ups: pages applied, pages ignored as another stream's, credits sent.
+    struct StreamCounters: Sendable, Equatable {
+        var pages = 0
+        var stalePages = 0
+        var credits = 0
+    }
+
+    /// A receipt of a load's or a segment's chunks in progress. Read and
+    /// written only on the session; the task that runs it is isolated to the
+    /// session and hops off it only to fetch and to read a chunk's bytes.
+    private final class Receipt {
+        let kind: RecordLogReceiptKind
+        let id: String
+        /// Received from `record.load complete` on an open document, not as an open's catch-up.
+        let live: Bool
+        /// The connection it runs on (`generation` when it began).
+        let connection: Int
+        /// The writer its store commands run as.
+        let writer: String
+        let rows: Int
+        let chunks: Int
+        let startedAt = Date()
+        /// The store's id for it, once begun; its commands carry it.
+        var attempt: String?
+        var remainderRows = 0
+        /// A segment's chunks kept from the rows the store held instead of fetched.
+        var kept: Int?
+        /// A segment's chunks fetched.
+        var fetched: Int?
+        /// The chunks the attempt it continued had done, when it continued one.
+        var resumed: Int?
+        /// A segment's chunks, as the store holds them once the receipt completes.
+        var segment: RecordLogHeldSegment?
+        /// A `record.released` arrived while its chunks were fetched: it stops after the one in flight.
+        var released = false
+        /// Its chunks applied or kept so far, those of the attempt it continued
+        /// included, for the status's progress.
+        var applied = 0
+        var task: Task<Void, Never>?
+
+        init(kind: RecordLogReceiptKind, id: String, live: Bool, connection: Int, writer: String, rows: Int, chunks: Int) {
+            self.kind = kind
+            self.id = id
+            self.live = live
+            self.connection = connection
+            self.writer = writer
+            self.rows = rows
+            self.chunks = chunks
+        }
+    }
+
+    let documentId: String
+    private let binding: RecordLogDocumentBinding
+    private let host: RecordLogSessionHost
+    private let timings: RecordLogSessionTimings
+    private let logger: Logger?
+
+    /// The binding is live exactly while this is `open`.
+    private var phase: Phase = .idle {
+        didSet { if phase != oldValue { binding.setLive(phase == .open) } }
+    }
+    private var current: (writer: String, orphan: Bool)?
+    private var orphans: [(writer: String, lowestPending: Int)] = []
+    private var ownSender: RecordLogSender?
+    private var orphanSender: RecordLogSender?
+    /// The orphan writer's entries the room has not answered yet.
+    private var outstanding = Set<Int>()
+    private var drainTimer: Task<Void, Never>?
+    /// Result frames that arrived while a catch-up was being read; for an open
+    /// that sent frames ahead, also their answers (results and refusals) that
+    /// arrived while it was opening.
+    private var held: [HeldAnswer] = []
+    /// Frames the room sent while the client might not use the network, with
+    /// their receipt stamps, in the order they came. They apply once it may
+    /// again, and are dropped with the socket.
+    private var offlineFrames: [(frame: [String: JSONValue], receivedAt: Int64)] = []
+    /// The open in progress sent its declaration and entries ahead of `record.opened`, or `nil`.
+    private var ahead: SentAhead?
+    /// `record.open` frames sent on this connection; only its first may send frames ahead.
+    private var openedOnConnection = 0
+    /// Set while the frames sent ahead are flushed: the sender may send before the open completes.
+    private var sendingAhead = false
+    /// What the document's earlier sessions on this connection id left.
+    private let history: RecordLogWriterHistory
+    /// The wait past which a re-minted writer's open asks the old id's stream for a barrier.
+    private var staleTimer: Task<Void, Never>?
+    /// A `record.open` of the re-minted writer's old id is out on this
+    /// connection: its `record.opened`, queued on the old id's stream behind
+    /// every answer queued there before it, ends the wait.
+    private var barrier = false
+    private var paging: Paging?
+    private var takenRetryMs: Int
+    private var catchUpRetryMs: Int
+    /// Counts the connections this session has lost. A timer armed under one
+    /// generation does nothing under another: the socket it was for is gone.
+    private var generation = 0
+    private var retryTimer: Task<Void, Never>?
+    /// The highest log number received ahead of the cursor, and the timer that catches up past it.
+    private var gapAhead = 0
+    private var gapTimer: Task<Void, Never>?
+    /// The room's `lastSeq` for the writer being opened, from its `record.opened`.
+    private var lastSeq = 0
+    private var clockWork: [Int: () -> Void] = [:]
+    private var clockTasks: [Int: Task<Void, Never>] = [:]
+    private var nextClockHandle = 0
+    /// The binding's declaration version the room was last sent in `record.declare`.
+    private var declaredVersion = -1
+    /// The models this open declared, for a host that scopes declarations:
+    /// a model's first write while open is declared once.
+    private var declaredThisOpen = Set<String>()
+    private var commitToken: UUID?
+    private var commitFeed: AsyncStream<[RecordLogPendingEntry]>.Continuation?
+    private var commitConsumer: Task<Void, Never>?
+    /// The saves the last catch-up dealt with (queued if unjudged, answered
+    /// otherwise), for a commit notice the commit task delivers only after
+    /// it. A save is named by its number and its ticket
+    /// (``RecordLogDocumentBinding/ticket(of:)``): a failed group gives its
+    /// numbers back, and the save that takes one again is a new entry with a
+    /// newer ticket, which still goes.
+    private var handedThrough: HandedThrough?
+
+    /// What ``handedThrough`` holds: every save numbered at or below
+    /// `minted` with a ticket at or below `mintedTicket`, and the saves the
+    /// catch-up read above `minted` (`read`) with a ticket at or below `readTicket`.
+    private struct HandedThrough {
+        let writer: String
+        let minted: Int
+        let mintedTicket: Int
+        let read: Set<Int>
+        let readTicket: Int
+
+        /// Whether the catch-up dealt with the save numbered `seq` that holds `ticket`.
+        func dealtWith(_ seq: Int, ticket: Int) -> Bool {
+            seq <= minted ? ticket <= mintedTicket : read.contains(seq) && ticket <= readTicket
+        }
+    }
+    /// Run once by the next catch-up between reading the watermark and
+    /// reading the pending entries: the hermetic tests' way to commit a write there.
+    private var betweenCatchUpReads: (@Sendable () -> Void)?
+    /// The load the room said is applying (`record.load started`): results stall behind its numbers on purpose.
+    private var loadInProgress: String?
+    /// Completed loads announced while the session was busy, received once it is open.
+    private var queuedLoads: [RecordLogLoadPointer] = []
+    /// The receipt of chunks in progress.
+    private var receipt: Receipt?
+    /// Receipts that failed in a row; at ``recordLogReceiptFailuresBeforeRows`` the next open takes rows only.
+    private var failedReceipts = 0
+    /// A load ended aborted or failed during a catch-up: open again once it completes.
+    private var reopenAfterCatchUp = false
+    /// Counts opens; a wait for another client's replacement opens again only if none was sent since.
+    private var opens = 0
+    private var replacementTimer: Task<Void, Never>?
+    /// The room streams: its last `record.opened` said so (`streams: true`),
+    /// or a page marked with a stream id arrived on this connection. A stream
+    /// start then has no answer out; an older room answers it with an
+    /// unmarked page.
+    private var roomStreams = false
+    /// The room refused this client's wire version (`DB3_CLIENT_OUTDATED`):
+    /// the session does not open the document again.
+    private var outdated = false
+    /// The client does not open the db3's type (`DB3_TYPE_UNKNOWN_TO_CLIENT`):
+    /// the session opens again only once its host accepts the type.
+    private var typeRefused = false
+    /// When the first of the `building` answers in a row arrived; `nil` when the last answer was another form.
+    private var buildingSince: Date?
+    /// This session's stream ids: a prefix of its own and a count.
+    private let streamPrefix = String(UUID().uuidString.prefix(8))
+    private var streamSeq = 0
+    /// Streamed catch-ups, for the tests.
+    private(set) var streamCounters = StreamCounters()
+    /// The status last reported; a report that changes nothing is not made.
+    private var reported = RecordLogSessionStatus(phase: .idle)
+
+    init(
+        documentId: String, binding: RecordLogDocumentBinding, host: RecordLogSessionHost,
+        timings: RecordLogSessionTimings = RecordLogSessionTimings(), logger: Logger? = nil,
+        history: RecordLogWriterHistory = RecordLogWriterHistory()
+    ) {
+        self.history = history
+        self.documentId = documentId
+        self.binding = binding
+        self.host = host
+        self.timings = timings
+        self.logger = logger
+        self.takenRetryMs = timings.writerTakenRetryMs
+        self.catchUpRetryMs = timings.catchUpRetryMs
+    }
+
+    /// Begin hearing this writer's committed entries. Called once after init.
+    func attach() {
+        guard commitFeed == nil else { return }
+        // In commit order: one stream, consumed by one task.
+        let (stream, feed) = AsyncStream.makeStream(of: [RecordLogPendingEntry].self)
+        commitFeed = feed
+        commitToken = binding.onCommitted { entries in feed.yield(entries) }
+        commitConsumer = Task { [weak self] in
+            for await entries in stream { await self?.committed(entries) }
+        }
+    }
+
+    /// Whether the session has opened the document as this client's writer.
+    var isOpen: Bool { phase == .open }
+
+    /// The upstream queue of this client's writer.
+    private var sender: RecordLogSender {
+        if let ownSender { return ownSender }
+        let made = makeSender(orphanWriter: nil)
+        ownSender = made
+        return made
+    }
+
+    /// A sender whose frames leave while this writer is the one open: the own
+    /// writer's while the document is open, or an orphan's while it drains.
+    /// Its closures are formed here, on the session, and run only here; they
+    /// hold the session strongly until ``close()`` drops the senders.
+    private func makeSender(orphanWriter: String?) -> RecordLogSender {
+        let clock = RecordLogClosureClock(
+            schedule: { milliseconds, work in self.schedule(milliseconds, work) },
+            cancel: { handle in self.cancelScheduled(handle) }
+        )
+        return RecordLogSender(
+            clock: clock, tickMs: timings.tickMs,
+            connected: {
+                guard let orphanWriter else { return (self.phase == .open || self.sendingAhead) && self.connected() }
+                return self.phase == .draining && self.current?.writer == orphanWriter && self.connected()
+            },
+            send: { frame in self.send(frame.json) }
+        )
+    }
+
+    private func connected() -> Bool { host.connection()?.connected() == true }
+
+    private func send(_ frame: JSONValue) {
+        guard var object = frame.objectValue, let connection = host.connection() else { return }
+        object["documentId"] = .string(documentId)
+        connection.send(object)
+    }
+
+    // MARK: - Timers
+
+    private func schedule(_ milliseconds: Int, _ work: @escaping () -> Void) -> Int {
+        nextClockHandle += 1
+        let handle = nextClockHandle
+        clockWork[handle] = work
+        clockTasks[handle] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, milliseconds)) * 1_000_000)
+            await self?.fire(handle)
+        }
+        return handle
+    }
+
+    private func cancelScheduled(_ handle: Int) {
+        clockWork[handle] = nil
+        clockTasks.removeValue(forKey: handle)?.cancel()
+    }
+
+    private func fire(_ handle: Int) {
+        clockTasks[handle] = nil
+        guard let work = clockWork.removeValue(forKey: handle) else { return }
+        work()
+    }
+
+    /// Run `body` on the session after `milliseconds`, unless the connection
+    /// it was armed under is gone by then.
+    private func after(_ milliseconds: Int, _ body: @escaping @Sendable (isolated RecordLogSession) -> Void) -> Task<Void, Never> {
+        let armed = generation
+        return Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, milliseconds)) * 1_000_000)
+            guard !Task.isCancelled, let self else { return }
+            await self.run(armed, body)
+        }
+    }
+
+    private func run(_ armed: Int, _ body: @Sendable (isolated RecordLogSession) -> Void) {
+        guard armed == generation, phase != .closed else { return }
+        body(self)
+        reportStatus()
+    }
+
+    // MARK: - Status
+
+    /// Where the session is: its phase, with chunk progress while a receipt's
+    /// chunks arrive and entry progress while paged changes apply. js-bao's
+    /// `status()`.
+    func status() -> RecordLogSessionStatus {
+        switch phase {
+        case .open: return RecordLogSessionStatus(phase: .live)
+        case .opening: return RecordLogSessionStatus(phase: .opening)
+        case .idle, .closed: return RecordLogSessionStatus(phase: .idle)
+        case .catchingUp, .loading, .draining: break
+        }
+        if let receipt, paging == nil || paging?.receipt === receipt {
+            let done = paging != nil ? receipt.chunks : min(receipt.applied, receipt.chunks)
+            return RecordLogSessionStatus(
+                phase: .loading, progress: RecordLogSessionProgress(done: done, total: receipt.chunks, unit: .chunks)
+            )
+        }
+        // A full walk, a replacement's pages or a store's first load is a load;
+        // paged changes from a cursor the store caught up to are a catch-up.
+        let cold = paging.map { $0.cursor == 0 && binding.marks.lastCatchUpAt == nil } ?? false
+        let loading = phase == .loading || (paging.map { $0.full || $0.generation != nil || cold } ?? false)
+        let reportedPhase: RecordLogSessionPhase = loading ? .loading : .catchingUp
+        guard let paging, let total = paging.total else { return RecordLogSessionStatus(phase: reportedPhase) }
+        return RecordLogSessionStatus(
+            phase: reportedPhase,
+            progress: RecordLogSessionProgress(done: paging.applied, total: max(total, paging.applied), unit: .entries)
+        )
+    }
+
+    /// Tell the host the status when it changed since it was last told.
+    private func reportStatus() {
+        let now = status()
+        guard now != reported else { return }
+        reported = now
+        host.status(documentId, now)
+    }
+
+    /// A receipt or a catch-up made progress: the client's open watchdog
+    /// waits longer, and the status is reported.
+    private func progressed() {
+        host.progress(documentId)
+        reportStatus()
+    }
+
+    // MARK: - Opening
+
+    /// Open the document on the connection, unless an open is under way or
+    /// done (a done one is reported again). Writers an earlier session left
+    /// entries under are opened first.
+    func start() {
+        open()
+        reportStatus()
+    }
+
+    private func open() {
+        if phase == .open {
+            host.synced(documentId)
+            return
+        }
+        if phase == .catchingUp || phase == .loading, let stream = paging?.stream, paging?.streamed == true || roomStreams {
+            // Started again while a stream runs: the open's watchdog saw no
+            // page in its budget (a room evicted mid stream ignores the credit
+            // and pushes nothing more). No request is out, and a late page of
+            // this stream is ignored by its id, so the open goes again at once.
+            // A room not known to stream may still owe the start an unmarked
+            // page, which the next open's catch-up would take for its own:
+            // that one is waited for, as for any page request.
+            logger?.log("[record-log]", documentId, "— the streamed catch-up", stream, "stopped; opening again from the cursor")
+            paging = nil
+            stopReceipt()
+            attempt("reopen a stopped stream") { try sendOpen() }
+            return
+        }
+        guard phase == .idle else { return }
+        // A db3 that lives only on this device (#5155) has no room: nothing
+        // names it on the socket.
+        if binding.isLocalOnly {
+            logger?.debug("[record-log]", documentId, "— lives only on this device; not opened on the socket")
+            return
+        }
+        if outdated {
+            // The room refused this client's wire version: opening again is refused again.
+            logger?.debug("[record-log]", documentId, "— not opened: the room needs a newer client (DB3_CLIENT_OUTDATED)")
+            return
+        }
+        if binding.marks.typed == .yes, let name = binding.marks.db3Type?.name, !host.acceptsType(documentId, name) {
+            // A type this client does not open: no open is sent, on a reconnect or otherwise.
+            logger?.debug("[record-log]", documentId, "— not opened: its type", name, "is not one this client opens (DB3_TYPE_UNKNOWN_TO_CLIENT)")
+            if !typeRefused {
+                typeRefused = true
+                host.syncFailed(documentId, JsBaoErrorCode.db3TypeUnknownToClient.rawValue)
+            }
+            return
+        }
+        typeRefused = false
+        guard connected() else {
+            host.syncFailed(documentId, "not connected")
+            return
+        }
+        phase = .opening
+        attempt("start") {
+            let own = binding.writer
+            let state = try binding.store.storedState()
+            orphans = state.writers
+                .filter { $0.writer != own && $0.pending > 0 }
+                .map { ($0.writer, $0.lowestPending) }
+            if !orphans.isEmpty {
+                logger?.log("[record-log]", documentId, "— draining", orphans.count, "earlier writer(s) before opening")
+            }
+            // A re-minted writer's old id may still have answers queued for this
+            // connection id: they come through before anything is opened.
+            if history.stale != nil { return try sendBarrier() }
+            try openNext()
+        }
+    }
+
+    /// Run one step of an open; a store failure ends the attempt.
+    private func attempt(_ what: String, _ body: () throws -> Void) {
+        do {
+            try body()
+        } catch {
+            logger?.warn("[record-log]", documentId, "—", what, "failed:", error.localizedDescription)
+            if phase == .opening || phase == .catchingUp || phase == .loading || phase == .draining {
+                phase = .idle
+                current = nil
+                paging = nil
+                stopReceipt()
+                host.syncFailed(documentId, error.localizedDescription)
+            }
+        }
+    }
+
+    private func openNext() throws {
+        if !orphans.isEmpty {
+            let orphan = orphans.removeFirst()
+            current = (orphan.writer, true)
+        } else {
+            current = (binding.writer, false)
+        }
+        try sendOpen()
+    }
+
+    private func sendOpen() throws {
+        guard let current else { return }
+        if ahead != nil {
+            // This open replaces one that sent frames ahead: what was held for
+            // them belongs to it, and this open resubmits what is still unjudged.
+            ahead = nil
+            held = []
+        }
+        let marks = try binding.refreshMarks()
+        let pending = try binding.store.pendingOf(current.writer)
+        let unacked = pending.filter { $0.acked == nil }
+        // The next number the room will receive from this writer: its lowest
+        // unacknowledged entry, or the one it would mint next.
+        let nextSeq = unacked.first?.seq
+            ?? (current.orphan ? max(1, (pending.map(\.seq).max() ?? 0) + 1) : marks.nextSeq)
+        phase = .opening
+        opens += 1
+        // The room tells a reopened subscriber again of a load still applying.
+        loadInProgress = nil
+        replacementTimer?.cancel()
+        replacementTimer = nil
+        var open: [String: JSONValue] = [
+            "type": "record.open",
+            "writer": .string(current.writer),
+            "cursor": .number(Double(marks.cursor)),
+            "nextSeq": .number(Double(nextSeq)),
+            "open": .number(Double(marks.open)),
+            "formats": [3],
+            "documentFormat": 3,
+            // Own entries the room applied as written come back as {l, e, w, seq}:
+            // the store derives their rows from its pending entries.
+            "acks": "compact",
+            // A room past this client's wire version refuses the open (DB3_CLIENT_OUTDATED).
+            "wireVersion": .number(Double(recordLogWireVersion)),
+        ]
+        if host.connection()?.fetchesArtifacts == true {
+            let waited = buildingSince.map { Date().timeIntervalSince($0) * 1000 >= Double(timings.buildingMaxWaitMs) } ?? false
+            if waited {
+                logger?.log("[record-log]", documentId, "— waited", timings.buildingMaxWaitMs, "ms for a segment being built; opening for pages instead")
+            }
+            let declared = failedReceipts >= recordLogReceiptFailuresBeforeRows
+                ? [] : (waited ? recordLogAcceptsWithoutBuilding : recordLogAccepts)
+            open["accepts"] = declared
+            // The download this device left unfinished (#5268): the room offers
+            // it again when it still can, and the receipt continues where it stopped.
+            if case .array(let tokens) = declared, !tokens.isEmpty, let receipt = marks.receipt {
+                open["unfinished"] = .object(["kind": .string(receipt.kind.rawValue), "id": .string(receipt.id)])
+            }
+        }
+        // Only the connection's first open sends ahead: a later one may switch
+        // the writer the socket's frames are judged under, and the answers to
+        // frames sent under a writer since replaced cannot be told apart once
+        // its numbers are reused. Nor while the room may still hold this
+        // connection id's subscription for another writer: a server that
+        // judges the frames under it would answer them as that writer's. And
+        // only when no resume can be owed: every number below `nextSeq` is
+        // then one the room judged.
+        // A db3 the room may hold typed (#5020): nothing is declared ahead of
+        // its answer, and a typed one is never declared to.
+        let sendAhead = !current.orphan && openedOnConnection == 0
+            && history.opened.allSatisfy { $0 == current.writer } && nextSeq > marks.resumedAt
+            && (marks.typed != .unknown || !host.waitsForTypeBeforeDeclaring)
+        // The type revision whose declarations this device holds: the room
+        // sends them again only for another one.
+        // An entry held from before vectors (#5225) lacks the encodings: the
+        // room sends the declarations again, with them, when no hash is sent.
+        if marks.typed == .yes, marks.vectorsKnown, marks.enumsKnown, marks.clearedKnown, let hash = marks.db3Type?.hash { open["db3TypeHash"] = .string(hash) }
+        openedOnConnection += 1
+        history.opened.insert(current.writer)
+        declaredThisOpen = []
+        send(.object(open))
+        guard sendAhead else { return }
+        ahead = SentAhead()
+        declaredVersion = binding.declarationVersion
+        if marks.typed != .yes {
+            let models = declarationsFor(pending)
+            ahead?.declarations = models
+            enqueueDeclare(models, on: sender)
+        }
+        for entry in unacked { sender.enqueue(entry.wire) }
+        sendingAhead = true
+        sender.flush()
+        sendingAhead = false
+        ahead?.seqs = sender.inFlightSeqs
+    }
+
+    /// The numbers sent ahead under the writer being opened that the room has
+    /// not answered: none once it refused them, and none an answer held so far
+    /// names.
+    private func owedAhead(_ writer: String) -> Set<Int> {
+        guard let ahead, !ahead.refused else { return [] }
+        var owed = ahead.seqs
+        for answer in held {
+            switch answer {
+            case .refused(let refusal): owed.remove(refusal.seq)
+            case .results(let items, _): owed.subtract(Self.answeredSeqs(items, writer: writer))
+            }
+        }
+        return owed
+    }
+
+    /// A restored store's writer was re-minted while the room owed answers to
+    /// entries sent ahead under its old id. The room queues those answers on
+    /// the old subscription's stream, which the new open's does not wait for,
+    /// and a `void` or `duplicate` names no writer: one arriving once the new
+    /// id's renumbered entries went would be read as theirs. So the new id
+    /// opens once every owed number is answered (the answers are dropped), the
+    /// entries frame is refused, or the subscription is released. Past the
+    /// drain wait the old id is opened again (``sendBarrier()``): its
+    /// `record.opened` follows what is queued for it.
+    private func waitForStale(writer: String, nextSeq: Int, owed: Set<Int>) {
+        ahead = nil
+        held = []
+        history.stale = RecordLogWriterHistory.Stale(writer: writer, nextSeq: nextSeq, seqs: owed)
+        staleTimer = after(timings.drainWaitMs) { session in
+            guard let stale = session.history.stale, session.staleTimer != nil else { return }
+            session.staleTimer = nil
+            session.logger?.warn(
+                "[record-log]", session.documentId, "— the room has not answered", stale.seqs.count,
+                "entr(ies) sent under the re-minted writer's old id; opening the old id again so its answer follows them"
+            )
+            session.attempt("re-minted writer's old open") { try session.sendBarrier() }
+        }
+    }
+
+    /// Open the re-minted writer's old id again. The room queues the answer on
+    /// that id's stream, behind every answer queued there before it; a room
+    /// that lost them (stopped, or its delivery failed) answers on a stream
+    /// that never carries them. A wait past which answers are taken to be lost
+    /// would let a late one settle the new id's numbers. Answers that arrive
+    /// meanwhile are dropped; only this open's answer ends the wait.
+    private func sendBarrier() throws {
+        guard let stale = history.stale else { return }
+        let marks = try binding.refreshMarks()
+        barrier = true
+        openedOnConnection += 1
+        history.opened.insert(stale.writer)
+        send(.object([
+            "type": "record.open",
+            "writer": .string(stale.writer),
+            "cursor": .number(Double(marks.cursor)),
+            "nextSeq": .number(Double(stale.nextSeq)),
+            "open": .number(Double(marks.open)),
+            "formats": [3],
+            "documentFormat": 3,
+            "acks": "compact",
+            "wireVersion": .number(Double(recordLogWireVersion)),
+        ]))
+    }
+
+    /// Answers to the old id's entries arrived: dropped, and the new id opens once none is owed.
+    private func staleAnswered(_ seqs: [Int]) throws {
+        guard var stale = history.stale, !barrier else { return }
+        stale.seqs.subtract(seqs)
+        history.stale = stale
+        if stale.seqs.isEmpty { try endStale() }
+    }
+
+    /// Nothing more of the old id can come: the document opens (orphans first, on a new connection).
+    private func endStale() throws {
+        guard history.stale != nil else { return }
+        staleTimer?.cancel()
+        staleTimer = nil
+        barrier = false
+        history.stale = nil
+        try openNext()
+    }
+
+    /// The socket closed: everything in flight is gone, and the next open starts over.
+    func disconnected() {
+        guard phase != .closed else { return }
+        generation += 1
+        phase = .idle
+        current = nil
+        orphans = []
+        paging = nil
+        roomStreams = false
+        buildingSince = nil
+        held = []
+        // The next open catches up from the cursor past what they carried.
+        offlineFrames = []
+        ahead = nil
+        openedOnConnection = 0
+        // A re-minted writer's wait outlives the socket: what the old id's
+        // subscription queued may be delivered on the next one.
+        staleTimer?.cancel()
+        staleTimer = nil
+        barrier = false
+        ownSender?.reset()
+        orphanSender?.reset()
+        orphanSender = nil
+        outstanding = []
+        drainTimer?.cancel()
+        drainTimer = nil
+        retryTimer?.cancel()
+        retryTimer = nil
+        replacementTimer?.cancel()
+        replacementTimer = nil
+        stopReceipt()
+        queuedLoads = []
+        loadInProgress = nil
+        reopenAfterCatchUp = false
+        clearGap()
+        reportStatus()
+    }
+
+    /// The receipt in progress stops: its task is cancelled, and nothing it
+    /// was fetching is applied.
+    private func stopReceipt() {
+        receipt?.task?.cancel()
+        receipt = nil
+    }
+
+    /// Stop the conversation without a socket loss: the session goes idle as
+    /// on a disconnect, nothing more is sent, and the next ``start()`` opens
+    /// from the store's cursor. The caller tells the room it unsubscribed.
+    func release() {
+        guard phase != .closed else { return }
+        disconnected()
+        // No answer is coming on this conversation: a caller waiting for one is told.
+        binding.releaseAcknowledgementWaiters()
+    }
+
+    /// The document closed: stop, and stop hearing its commits.
+    func close() {
+        disconnected()
+        phase = .closed
+        ownSender = nil
+        if let commitToken { binding.removeCommitListener(commitToken) }
+        commitToken = nil
+        commitFeed?.finish()
+        commitFeed = nil
+        commitConsumer?.cancel()
+        for task in clockTasks.values { task.cancel() }
+        clockTasks = [:]
+        clockWork = [:]
+    }
+
+    /// The socket may carry frames again: what the room sent meanwhile
+    /// applies, and queued entries leave at the next tick.
+    func kick() {
+        applyOfflineFrames()
+        ownSender?.kick()
+    }
+
+    /// The room said this client may write again (a connect with write access):
+    /// a `read` the room set earlier is lifted.
+    func adoptWriteAccess() {
+        guard binding.isReadOnly else { return }
+        logger?.log("[record-log]", documentId, "— connected with write access again; saves are allowed")
+        _ = try? binding.setState(permission: .some(nil))
+    }
+
+    private func clearGap() {
+        gapTimer?.cancel()
+        gapTimer = nil
+        gapAhead = 0
+    }
+
+    /// Results arrived past a missing one. If the missing one has not come
+    /// within the result-gap wait, the writer is opened again from its cursor:
+    /// the catch-up carries what the lost result changed.
+    private func watchGap(cursor: Int, items: [RecordLogResultItem]) {
+        // A load applying: its rows are never relayed, so the results after
+        // them wait on purpose until its pointer is received.
+        if loadInProgress != nil {
+            clearGap()
+            return
+        }
+        for item in items {
+            if case .result(let result) = item, result.l > cursor { gapAhead = max(gapAhead, result.l) }
+        }
+        if gapAhead <= cursor {
+            clearGap()
+            return
+        }
+        guard gapTimer == nil else { return }
+        gapTimer = after(timings.resultGapMs) { session in
+            session.gapTimer = nil
+            session.attempt("result gap") {
+                let marks = try session.binding.refreshMarks()
+                guard session.phase == .open, session.loadInProgress == nil, session.gapAhead > marks.cursor else { return }
+                session.logger?.warn(
+                    "[record-log] result gap", session.documentId, "— results up to", session.gapAhead,
+                    "wait behind", marks.cursor + 1, "; catching up from the cursor"
+                )
+                session.gapAhead = 0
+                try session.sendOpen()
+            }
+        }
+    }
+
+    // MARK: - Frames
+
+    /// One frame the room sent about this document, stamped with its receipt
+    /// before it waits for the session: the head it carries was heard
+    /// then, however long the session was busy.
+    nonisolated func deliver(_ frame: [String: JSONValue]) async {
+        await receive(frame, receivedAt: host.now())
+    }
+
+    /// One frame the room sent about this document, heard at `stamp` (epoch
+    /// ms; now when `nil`).
+    func receive(_ frame: [String: JSONValue], receivedAt stamp: Int64? = nil) {
+        guard phase != .closed else { return }
+        let stamp = stamp ?? host.now()
+        // Offline on a socket that stays open, the copy changes no more until
+        // the client may use the network again (#5447): the frame waits behind
+        // any that came before it.
+        offlineFrames.append((frame, stamp))
+        applyOfflineFrames()
+    }
+
+    /// Apply the frames that waited while the client might not use the
+    /// network, in the order they came, while it may. Asked before each: a
+    /// listener a frame tells may set the client offline again, and the rest
+    /// wait for the next kick.
+    private func applyOfflineFrames() {
+        while !offlineFrames.isEmpty, phase != .closed, host.connection()?.networkingAllowed != false {
+            let (frame, stamp) = offlineFrames.removeFirst()
+            apply(frame, receivedAt: stamp)
+        }
+    }
+
+    private func apply(_ frame: [String: JSONValue], receivedAt stamp: Int64) {
+        // Stamped on arrival, before a catch-up holds it (#5221): the head it carries was heard then.
+        receivedAt = stamp
+        defer { reportStatus() }
+        let type = frame["type"]?.stringValue ?? ""
+        switch type {
+        case "record.opened": attempt("record.opened") { try opened(frame) }
+        case "record.catchUpPage": attempt("record.catchUpPage") { try catchUpPage(frame) }
+        case "record.results":
+            let items = (frame["results"]?.arrayValue ?? []).compactMap { RecordLogResultItem(json: $0) }
+            let heard = Self.heard(frame, at: receivedAt)
+            attempt("record.results") { try results(items, heard: heard) }
+        case "record.refused":
+            guard let refusal = RecordLogRefusal(json: .object(frame)) else { return }
+            attempt("record.refused") { try refused(refusal) }
+        case "record.gap":
+            guard let expected = frame["expected"]?.wholeNumber else { return }
+            attempt("record.gap") { try gap(expected) }
+        case "record.released": attempt("record.released") { try released(frame) }
+        case "record.load": attempt("record.load") { try load(frame) }
+        case "record.epoch":
+            guard let current = frame["current"]?.wholeNumber else { return }
+            attempt("record.epoch") {
+                try binding.setState(notice: (current, frame["next"]?.wholeNumber ?? current + 1, frame["entries"]?.wholeNumber))
+            }
+        case "record.declared":
+            host.declared(documentId)
+            let refused = (frame["refused"]?.arrayValue ?? []).compactMap(\.stringValue)
+            guard !refused.isEmpty else { return }
+            logger?.warn(
+                "[record-log] constraint refused", documentId, "— the room keeps", refused.joined(separator: ", "),
+                "out of force (live records already share the key); saves are no longer pre-checked against it"
+            )
+            attempt("record.declared") { try binding.excludeConstraints(refused) }
+        // The list itself is read over HTTP: the frame only says it changed (#5322).
+        case "record.indexes": host.indexesChanged(documentId)
+        case "error": attempt("error") { try error(frame) }
+        default:
+            logger?.debug("[record-log]", documentId, "— ignored", type)
+        }
+    }
+
+    /// What a `record.opened` says of the db3's type: no `db3Type` key
+    /// is an untyped room; an object with a string `name` and `hash` (and,
+    /// when sent, `models` of field kinds, `vectors` of each vector field's
+    /// encoding, and `enums` of each enforced field's values) is
+    /// the room's type. A malformed value changes nothing.
+    private func typeOfOpened(_ frame: [String: JSONValue]) -> RecordLogTypeUpdate? {
+        guard let value = frame["db3Type"], value != .null else { return .untyped }
+        guard let object = value.objectValue, let name = object["name"]?.stringValue, !name.isEmpty,
+              let hash = object["hash"]?.stringValue, !hash.isEmpty
+        else {
+            logger?.warn("[record-log]", documentId, "— record.opened carried a db3Type this client cannot read; the type it holds is kept")
+            return nil
+        }
+        guard let models = object["models"] else { return .typed(name: name, hash: hash, models: nil) }
+        var declarations: [String: [String: String]] = [:]
+        for (model, fields) in models.objectValue ?? [:] {
+            guard let kinds = fields.objectValue else { return malformed() }
+            var declared: [String: String] = [:]
+            for (field, kind) in kinds {
+                guard let kind = kind.stringValue else { return malformed() }
+                declared[field] = kind
+            }
+            declarations[model] = declared
+        }
+        guard models.objectValue != nil else { return malformed() }
+        var vectors: RecordLogVectorDeclarations?
+        if let sent = object["vectors"], sent != .null {
+            guard let read = recordLogVectorDeclarations(sent) else { return malformed() }
+            vectors = read
+        }
+        var enums: RecordLogEnumDeclarations?
+        if let sent = object["enums"], sent != .null {
+            guard let read = recordLogEnumDeclarations(sent) else { return malformed() }
+            enums = read
+        }
+        var cleared: RecordLogClearedDeclarations?
+        if let sent = object["cleared"], sent != .null {
+            guard let read = recordLogClearedDeclarations(sent) else { return malformed() }
+            cleared = read
+        }
+        return .typed(name: name, hash: hash, models: declarations, vectors: vectors, enums: enums, cleared: cleared)
+
+        func malformed() -> RecordLogTypeUpdate? {
+            logger?.warn("[record-log]", documentId, "— record.opened carried a db3Type this client cannot read; the type it holds is kept")
+            return nil
+        }
+    }
+
+    private func opened(_ frame: [String: JSONValue]) throws {
+        if history.stale != nil {
+            // The old id opened again: everything its stream carried before is in.
+            if barrier && phase == .opening { return try endStale() }
+            logger?.debug("[record-log]", documentId, "— record.opened while a re-minted writer waits for its old id; ignored")
+            return
+        }
+        guard phase == .opening, let current else {
+            logger?.debug("[record-log]", documentId, "— record.opened outside an open; ignored")
+            return
+        }
+        takenRetryMs = timings.writerTakenRetryMs
+        roomStreams = frame["streams"]?.boolValue == true
+        if let version = frame["wireVersion"]?.wholeNumber {
+            logger?.debug("[record-log]", documentId, "— the room speaks wire version", version, "; this client", recordLogWireVersion)
+        }
+        let said = typeOfOpened(frame)
+        if case .typed(let name, _, _, _, _, _)? = said, !host.acceptsType(documentId, name) {
+            // A type this client does not open: its name is kept, nothing of
+            // the open is applied, and the session ends.
+            try binding.setState(type: said)
+            return endForType(name)
+        }
+        let epochs = frame["epochs"]?.objectValue ?? [:]
+        let currentEpoch = epochs["current"]?.wholeNumber ?? RecordLogTransport.firstEpoch
+        let high = epochs["high"]?.wholeNumber ?? currentEpoch
+        let constraints = frame["constraints"]?.arrayValue?.compactMap { RecordLogConstraint(json: $0) }
+        let marks = try binding.setState(
+            notice: (currentEpoch, epochs["next"]?.wholeNumber ?? currentEpoch + 1, epochs["entries"]?.wholeNumber),
+            constraints: constraints.map { list in list.filter { binding.constraintInForce($0.name) } },
+            // The room opened the document for this client's writer: an access
+            // refusal it answered before is over.
+            permission: !current.orphan && binding.marks.permission == RecordLogPermission.refused ? .some(nil) : nil,
+            // The room says whether the db3 is typed, and by what (#5020).
+            type: said,
+            // Its head, to a client at wire version 3 (#5221).
+            heard: Self.heard(frame, at: receivedAt)
+        )
+        lastSeq = frame["lastSeq"]?.wholeNumber ?? 0
+        if !current.orphan && lastSeq >= marks.nextSeq {
+            // The room judged numbers this writer never minted: the store is an
+            // older copy of itself. Continuing would reuse those numbers.
+            logger?.warn(
+                "[record-log]", documentId, "— the room has judged writer", current.writer, "up to", lastSeq,
+                "past the", marks.nextSeq - 1, "it minted (a restored store); re-minting"
+            )
+            let owed = owedAhead(current.writer)
+            try remint(current.writer, orphan: false)
+            if !owed.isEmpty { return waitForStale(writer: current.writer, nextSeq: lastSeq + 1, owed: owed) }
+            try sendOpen()
+            return
+        }
+        // The room now holds this connection's subscription for the writer it
+        // answered, and for no other.
+        if !current.orphan { history.opened = [current.writer] }
+        let catchUp = frame["catchUp"]?.objectValue ?? ["mode": "inline", "lsn": frame["lsn"] ?? 0]
+        let mode = catchUp["mode"]?.stringValue
+        if mode == "building" { return waitForSegment(catchUp) }
+        buildingSince = nil
+        // The model clears kept above the cursor (#5994), before anything else
+        // of the catch-up: its rows, or the first chunk of a load or segment.
+        let clears = RecordLogClear.list(catchUp["clears"])
+        if !clears.isEmpty { try applyClears(clears, writer: current.writer) }
+        phase = .catchingUp
+        if mode == "load" {
+            guard let pointer = RecordLogLoadPointer(json: catchUp["load"]) else {
+                return try openFailedReceipt(.load, "the load pointer does not validate")
+            }
+            return try startLoadReceipt(
+                pointer, live: false, cursor: catchUp["cursor"]?.wholeNumber ?? marks.cursor,
+                upTo: catchUp["upTo"]?.wholeNumber ?? frame["lsn"]?.wholeNumber ?? 0, high: high
+            )
+        }
+        if mode == "segment" {
+            guard let segment = RecordLogSegmentPointer(json: catchUp["segment"]) else {
+                return try openFailedReceipt(.segment, "the segment pointer does not validate")
+            }
+            return startSegmentReceipt(segment, upTo: catchUp["upTo"]?.wholeNumber ?? frame["lsn"]?.wholeNumber ?? 0, high: high)
+        }
+        if let marker = marks.receipt, mode != "full" {
+            // A receipt did not complete: its committed chunks may hold a row the
+            // room refused, which rows changed after the cursor never correct. The
+            // whole table replaces them.
+            let upTo = catchUp["upTo"]?.wholeNumber ?? catchUp["lsn"]?.wholeNumber ?? frame["lsn"]?.wholeNumber ?? 0
+            logger?.log(
+                "[record-log] \(documentId): the \(marker.kind.rawValue) receipt \(marker.id) did not complete; "
+                    + "walking the room's whole table (to \(upTo))"
+            )
+            let replacing = try binding.withOperation { try binding.store.beginFencedCatchUp(writer: current.writer, full: true) }
+            beginPaging(Paging(cursor: 0, upTo: upTo, full: true, high: high, generation: replacing))
+            return
+        }
+        if mode == "paged" {
+            let full = catchUp["full"]?.boolValue == true
+            let replacing = try binding.withOperation { try binding.store.beginFencedCatchUp(writer: current.writer, full: full) }
+            beginPaging(Paging(
+                cursor: catchUp["cursor"]?.wholeNumber ?? 0, upTo: catchUp["upTo"]?.wholeNumber ?? 0, full: full, high: high,
+                generation: replacing, total: catchUp["count"]?.wholeNumber
+            ))
+            return
+        }
+        let full = mode == "full"
+        let lsn = catchUp["lsn"]?.wholeNumber ?? frame["lsn"]?.wholeNumber ?? 0
+        let replacing = try binding.withOperation { try binding.store.beginFencedCatchUp(writer: current.writer, full: full) }
+        let page = try applyPage(catchUp, lsn: lsn, writer: current.writer, generation: replacing)
+        if page.stale { return try overtaken(lsn: lsn, cursor: page.cursor, replacing: replacing) }
+        let done = try complete(
+            lsn: lsn, high: high, full: full, writer: current.writer, generation: replacing,
+            heard: RecordLogHeard(receivedAt: receivedAt)
+        )
+        if done.stale { return try overtaken(lsn: lsn, cursor: done.cursor, replacing: replacing) }
+        if full { failedReceipts = 0 }
+        try caughtUp(done.acknowledged, underivable: done.underivable)
+    }
+
+    /// Begin a paged catch-up as a stream: the start carries a fresh id, and the
+    /// room pushes every page marked with it. An older room answers the start
+    /// with an unmarked page, and the rest are asked for one at a time.
+    private func beginPaging(_ start: Paging) {
+        var paging = start
+        streamSeq += 1
+        paging.stream = "\(streamPrefix)-\(streamSeq)"
+        self.paging = paging
+        send(catchUpRequest(paging, after: nil))
+    }
+
+    /// A page of a stream this session is not running (ended, replaced or released): it applies to nothing.
+    private func stalePage(_ frame: [String: JSONValue], _ why: String) {
+        streamCounters.stalePages += 1
+        logger?.debug("[record-log]", documentId, "— catch-up page of stream", frame["stream"]?.stringValue ?? "(none)", "ignored:", why)
+    }
+
+    /// The room is building a segment for this open (`mode: "building"`): the
+    /// subscription is registered, but nothing is caught up. Results that
+    /// arrive meanwhile are dropped (the next open's catch-up carries them),
+    /// progress is reported so the open's watchdog waits, and the document is
+    /// opened again after `retryMs`. Past ``RecordLogSessionTimings/buildingMaxWaitMs``
+    /// of such answers, the open no longer declares `building`.
+    private func waitForSegment(_ catchUp: [String: JSONValue]) {
+        if buildingSince == nil { buildingSince = Date() }
+        let retryMs = max(0, catchUp["retryMs"]?.wholeNumber ?? recordLogBuildingRetryMs)
+        logger?.log(
+            "[record-log]", documentId, "— the room is building segment", catchUp["segmentId"]?.stringValue ?? "",
+            "for this open; opening again in", retryMs, "ms"
+        )
+        phase = .opening
+        progressed()
+        let waiting = opens
+        retryTimer?.cancel()
+        retryTimer = after(retryMs) { session in
+            session.retryTimer = nil
+            guard session.opens == waiting, session.phase == .opening, session.current != nil else { return }
+            session.attempt("open after building") { try session.sendOpen() }
+        }
+    }
+
+    private func catchUpRequest(_ paging: Paging, after: JSONValue?) -> JSONValue {
+        var request: [String: JSONValue] = [
+            "type": "record.catchUp", "cursor": .number(Double(paging.cursor)), "upTo": .number(Double(paging.upTo)),
+        ]
+        if after == nil, let stream = paging.stream { request["stream"] = .string(stream) }
+        if paging.full { request["full"] = true }
+        if let receipt = paging.receipt, receipt.kind == .load { request["load"] = .string(receipt.id) }
+        if let after { request["after"] = after }
+        return .object(request)
+    }
+
+    private func applyPage(
+        _ page: [String: JSONValue], lsn: Int, writer: String, generation: Int?, receipt: String? = nil
+    ) throws -> RecordLogChangeReply {
+        let rows = (page["rows"]?.arrayValue ?? []).compactMap { row -> RecordLogCatchUpRow? in
+            guard let model = row["model"]?.stringValue, let id = row["id"]?.stringValue else { return nil }
+            return RecordLogCatchUpRow(model: model, id: id, row: row["row"]?.objectValue ?? ["id": .string(id)])
+        }
+        let gone = (page["gone"]?.arrayValue ?? []).compactMap(RecordLogRecordKey.init(json:))
+        let heard = Self.heard(page, at: receivedAt)
+        let reply = try binding.withOperation {
+            try binding.store.applyCatchUpPage(
+                writer: writer, rows: rows, gone: gone, lsn: lsn, generation: generation, receipt: receipt,
+                heard: heard
+            )
+        }
+        notify(reply.changed)
+        return reply
+    }
+
+    private func complete(
+        lsn: Int, high: Int, full: Bool, writer: String, generation: Int?, receipt: String? = nil,
+        segment: RecordLogHeldSegment? = nil, heard: RecordLogHeard? = nil
+    ) throws -> RecordLogChangeReply {
+        // A receipt's completion is no frame: what it raises was heard now.
+        let heard = heard ?? RecordLogHeard(receivedAt: host.now())
+        let reply = try binding.withOperation {
+            try binding.store.completeCatchUp(
+                writer: writer, lsn: lsn, high: high, full: full, generation: generation, receipt: receipt, segment: segment,
+                heard: heard
+            )
+        }
+        notify(reply.changed, models: reply.models)
+        binding.noteSettled(reply)
+        return reply
+    }
+
+    /// Tell the listeners of the rows that changed, and of each model a clear emptied (#5994).
+    private func notify(_ changed: [RecordLogRowChange], models: [String] = []) {
+        guard !changed.isEmpty || !models.isEmpty else { return }
+        binding.notify(changed.map { RecordLogRecordKey(model: $0.model, id: $0.id) }, models: models, changes: changed)
+    }
+
+    /// Apply the model clears a catch-up carries (#5994), oldest first and
+    /// each once, before the rows, chunks or page they ride with.
+    private func applyClears(_ clears: [RecordLogClear], writer: String) throws {
+        let reply = try binding.withOperation { try binding.store.applyClears(writer: writer, clears: clears) }
+        notify(reply.changed, models: reply.models)
+    }
+
+    /// Another client of this store applied results past the log number the
+    /// room read this catch-up at, or began a replacement of its own: its rows
+    /// are older than the store's, and nothing of it was applied. The open
+    /// starts over from the store's cursor (`replacing` was this catch-up's
+    /// replacement generation).
+    private func overtaken(lsn: Int, cursor: Int, replacing: Int?) throws {
+        logger?.log(
+            "[record-log] \(documentId): the store's cursor \(cursor) passed this catch-up's \(lsn), or another client of "
+                + "the store began replacing it; opening again from the cursor"
+        )
+        paging = nil
+        stopReceipt()
+        try openAfterReplacement(replacing)
+    }
+
+    /// Open again from the cursor, once another client's replacement of the
+    /// store that overtook this one (`replacing` was this one's generation) has
+    /// completed: beginning a replacement now would overtake that one in turn,
+    /// and the two could go on overtaking each other. The wait reports
+    /// progress, and ends after ``RecordLogSessionTimings/replacementWaitMs``
+    /// with the other taken to be gone. A disconnect or any other open ends it.
+    private func openAfterReplacement(_ replacing: Int?) throws {
+        let marks = try binding.refreshMarks()
+        guard marks.replacing, marks.replacement != replacing else { return try sendOpen() }
+        logger?.log(
+            "[record-log] \(documentId): waiting for another client of the store to complete its replacement before opening again"
+        )
+        let deadline = Date().addingTimeInterval(Double(timings.replacementWaitMs) / 1000)
+        waitForReplacement(replacing, opens: opens, deadline: deadline)
+    }
+
+    private func waitForReplacement(_ replacing: Int?, opens waiting: Int, deadline: Date) {
+        replacementTimer?.cancel()
+        replacementTimer = after(timings.replacementPollMs) { session in
+            session.replacementTimer = nil
+            // Another open went (or the connection went, which `after` checks): the wait is over.
+            guard session.opens == waiting, session.current != nil else { return }
+            session.attempt("replacement wait") {
+                let now = try session.binding.refreshMarks()
+                let other = now.replacing && now.replacement != replacing
+                if other && Date() < deadline {
+                    session.progressed()
+                    session.waitForReplacement(replacing, opens: waiting, deadline: deadline)
+                    return
+                }
+                if other {
+                    session.logger?.warn(
+                        "[record-log] \(session.documentId): the other client's replacement did not complete within "
+                            + "\(session.timings.replacementWaitMs) ms; it is taken to be gone, opening again from the cursor"
+                    )
+                }
+                try session.sendOpen()
+            }
+        }
+    }
+
+    private func catchUpPage(_ frame: [String: JSONValue]) throws {
+        let marked = frame["stream"]?.stringValue
+        guard phase == .catchingUp || phase == .loading, var paging, let current else {
+            if marked != nil { stalePage(frame, "no catch-up is in progress") }
+            return
+        }
+        if let marked {
+            // Only the stream this catch-up started: an earlier one's last page
+            // would otherwise complete it with rows it never carried.
+            guard marked == paging.stream else {
+                return stalePage(frame, "the catch-up in progress is \(paging.stream ?? "paged per request")")
+            }
+            paging.streamed = true
+            roomStreams = true
+            streamCounters.pages += 1
+        } else if paging.stream != nil, paging.streamed || roomStreams {
+            return stalePage(frame, "an unmarked page during a stream")
+        } else if paging.stream != nil {
+            logger?.debug("[record-log]", documentId, "— the room answered a stream start with a page per request; asking for each page")
+            paging.stream = nil
+        }
+        self.paging = paging
+        let receipt = paging.receipt
+        if paging.released {
+            logger?.log("[record-log]", documentId, "— a catch-up page requested before the room released the subscription; discarded")
+            self.paging = nil
+            stopReceipt()
+            return try sendOpen()
+        }
+        if frame["restart"]?.boolValue == true {
+            // A restart applies no rows, but its head was heard (#5221): kept
+            // with its receipt time before the reopen, which may never answer.
+            let heard = Self.heard(frame, at: receivedAt)
+            if heard.head != nil { _ = try binding.setState(heard: heard) }
+            if let receipt {
+                return try receiptFailed(receipt, "the room answered the remainder restart (its floor passed the cursor)")
+            }
+            logger?.log("[record-log]", documentId, "— catch-up restarts; the room's floor passed the cursor")
+            self.paging = nil
+            return try sendOpen()
+        }
+        let lsn = frame["lsn"]?.wholeNumber ?? 0
+        // The clears committed after the catch-up began (#5994), before the
+        // page's rows; every later page carries them again, and they apply once.
+        let clears = RecordLogClear.list(frame["clears"])
+        if !clears.isEmpty { try applyClears(clears, writer: current.writer) }
+        let page = try applyPage(frame, lsn: lsn, writer: current.writer, generation: paging.generation, receipt: receipt?.attempt)
+        if page.stale {
+            let replacing = paging.generation
+            let overtaken = { try self.overtaken(lsn: lsn, cursor: page.cursor, replacing: replacing) }
+            if let receipt { return try receiptStale(receipt, replacing: replacing, otherwise: overtaken) }
+            return try overtaken()
+        }
+        let carried = (frame["rows"]?.arrayValue?.count ?? 0) + (frame["gone"]?.arrayValue?.count ?? 0)
+        paging.applied += carried
+        self.paging = paging
+        receipt?.remainderRows += carried
+        // The status is reported once the frame is handled.
+        host.progress(documentId)
+        if let next = frame["next"], let stream = paging.stream {
+            // The room pushes on; the credit lets it run past the window.
+            paging.pages += 1
+            self.paging = paging
+            if paging.pages % recordLogStreamCreditPages == 0 {
+                streamCounters.credits += 1
+                send(.object(["type": "record.catchUp", "stream": .string(stream), "credit": next]))
+            }
+            return
+        }
+        if let next = frame["next"] {
+            send(catchUpRequest(paging, after: next))
+            return
+        }
+        self.paging = nil
+        let full = paging.generation != nil
+        let done = try complete(
+            lsn: lsn, high: paging.high, full: full, writer: current.writer, generation: paging.generation,
+            receipt: receipt?.attempt, segment: receipt?.segment, heard: Self.heard(frame, at: receivedAt)
+        )
+        if done.stale {
+            let replacing = paging.generation
+            let overtaken = { try self.overtaken(lsn: lsn, cursor: done.cursor, replacing: replacing) }
+            if let receipt { return try receiptStale(receipt, replacing: replacing, otherwise: overtaken) }
+            return try overtaken()
+        }
+        if full { failedReceipts = 0 }
+        if let receipt { receiptDone(receipt) }
+        try caughtUp(done.acknowledged, underivable: done.underivable)
+    }
+
+    /// The room answered a catch-up page request with an error: no page is
+    /// coming, so the open starts over from the unchanged cursor after a backoff.
+    private func catchUpFailed(_ frame: [String: JSONValue]) {
+        let wait = catchUpRetryMs
+        catchUpRetryMs = min(catchUpRetryMs * 2, 30_000)
+        logger?.warn(
+            "[record-log] catch-up failed", documentId, "— record.catchUp answered",
+            frame["code"]?.stringValue ?? "an error", "; opening again from the cursor in", wait, "ms"
+        )
+        paging = nil
+        held = []
+        ahead = nil
+        phase = .idle
+        current = nil
+        retryTimer?.cancel()
+        retryTimer = after(wait) { session in
+            session.retryTimer = nil
+            session.start()
+        }
+    }
+
+    /// The catch-up is complete: answers held meanwhile apply, then the writer's
+    /// entries go. A compact acknowledgement left underivable (by the completion
+    /// or a held result) opens the document again once they have.
+    private func caughtUp(_ acknowledged: [RecordLogEntryRef], underivable: RecordLogUnderivableAck? = nil) throws {
+        guard let current else { return }
+        let ahead = self.ahead
+        self.ahead = nil
+        // The server refused the frames sent ahead, the declaration with them:
+        // nothing of them is owed an answer, and they go again as a first
+        // open's do, the declaration first.
+        if ahead?.refused == true { ownSender?.reset() }
+        catchUpRetryMs = timings.catchUpRetryMs
+        clearGap()
+        settleAcknowledged(acknowledged)
+        let answers = held
+        held = []
+        phase = current.orphan ? .draining : .open
+        var underivable = underivable
+        for answer in answers {
+            switch answer {
+            case .results(let items, let heard): underivable = try applyResults(items, heard: heard) ?? underivable
+            case .refused(let refusal): try applyRefusal(refusal)
+            }
+        }
+        if let underivable {
+            logUnderivable(underivable)
+            reopenAfterCatchUp = true
+        }
+        // The watermark is read before the entries. A commit runs outside this
+        // actor and writes its entry to the store before its number reaches
+        // the marks, so every number at or below `minted` is in `pending`
+        // unless the room already answered it. A commit landing between the
+        // two reads is then in `pending` (queued below) or past the watermark
+        // (its notice sends it), never covered by a watermark that skips it.
+        // The watermark is read with the newest save's ticket: a failed group
+        // gives its numbers back without lowering the watermark, and a save
+        // that takes one again holds a newer ticket, so its notice still sends it.
+        let (minted, mintedTicket) = binding.savesThrough()
+        if let hook = betweenCatchUpReads {
+            betweenCatchUpReads = nil
+            hook()
+        }
+        let pending = try binding.store.pendingOf(current.writer)
+        let unsent = pending.filter { $0.acked == nil }
+        handedThrough = HandedThrough(
+            writer: current.writer, minted: minted, mintedTicket: mintedTicket,
+            read: Set(pending.map(\.seq).filter { $0 > minted }), readTicket: binding.lastSaveTicket()
+        )
+        if let ahead, !ahead.refused {
+            // The marks are read again, as the resume check below does, so the
+            // open reports them as the catch-up left them.
+            if unsent.isEmpty { try binding.refreshMarks() }
+            // The declaration and the entries went with the open, with no
+            // resume owed: what goes now is a model registered since, then what
+            // was committed meanwhile (the sender keeps those in flight or
+            // queued once). A typed db3 takes no declaration (#5020).
+            if binding.marks.typed == .yes {
+                if !ahead.declared { host.declared(documentId) }
+            } else if host.scopedDeclarations != nil {
+                // The held models with the entries in hand: one committed
+                // while the catch-up ran is declared before it goes (#5160).
+                declaredVersion = binding.declarationVersion
+                let models = declarationsFor(pending)
+                if models != ahead.declarations { enqueueDeclare(models, on: sender) }
+            } else if !ahead.declared {
+                declaredVersion = binding.declarationVersion
+                enqueueDeclare(host.declarations(), on: sender)
+            } else {
+                declareIfChanged()
+            }
+            for entry in unsent { sender.enqueue(entry.wire) }
+            return try synced()
+        }
+        // Entries handed back without the room hearing of it leave a gap the
+        // room would wait on; tell it where this writer goes on from.
+        let first = try unsent.first?.seq ?? binding.refreshMarks().nextSeq
+        let resumeAt = current.orphan ? (unsent.isEmpty ? 0 : first) : first
+        if resumeAt > lastSeq + 1 {
+            send(RecordLogUpFrame.resume(nextSeq: resumeAt, records: nil).json)
+        }
+        if current.orphan {
+            try drain(current.writer, unsent)
+            return
+        }
+        // Opened again on this connection (a gap, a restart), or the frames
+        // sent ahead were refused: what was in flight is sent again, so the
+        // room answers it with what it made of it.
+        sender.requeueInFlight(unsent.map(\.wire))
+        declaredVersion = binding.declarationVersion
+        // A typed db3 takes no declaration: its type's are in force (#5020).
+        if binding.marks.typed == .yes {
+            host.declared(documentId)
+        } else {
+            enqueueDeclare(declarationsFor(pending), on: sender)
+        }
+        for entry in unsent { sender.enqueue(entry.wire) }
+        try synced()
+    }
+
+    /// The own writer is open: what waits leaves, the open is reported, and
+    /// loads announced meanwhile are received.
+    private func synced() throws {
+        sender.kick()
+        host.synced(documentId)
+        if reopenAfterCatchUp {
+            // A load aborted or failed while this catch-up ran: the rows it
+            // applied before it stopped come with the next.
+            reopenAfterCatchUp = false
+            return try sendOpen()
+        }
+        try nextQueuedLoad()
+    }
+
+    /// Resubmit an orphan writer's entries, wait for the room to answer each,
+    /// then open the next writer.
+    private func drain(_ writer: String, _ unsent: [RecordLogPendingEntry]) throws {
+        outstanding = Set(unsent.map(\.seq))
+        let drainSender = makeSender(orphanWriter: writer)
+        orphanSender = drainSender
+        if let models = orphanDeclarations(unsent) { enqueueDeclare(models, on: drainSender) }
+        for entry in unsent { drainSender.enqueue(entry.wire) }
+        drainSender.kick()
+        guard !outstanding.isEmpty else {
+            orphanSender = nil
+            return try openNext()
+        }
+        drainTimer = after(timings.drainWaitMs) { session in
+            session.finishDrain(writer)
+        }
+    }
+
+    private func finishDrain(_ writer: String) {
+        drainTimer?.cancel()
+        drainTimer = nil
+        guard phase == .draining, current?.writer == writer else { return }
+        if !outstanding.isEmpty {
+            logger?.warn(
+                "[record-log]", documentId, "— the room did not answer", outstanding.count,
+                "entr(ies) of earlier writer", writer, "; they stay for the next session"
+            )
+        }
+        orphanSender = nil
+        attempt("drain") { try openNext() }
+    }
+
+    /// Answers for an orphan writer's entries arrived.
+    private func answered(_ seqs: [Int]) {
+        guard let current, current.orphan else { return }
+        for seq in seqs { outstanding.remove(seq) }
+        if outstanding.isEmpty, phase == .draining { finishDrain(current.writer) }
+    }
+
+    private func senderOf(_ writer: String) -> RecordLogSender? {
+        guard let current, current.writer == writer else { return nil }
+        return current.orphan ? orphanSender : sender
+    }
+
+    /// Whether answers are held until the catch-up completes: during it, and
+    /// while an open that sent frames ahead waits for `record.opened` (a server
+    /// can answer those frames before it).
+    private var holding: Bool {
+        phase == .catchingUp || phase == .loading || (ahead != nil && phase == .opening)
+    }
+
+    private func results(_ items: [RecordLogResultItem], heard: RecordLogHeard) throws {
+        guard !items.isEmpty else { return }
+        if let stale = history.stale {
+            // Answers on the replaced subscription's stream: none is the new
+            // id's. Other writers' rows come with its catch-up.
+            return try staleAnswered(Self.answeredSeqs(items, writer: stale.writer))
+        }
+        if holding {
+            // Held with its stamp: applied after the catch-up, it was heard now.
+            held.append(.results(items, heard))
+            return
+        }
+        guard phase == .open || phase == .draining else { return }
+        if let underivable = try applyResults(items, heard: heard) {
+            logUnderivable(underivable)
+            clearGap()
+            try sendOpen()
+        }
+    }
+
+    /// A compact acknowledgement the store could not derive: the open that follows brings its row.
+    private func logUnderivable(_ ack: RecordLogUnderivableAck) {
+        logger?.warn(
+            "[record-log] \(documentId): the compact acknowledgement of writer \(ack.writer) seq \(ack.seq) (log number \(ack.l)) "
+                + "names no pending entry to derive its rows from; opening again from the cursor"
+        )
+    }
+
+    /// Apply relayed items; answers a compact acknowledgement the store could
+    /// not derive, if one holds the cursor back.
+    @discardableResult
+    private func applyResults(_ items: [RecordLogResultItem], heard: RecordLogHeard = RecordLogHeard()) throws -> RecordLogUnderivableAck? {
+        let writer = current?.writer ?? binding.writer
+        let reply = try binding.withOperation {
+            try binding.store.receive(writer: writer, items: items, heard: heard)
+        }
+        notify(reply.changed, models: reply.models)
+        // No row changed, yet the cursor or the head heard may have: the drift did (#5221).
+        if reply.changed.isEmpty { binding.noticeHeard() }
+        // Every number the room answered is one its frame no longer owes.
+        let seqs = Self.answeredSeqs(items, writer: writer)
+        for item in items {
+            if case .result(let result) = item, result.w == binding.writer, let alias = result.alias {
+                binding.noteAlias(alias)
+            }
+        }
+        let sender = senderOf(writer)
+        for seq in seqs { sender?.acknowledged(seq) }
+        answered(seqs)
+        settleAcknowledged(reply.acknowledged)
+        binding.noteSettled(reply)
+        watchGap(cursor: reply.cursor, items: items)
+        return reply.underivable
+    }
+
+    /// The numbers of `writer`'s entries that results answer: a `void` or
+    /// `duplicate` names no writer.
+    private static func answeredSeqs(_ items: [RecordLogResultItem], writer: String) -> [Int] {
+        var seqs: [Int] = []
+        for item in items {
+            switch item {
+            case .void(let seq), .duplicate(let seq): seqs.append(seq)
+            case .result(let result):
+                if result.w == writer, let seq = result.seq { seqs.append(seq) }
+            }
+        }
+        return seqs
+    }
+
+    /// This client's writer's entries the room acknowledged: confirmed, and their waiters resolve.
+    private func settleAcknowledged(_ acknowledged: [RecordLogEntryRef]) {
+        let own = binding.writer
+        let seqs = acknowledged.filter { $0.writer == own }.map(\.seq)
+        guard !seqs.isEmpty else { return }
+        let touched = binding.acknowledged(seqs)
+        if !touched.isEmpty { binding.notify(touched) }
+    }
+
+    private func refused(_ refusal: RecordLogRefusal) throws {
+        if history.stale != nil { return try staleAnswered([refusal.seq]) }
+        guard current != nil else { return }
+        if ahead != nil && holding {
+            // A refusal of a frame sent ahead: applied with the results held
+            // beside it, after the catch-up, as if it had arrived then.
+            held.append(.refused(refusal))
+            return
+        }
+        if phase == .opening || phase == .idle {
+            // Sent for the subscription this open replaces: its numbers are not
+            // the ones the next open resubmits, and a resubmission replays a
+            // real refusal.
+            logger?.debug("[record-log]", documentId, "— dropped a refusal of", refusal.seq, "that arrived before record.opened")
+            return
+        }
+        try applyRefusal(refusal)
+    }
+
+    private func applyRefusal(_ refusal: RecordLogRefusal) throws {
+        guard let current else { return }
+        let writer = current.writer
+        let reply = try binding.withOperation {
+            try binding.store.refused(writer: writer, refusal: refusal)
+        }
+        notify(reply.changed)
+        let sender = senderOf(writer)
+        var after: [Int: RecordLogPendingEntry] = [:]
+        for entry in try binding.store.pendingOf(writer) { after[entry.seq] = entry }
+        // The refusal is the room's answer to the refused number: the marker left
+        // in its place, or a withdrawn entry's marker it answers, waits on nothing.
+        if after[refusal.seq]?.isVoid == true {
+            try binding.withOperation { try binding.store.settled(writer: writer, seq: refusal.seq) }
+            after[refusal.seq] = nil
+        }
+        for frame in reply.frames { sender?.enqueueControl(frame) }
+        for entry in reply.handedBack {
+            let marker = after[entry.seq]
+            sender?.withdraw(entry.seq, replacement: marker?.isVoid == true ? marker?.wire : nil)
+        }
+        sender?.acknowledged(refusal.seq)
+        answered([refusal.seq] + reply.handedBack.map(\.seq))
+        let handed = reply.handedBack.filter { !$0.isVoid }
+        guard !handed.isEmpty else {
+            logger?.debug("[record-log]", documentId, "— refusal of", refusal.seq, "(\(refusal.code)) withdrew nothing new")
+            return
+        }
+        handBack(writer: writer, handed, refusal)
+    }
+
+    /// Writes the room or the client will not apply go back to the app, once per refusal.
+    private func handBack(writer: String, _ handed: [RecordLogPendingEntry], _ refusal: RecordLogRefusal) {
+        let codeText = RecordLogHandBackCode.all.contains(refusal.code) ? refusal.code : codeOfScope(refusal)
+        let code = JsBaoErrorCode(rawValue: codeText) ?? .documentConstraintViolated
+        var details: [String: JSONValue] = [
+            "documentId": .string(documentId), "scope": .string(refusal.scope.rawValue),
+            "from": .number(Double(refusal.from)), "seq": .number(Double(refusal.seq)),
+        ]
+        if let constraint = refusal.constraint { details["constraint"] = .string(constraint) }
+        if let conflicting = refusal.conflicting { details["conflicting"] = conflicting.json }
+        if let current = refusal.current { details["current"] = current.json }
+        if let reason = refusal.reason { details["reason"] = .string(reason) }
+        let error = JsBaoError(
+            code: code, message: refusal.message ?? Self.message(code: code, documentId: documentId), details: details
+        )
+        let writes = handed.flatMap(\.refusedWrites)
+        logger?.warn(
+            "[record-log] write-refused", documentId, "—", code.rawValue, "handed back", handed.count,
+            "entr(ies) of writer", writer, "from", refusal.from
+        )
+        if writer == binding.writer {
+            let touched = binding.handBack(handed.map(\.seq), error: error)
+            binding.notify(touched)
+        }
+        guard let first = writes.first else { return }
+        binding.reportRefused(DocumentWriteRefusedEvent(
+            documentId: documentId, model: first.model, recordId: first.recordId, error: error,
+            writes: writes, conflictingRecord: refusal.conflicting, current: refusal.current
+        ))
+    }
+
+    /// The code to hand back with when the room's refusal names a run it refused
+    /// only because an earlier entry was: a record's run is a constraint's, a
+    /// writer's run is the window's.
+    private func codeOfScope(_ refusal: RecordLogRefusal) -> String {
+        logger?.warn("[record-log]", documentId, "— refusal", refusal.code, "of", refusal.seq, "handed back writes its first refusal never did")
+        return refusal.scope == .record ? "DOCUMENT_CONSTRAINT_VIOLATED" : "DOCUMENT_OFFLINE_WINDOW_EXPIRED"
+    }
+
+    private static func message(code: JsBaoErrorCode, documentId: String) -> String {
+        switch code {
+        case .documentConstraintViolated:
+            return "A write to '\(documentId)' broke a unique constraint another write holds; it was withdrawn."
+        case .documentOfflineWindowExpired:
+            return "This client was away from '\(documentId)' longer than its offline window; its unsent writes were not applied."
+        case .documentEpochFrozen:
+            return "The writes to '\(documentId)' were made in an epoch the room has frozen; they were not applied."
+        case .db3ConditionNotMet:
+            return "A write to '\(documentId)' carried a condition the record did not meet; it was not applied."
+        case .db3RecordNotFound:
+            return "An increment in '\(documentId)' named a record that does not exist or was deleted; it was not applied."
+        case .db3TriggerRefused:
+            return "A write to '\(documentId)' was refused by one of the db3's triggers; it was not applied."
+        case .db3ModelNotDeclared:
+            return "A write to '\(documentId)' names a model its type does not declare; it was not applied."
+        default:
+            return "Writes to '\(documentId)' were refused (\(code.rawValue))."
+        }
+    }
+
+    private func gap(_ expected: Int) throws {
+        // The old id's entries from `expected` are not held: nothing more of them
+        // is answered. With its open out again, that open's answer ends the wait.
+        if history.stale != nil {
+            if !barrier { try endStale() }
+            return
+        }
+        guard let current else { return }
+        logger?.log("[record-log]", documentId, "— the room is missing entries from", expected, "; resending")
+        let resender = senderOf(current.writer)
+        // Only what went: an entry committed while the catch-up ran has not,
+        // and goes once it does, behind the declaration of its models (#5160).
+        let sent = resender?.inFlightSeqs ?? []
+        let unjudged = try binding.store.pendingOf(current.writer)
+            .filter { $0.acked == nil && sent.contains($0.seq) }.map(\.wire)
+        resender?.resendFrom(expected, entries: unjudged)
+    }
+
+    /// The room dropped this connection's subscription (a delivery to it
+    /// failed): nothing more is coming, so the writer is opened again from the
+    /// cursor. Mid paged catch-up, a page request is out: the open goes again
+    /// once that answer is in, and the page is discarded. A streamed catch-up
+    /// has no request out once the room is known to stream (its
+    /// `record.opened` said so, or a marked page arrived): it dropped the
+    /// stream with the subscription, and the open goes at once.
+    private func released(_ frame: [String: JSONValue]) throws {
+        // The old id's subscription is gone: nothing more of it is coming.
+        if history.stale != nil {
+            if phase == .opening { try endStale() }
+            return
+        }
+        guard current != nil, phase != .idle, phase != .closed else { return }
+        logger?.warn(
+            "[record-log]", documentId, "— the room released this connection's subscription (",
+            frame["reason"]?.stringValue ?? "no reason given", "); opening again from the cursor"
+        )
+        clearGap()
+        if phase == .catchingUp || phase == .loading, let paging {
+            guard paging.stream != nil, paging.streamed || roomStreams else {
+                self.paging?.released = true
+                return
+            }
+            self.paging = nil
+            stopReceipt()
+            return try sendOpen()
+        }
+        if let receipt, paging == nil {
+            // Its chunks are being fetched: the one in flight completes, then
+            // the receipt stops and the document opens again.
+            receipt.released = true
+            return
+        }
+        paging = nil
+        try sendOpen()
+    }
+
+    /// The access refusal the connection sends for a record frame of a document the user may no longer read.
+    private static let accessRefusedMessage = "Access denied to document"
+    /// The codes of a terminal access refusal. `DB3_SYNC_OFF`: the db3's sync
+    /// is off, so no socket reaches it until it is on again (js-bao's).
+    private static let accessRefusedCodes: Set<String> = ["ACCESS_DENIED", "DOC_ACCESS_DENIED", "DB3_SYNC_OFF", "DOCUMENT_DELETED"]
+
+    /// Whether an `error` frame is the room's access refusal of a record frame:
+    /// an access code, or the connection's code-less access-denied message,
+    /// answering any `record.*` frame.
+    static func isAccessRefusal(_ frame: [String: JSONValue]) -> Bool {
+        if let type = frame["messageType"], type.stringValue?.hasPrefix("record.") != true { return false }
+        let code = frame["code"]?.stringValue ?? ""
+        if !code.isEmpty { return accessRefusedCodes.contains(code) }
+        return frame["message"]?.stringValue == accessRefusedMessage
+    }
+
+    /// The room refused a record frame because the user may no longer read
+    /// the document: whatever the frame was, the conversation stops. The store
+    /// is marked `permission: "refused"` (local writes are refused from now),
+    /// its unjudged entries stay for the room to judge once access returns,
+    /// nothing more is sent, and the open is reported failed with
+    /// `ACCESS_DENIED`, `DB3_SYNC_OFF` when the db3's sync was turned off, or
+    /// `DOCUMENT_DELETED` when the db3 was deleted. The own writer's next
+    /// `record.opened` lifts the mark.
+    private func accessRefused(_ frame: [String: JSONValue]) throws {
+        guard phase != .closed else { return }
+        let code = frame["code"]?.stringValue
+        let reason = code == JsBaoErrorCode.db3SyncOff.rawValue || code == "DOCUMENT_DELETED" ? code! : "ACCESS_DENIED"
+        let why = reason == JsBaoErrorCode.db3SyncOff.rawValue ? " because its sync is off;"
+            : reason == "DOCUMENT_DELETED" ? " because it was deleted;" : " for access;"
+        logger?.warn(
+            "[record-log] \(documentId): the room refused \(frame["messageType"]?.stringValue ?? "a record frame")"
+                + why
+                + " the document stays readable here, its unsent writes are kept, and nothing more is sent"
+        )
+        disconnected()
+        try binding.setState(permission: .some(RecordLogPermission.refused))
+        host.syncFailed(documentId, reason)
+    }
+
+    /// End the conversation for a type this client does not open
+    /// (`DB3_TYPE_UNKNOWN_TO_CLIENT`): nothing more is sent, unsent writes
+    /// stay in the store, and the session opens again only once its host
+    /// accepts the type. The host closes the db3 on the socket.
+    private func endForType(_ name: String) {
+        logger?.debug("[record-log]", documentId, "— its type", name, "is not one this client opens; the session ends (DB3_TYPE_UNKNOWN_TO_CLIENT)")
+        typeRefused = true
+        disconnected()
+        host.syncFailed(documentId, JsBaoErrorCode.db3TypeUnknownToClient.rawValue)
+    }
+
+    private func error(_ frame: [String: JSONValue]) throws {
+        let code = frame["code"]?.stringValue ?? ""
+        let messageType = frame["messageType"]?.stringValue
+        if code == "DB3_DECLARATION_REFUSED_TYPED" && messageType == "record.declare" {
+            // A typed db3's type is its declaration: the room declared nothing
+            // and judges every write by the type. The declaration is answered,
+            // and the store is marked typed so its next open declares nothing (#5020).
+            logger?.debug(
+                "[record-log]", documentId, "— the db3 is typed by", frame["db3Type"]?.stringValue ?? "its type",
+                "; the room keeps the type's declarations, and this client's models are judged against them"
+            )
+            if let name = frame["db3Type"]?.stringValue, !name.isEmpty {
+                let held = binding.marks.db3Type
+                try binding.setState(type: .typed(name: name, hash: held?.name == name ? held?.hash : nil, models: nil))
+                // A type this client does not open, attached while the session was live.
+                if !host.acceptsType(documentId, name) { return endForType(name) }
+            }
+            host.declared(documentId)
+            return
+        }
+        logger?.warn(
+            "[record-log]", documentId, "—", frame["messageType"]?.stringValue ?? "record frame", "answered", code,
+            ":", frame["message"]?.stringValue ?? ""
+        )
+        if Self.isAccessRefusal(frame) { return try accessRefused(frame) }
+        if history.stale != nil && barrier {
+            // The room would not open the old id again: no subscription of it on
+            // this connection is left to queue answers on.
+            if messageType == "record.open" && phase == .opening { try endStale() }
+            return
+        }
+        if history.stale != nil, messageType == "record.entries" || messageType == "record.declare" {
+            // The old id's frames answered with an error: its entries were not
+            // judged, and the new id's open goes. Its numbers are not the new
+            // id's; the room answers the new id's frames for themselves.
+            if messageType == "record.entries" { try endStale() }
+            return
+        }
+        guard let current else { return }
+        if frame["messageType"]?.stringValue == "record.catchUp", let receipt = paging?.receipt {
+            return try receiptFailed(receipt, "the remainder was answered \(code.isEmpty ? "an error" : code)")
+        }
+        if frame["messageType"]?.stringValue == "record.catchUp", phase == .catchingUp {
+            return catchUpFailed(frame)
+        }
+        switch code {
+        case "WRITER_UNKNOWN":
+            guard phase == .opening else { return }
+            try remint(current.writer, orphan: current.orphan)
+            try sendOpen()
+        case "WRITER_ID_TAKEN":
+            guard phase == .opening else { return }
+            if current.orphan {
+                logger?.log("[record-log]", documentId, "— earlier writer", current.writer, "is held by another connection; skipped")
+                return try openNext()
+            }
+            let wait = takenRetryMs
+            takenRetryMs = min(takenRetryMs * 2, 30_000)
+            phase = .idle
+            self.current = nil
+            held = []
+            ahead = nil
+            retryTimer?.cancel()
+            retryTimer = after(wait) { session in
+                session.retryTimer = nil
+                session.start()
+            }
+        case "DOCUMENT_NOT_OPEN":
+            if phase == .open || phase == .draining {
+                try sendOpen()
+            } else if ahead != nil, messageType == "record.entries" || messageType == "record.declare" {
+                // A server that does not hold frames behind their open: they go
+                // again after the catch-up, as every other open sends them.
+                ahead?.refused = true
+            }
+        case "DB3_CLIENT_OUTDATED":
+            // The room needs a newer wire version than this client declares:
+            // the open ends, and this session does not open the document again.
+            guard messageType == "record.open" else { return }
+            logger?.warn(
+                "[record-log]", documentId, "— the room speaks wire version", frame["wireVersion"]?.wholeNumber ?? 0,
+                "; this client declares", recordLogWireVersion, ". Update the client to sync this db3."
+            )
+            outdated = true
+            phase = .idle
+            self.current = nil
+            held = []
+            ahead = nil
+            host.syncFailed(documentId, code)
+        case "WRITE_ACCESS_DENIED":
+            try binding.setState(permission: .some("read"))
+            let pending = try binding.store.pendingOf(current.writer).filter { !$0.isVoid && $0.acked == nil }
+            guard let from = frame["from"]?.wholeNumber ?? pending.first?.seq else { return }
+            let refusal = RecordLogRefusal(
+                seq: from, code: "WRITE_ACCESS_DENIED", scope: .writer, from: from,
+                message: "This document is read-only for you now; the writes were not applied."
+            )
+            let reply = try binding.withOperation {
+                try binding.store.refused(writer: current.writer, refusal: refusal)
+            }
+            notify(reply.changed)
+            let sender = senderOf(current.writer)
+            for entry in reply.handedBack {
+                sender?.withdraw(entry.seq)
+                sender?.acknowledged(entry.seq)
+            }
+            answered(reply.handedBack.map(\.seq))
+            let handed = reply.handedBack.filter { !$0.isVoid }
+            if !handed.isEmpty { handBack(writer: current.writer, handed, refusal) }
+        default:
+            // An answer to a frame sent ahead is not the open's: it ends nothing.
+            if ahead != nil, messageType == "record.entries" || messageType == "record.declare" { return }
+            if phase == .opening {
+                phase = .idle
+                self.current = nil
+                held = []
+                ahead = nil
+                host.syncFailed(documentId, code.isEmpty ? "error" : code)
+            }
+        }
+    }
+
+    // MARK: - Receipts of chunks
+
+    /// A `record.load` frame. `started`: a load is applying, so results wait
+    /// behind its numbers and no gap re-open is due. `complete`: its pointer is
+    /// received now when the document is open, after the open in progress
+    /// otherwise. `aborted` / `failed`: the room never points across it, so the
+    /// document opens again from the cursor and takes rows.
+    private func load(_ frame: [String: JSONValue]) throws {
+        guard let sessionId = frame["sessionId"]?.stringValue, !sessionId.isEmpty else { return }
+        let stage = frame["phase"]?.stringValue ?? ""
+        switch stage {
+        case "started":
+            if loadInProgress == sessionId { return }
+            if receipt?.id == sessionId {
+                logger?.debug("[record-log] \(documentId): load \(sessionId) is being received; started ignored")
+                return
+            }
+            loadInProgress = sessionId
+            clearGap()
+            logger?.log("[record-log] \(documentId): load \(sessionId) is applying; results wait behind it")
+        case "complete":
+            guard let pointer = RecordLogLoadPointer(json: .object(frame)) else { return }
+            if receipt?.id == sessionId || queuedLoads.contains(where: { $0.sessionId == sessionId }) {
+                logger?.debug("[record-log] \(documentId): load \(sessionId) is already being received; duplicate dropped")
+                return
+            }
+            queuedLoads.append(pointer)
+            try nextQueuedLoad()
+        case "aborted", "failed":
+            if loadInProgress == sessionId { loadInProgress = nil }
+            queuedLoads.removeAll { $0.sessionId == sessionId }
+            logger?.log("[record-log] \(documentId): load \(sessionId) \(stage); opening again from the cursor")
+            if phase == .open || phase == .draining {
+                clearGap()
+                try sendOpen()
+            } else if phase == .catchingUp || phase == .loading {
+                reopenAfterCatchUp = true
+            }
+        default:
+            logger?.debug("[record-log] \(documentId): ignored record.load \(stage)")
+        }
+    }
+
+    /// Receive the next completed load announced while the session was busy,
+    /// if the cursor is still below it.
+    private func nextQueuedLoad() throws {
+        while phase == .open && receipt == nil && !queuedLoads.isEmpty {
+            try startLoadReceipt(queuedLoads.removeFirst(), live: true, cursor: 0, upTo: 0, high: 0)
+        }
+    }
+
+    /// Whether `receipt` is still the one in progress on this connection.
+    private func receiving(_ receipt: Receipt) -> Bool {
+        self.receipt === receipt && generation == receipt.connection && phase != .closed
+    }
+
+    /// The connection, when it can fetch artifacts; a receipt fails without one.
+    private func fetcher() throws -> any RecordLogConnection {
+        guard let connection = host.connection(), connection.fetchesArtifacts else {
+            throw RecordLogReceiptFailure("the connection cannot fetch artifacts")
+        }
+        return connection
+    }
+
+    /// Begin receiving a completed load: live, from `record.load complete` on an
+    /// open document, or as an open's `load` catch-up (from `cursor` to `upTo`,
+    /// seeing `high`). The chunks are fetched and applied by the receipt's task
+    /// (results that arrive meanwhile are held); the remainder is then paged
+    /// from the cursor through it.
+    private func startLoadReceipt(_ pointer: RecordLogLoadPointer, live: Bool, cursor openCursor: Int, upTo: Int, high: Int) throws {
+        guard let current else { return }
+        let cursor = live ? try binding.refreshMarks().cursor : openCursor
+        if live {
+            guard let lastLsn = pointer.lastLsn, cursor < lastLsn else {
+                logger?.debug("[record-log] \(documentId): load \(pointer.sessionId) is behind the cursor \(cursor); nothing to receive")
+                if loadInProgress == pointer.sessionId { loadInProgress = nil }
+                return
+            }
+            phase = .loading
+        }
+        let receipt = Receipt(
+            kind: .load, id: pointer.sessionId, live: live, connection: generation, writer: current.writer,
+            rows: pointer.rows, chunks: pointer.chunkCount
+        )
+        self.receipt = receipt
+        logger?.log(
+            "[record-log] load receipt \(documentId): \(pointer.sessionId) \(pointer.rows) rows in \(pointer.chunkCount) chunks "
+                + "(\(live ? "live" : "on reconnect")), from cursor \(cursor)"
+        )
+        let remainder = (cursor: cursor, upTo: live ? (pointer.lastLsn ?? cursor) : upTo, high: live ? pointer.epoch : high)
+        progressed()
+        receipt.task = spawnLoadReceipt(receipt, pointer, remainder)
+    }
+
+    /// Begin receiving a segment, an open's `segment` catch-up: a replacement
+    /// of the table with its chunks, its corrections, then the pages of what
+    /// changed after its `completedLsn`, completed at the last page.
+    private func startSegmentReceipt(_ segment: RecordLogSegmentPointer, upTo: Int, high: Int) {
+        guard let current else { return }
+        let receipt = Receipt(
+            kind: .segment, id: segment.segmentId, live: false, connection: generation, writer: current.writer,
+            rows: segment.rows, chunks: segment.chunks.count
+        )
+        self.receipt = receipt
+        logger?.log(
+            "[record-log] segment receipt \(documentId): \(segment.segmentId) \(segment.rows) rows in \(segment.chunks.count) "
+                + "chunks at \(segment.lsn), corrections to \(segment.completedLsn)"
+        )
+        progressed()
+        receipt.task = spawnSegmentReceipt(receipt, segment, upTo: upTo, high: high)
+    }
+
+    private static func describe(_ error: Error) -> String {
+        if let failure = error as? RecordLogReceiptFailure { return failure.reason }
+        if let chunk = error as? RecordLogChunkError { return chunk.description }
+        if let artifact = error as? RecordLogArtifactError { return artifact.description }
+        if let jsBao = error as? JsBaoError { return jsBao.message }
+        return error.localizedDescription
+    }
+
+    /// A receipt completed: the failure count resets, and its end is logged.
+    private func receiptDone(_ receipt: Receipt) {
+        if self.receipt === receipt { self.receipt = nil }
+        failedReceipts = 0
+        if loadInProgress == receipt.id { loadInProgress = nil }
+        let ms = Int(Date().timeIntervalSince(receipt.startedAt) * 1000)
+        let kept = receipt.kept.map { "; \($0) kept, \(receipt.fetched ?? receipt.chunks - $0) fetched" } ?? ""
+        let resumed = receipt.resumed.map { "; resumed at chunk \($0)" } ?? ""
+        logger?.log(
+            "[record-log] \(receipt.kind.rawValue) received \(documentId): \(receipt.id) \(receipt.rows) rows in "
+                + "\(receipt.chunks) chunks, remainder \(receipt.remainderRows) rows, \(ms) ms\(kept)\(resumed)"
+        )
+    }
+
+    /// The store continued an attempt of `receipt` that had done chunks:
+    /// progress starts there, and it is logged.
+    private func resuming(_ receipt: Receipt, _ start: RecordLogReceiptStart, chunks: Int) {
+        receipt.applied = start.done
+        guard start.done > 0 || start.completed else { return }
+        receipt.resumed = start.done
+        logger?.log(
+            "[record-log] \(receipt.kind.rawValue) receipt \(documentId): \(receipt.id) resuming at chunk \(start.done) of \(chunks)"
+        )
+        progressed()
+    }
+
+    /// A command of `receipt` was answered stale. While the marks show a
+    /// receipt of the same load or segment in progress (for a segment, under
+    /// the replacement this one wrote under), another session of the store
+    /// took this one over: it is abandoned, and the session waits for that
+    /// receipt before it opens again (``waitForReceipt(_:id:progress:opens:deadline:)``),
+    /// so the two never continue one download at once and neither starts it
+    /// over. Otherwise `otherwise` runs.
+    private func receiptStale(_ receipt: Receipt, replacing: Int? = nil, otherwise: () throws -> Void) throws {
+        guard receiving(receipt) else { return }
+        let marks = try binding.refreshMarks()
+        guard let other = marks.receipt, other.kind == receipt.kind, other.id == receipt.id,
+              receipt.kind == .load || marks.replacement == replacing
+        else { return try otherwise() }
+        logger?.log(
+            "[record-log] \(documentId): \(receipt.kind.rawValue) receipt \(receipt.id) abandoned (another session of the store "
+                + "took it over); waiting for its receipt before opening again"
+        )
+        self.receipt = nil
+        paging = nil
+        held = []
+        if loadInProgress == receipt.id { loadInProgress = nil }
+        guard current != nil else { return }
+        let deadline = Date().addingTimeInterval(Double(timings.replacementWaitMs) / 1000)
+        waitForReceipt(receipt.kind, id: receipt.id, progress: Self.progressOf(other), opens: opens, deadline: deadline)
+    }
+
+    private static func progressOf(_ receipt: RecordLogReceipt?) -> String {
+        "\(receipt?.done.map(String.init) ?? "")/\(receipt?.completed == true)"
+    }
+
+    /// Open again from the cursor once another session's receipt of the same
+    /// load or segment has left the store's marks (it completed, or something
+    /// ended it), or has made no progress (`done`, `completed`) for
+    /// ``RecordLogSessionTimings/replacementWaitMs``: that session is then
+    /// taken to be gone, and the open's answer offers the download again. The
+    /// wait reports progress; a disconnect or any other open ends it.
+    private func waitForReceipt(_ kind: RecordLogReceiptKind, id: String, progress: String, opens waiting: Int, deadline: Date) {
+        replacementTimer?.cancel()
+        replacementTimer = after(timings.replacementPollMs) { session in
+            session.replacementTimer = nil
+            guard session.opens == waiting, session.current != nil else { return }
+            session.attempt("receipt wait") {
+                let now = try session.binding.refreshMarks()
+                if let other = now.receipt, other.kind == kind, other.id == id {
+                    let moved = Self.progressOf(other)
+                    let until = moved != progress ? Date().addingTimeInterval(Double(session.timings.replacementWaitMs) / 1000) : deadline
+                    if Date() < until {
+                        session.progressed()
+                        session.waitForReceipt(kind, id: id, progress: moved, opens: waiting, deadline: until)
+                        return
+                    }
+                    session.logger?.log(
+                        "[record-log] \(session.documentId): the \(kind.rawValue) receipt \(id) another session of the store took over "
+                            + "made no progress in \(session.timings.replacementWaitMs) ms; opening again from the cursor"
+                    )
+                }
+                try session.sendOpen()
+            }
+        }
+    }
+
+    /// A receipt cannot go on: what it committed stays (the store's marker says
+    /// so), and the session opens again from the unchanged cursor. Two failures
+    /// in a row make the next open take rows only.
+    private func receiptFailed(_ receipt: Receipt, _ reason: String) throws {
+        guard receiving(receipt) else { return }
+        failedReceipts += 1
+        logger?.warn(
+            "[record-log] \(receipt.kind.rawValue) receipt failed \(documentId): \(receipt.id) \(reason); opening again from the cursor"
+        )
+        self.receipt = nil
+        paging = nil
+        held = []
+        if loadInProgress == receipt.id { loadInProgress = nil }
+        if current != nil { try sendOpen() }
+    }
+
+    /// A pointer an open's catch-up named does not validate: a failed receipt.
+    private func openFailedReceipt(_ kind: RecordLogReceiptKind, _ reason: String) throws {
+        failedReceipts += 1
+        logger?.warn("[record-log] \(kind.rawValue) receipt failed \(documentId): \(reason); opening again from the cursor")
+        held = []
+        try sendOpen()
+    }
+
+    /// A receipt was overtaken, ended by the store or released: no failure is
+    /// counted, and the open goes again from the cursor; one another client's
+    /// replacement overtook (`replacing` was its generation) waits for that
+    /// replacement first.
+    private func abandonReceipt(_ receipt: Receipt, _ why: String, replacing: Int? = nil) throws {
+        guard receiving(receipt) else { return }
+        logger?.log(
+            "[record-log] \(documentId): \(receipt.kind.rawValue) receipt \(receipt.id) abandoned (\(why)); opening again from the cursor"
+        )
+        self.receipt = nil
+        paging = nil
+        held = []
+        guard current != nil else { return }
+        if let replacing {
+            try openAfterReplacement(replacing)
+        } else {
+            try sendOpen()
+        }
+    }
+
+    /// Replace a writer the room does not know (or a restored store's): a new
+    /// id, its entries renumbered from 1, what waits on them following them.
+    private func remint(_ writer: String, orphan: Bool) throws {
+        let reminted = try binding.withOperation { try binding.store.remintWriter(writer) }
+        let fresh = reminted.writer
+        let renumbered = reminted.renumbered
+        logger?.log("[record-log]", documentId, "— writer", writer, "re-minted as", fresh)
+        if !orphan {
+            // What the sender holds carries the old numbers: queued entries
+            // would go under the new writer with another entry's number, and
+            // in-flight numbers would hold a frame no answer frees. The open
+            // that follows sends every renumbered entry again.
+            ownSender?.reset()
+            binding.reminted(writer: fresh, renumbered: renumbered)
+            try binding.refreshMarks()
+        }
+        current = (fresh, orphan)
+    }
+
+    /// A model was registered on the open document: the room hears its
+    /// declaration before any entry of it.
+    func declare() {
+        declareIfChanged()
+    }
+
+    private func declareIfChanged() {
+        guard phase == .open else { return }
+        let version = binding.declarationVersion
+        guard version != declaredVersion else { return }
+        declaredVersion = version
+        // A typed db3 takes no declaration: its type's are in force (#5020).
+        guard binding.marks.typed != .yes else { return }
+        guard let scoped = host.scopedDeclarations else {
+            return enqueueDeclare(host.declarations(), on: sender)
+        }
+        // Only what the registration adds to this db3's answer (#5160): a
+        // model bound to it, or bound nowhere when it is the default db3.
+        let fresh = scoped(documentId, declaredThisOpen.sorted()).filter { !declaredThisOpen.contains($0.key) }
+        guard !fresh.isEmpty else { return }
+        declaredThisOpen.formUnion(fresh.keys)
+        enqueueDeclare(fresh, on: sender)
+    }
+
+    /// This writer's entries committed: they go to the room once the document is open.
+    private func committed(_ entries: [RecordLogPendingEntry]) {
+        guard phase == .open else { return }
+        // A notice heard late: the catch-up already queued the entry, or the
+        // room already answered it, and an answered entry must not go again.
+        // A save it cannot place (no ticket) goes: the room answers a number
+        // it holds from its mark.
+        let entries = entries.filter { entry in
+            guard let handed = handedThrough, handed.writer == binding.writer,
+                  let ticket = binding.ticket(of: entry.seq) else { return true }
+            return !handed.dealtWith(entry.seq, ticket: ticket)
+        }
+        guard !entries.isEmpty else { return }
+        declareIfChanged()
+        for entry in entries {
+            declareFirstWrites(entry)
+            sender.enqueue(entry.wire)
+        }
+    }
+
+    /// A commit notice delivered as late as the commit task may run
+    /// (``attach()``): the hermetic tests' way to hold it back.
+    func hearCommitted(_ entries: [RecordLogPendingEntry]) { committed(entries) }
+
+    /// Run `hook` once, inside the next catch-up, between its two reads of
+    /// the store (``caughtUp(_:underivable:)``).
+    func runBetweenCatchUpReads(_ hook: (@Sendable () -> Void)?) { betweenCatchUpReads = hook }
+
+    // MARK: - Declarations (#5160)
+
+    /// The distinct models an entry's mutations write, in order of first
+    /// mention; none for a withdrawn (void) entry.
+    private static func modelsOf(_ entry: RecordLogPendingEntry) -> [String] {
+        guard !entry.isVoid else { return [] }
+        var seen = Set<String>()
+        return entry.mutations.map(\.model).filter { seen.insert($0).inserted }
+    }
+
+    /// The declarations an open carries. A scoping host answers for the models
+    /// the copy holds, as the marks last read name them, united with the
+    /// models of `pending`, the entries in hand (marks read before a commit
+    /// made since do not name its models); the models it names are this
+    /// open's. Any other host declares every model.
+    private func declarationsFor(_ pending: [RecordLogPendingEntry]) -> [String: JSONValue] {
+        guard let scoped = host.scopedDeclarations else { return host.declarations() }
+        var held = Set(binding.marks.models)
+        for entry in pending { held.formUnion(Self.modelsOf(entry)) }
+        let models = scoped(documentId, held.sorted())
+        declaredThisOpen = Set(models.keys)
+        return models
+    }
+
+    /// A committed entry's models this open has not declared go in a
+    /// `record.declare` queued before it, so the room holds their indexes and
+    /// constraints before it applies the entry. A typed db3 takes none,
+    /// nor does a model the host has no declaration of.
+    private func declareFirstWrites(_ entry: RecordLogPendingEntry) {
+        guard let scoped = host.scopedDeclarations, binding.marks.typed != .yes else { return }
+        let fresh = Self.modelsOf(entry).filter { !declaredThisOpen.contains($0) }
+        guard !fresh.isEmpty else { return }
+        let models = scoped(documentId, fresh).filter { fresh.contains($0.key) }
+        guard !models.isEmpty else { return }
+        declaredThisOpen.formUnion(models.keys)
+        enqueueDeclare(models, on: sender)
+    }
+
+    /// The declarations an earlier writer's entries go behind: those of every
+    /// model they write that the host declares into this db3. An earlier
+    /// session may have written them offline after its open declared what the
+    /// copy held and had bound then, so none is left out. A host that does
+    /// not scope declared every model at the earlier open, and the drain keeps
+    /// today's frames. A typed db3 takes none.
+    private func orphanDeclarations(_ unsent: [RecordLogPendingEntry]) -> [String: JSONValue]? {
+        guard let scoped = host.scopedDeclarations, binding.marks.typed != .yes else { return nil }
+        let written = Set(unsent.flatMap(Self.modelsOf))
+        guard !written.isEmpty else { return nil }
+        let models = scoped(documentId, written.sorted()).filter { written.contains($0.key) }
+        return models.isEmpty ? nil : models
+    }
+
+    /// Queue a `record.declare` on `sender`, after what it queued before, and
+    /// say which models it carries.
+    private func enqueueDeclare(_ models: [String: JSONValue], on sender: RecordLogSender) {
+        if models.isEmpty {
+            logger?.debug("[record-log]", documentId, "— declaring no models")
+        } else {
+            logger?.debug("[record-log]", documentId, "— declaring", models.count, "model(s):", models.keys.sorted().joined(separator: ", "))
+        }
+        sender.enqueueControl(.declare(models: models))
+    }
+
+    // MARK: - The receipt's task
+
+    // Everything a receipt does that suspends lives here, outside the frame
+    // handlers: its task fetches and reads chunks off the session and comes
+    // back to it for each store step, checking that the receipt and its
+    // connection are still current after every suspension.
+
+    private func spawnLoadReceipt(
+        _ receipt: Receipt, _ pointer: RecordLogLoadPointer, _ remainder: (cursor: Int, upTo: Int, high: Int)
+    ) -> Task<Void, Never> {
+        Task {
+            await self.receiveLoadChunks(receipt, pointer, remainder)
+            self.reportStatus()
+        }
+    }
+
+    private func spawnSegmentReceipt(_ receipt: Receipt, _ segment: RecordLogSegmentPointer, upTo: Int, high: Int) -> Task<Void, Never> {
+        Task {
+            await self.receiveSegment(receipt, segment, upTo: upTo, high: high)
+            self.reportStatus()
+        }
+    }
+
+    private func receiveLoadChunks(
+        _ receipt: Receipt, _ pointer: RecordLogLoadPointer, _ remainder: (cursor: Int, upTo: Int, high: Int)
+    ) async {
+        guard receiving(receipt), !Task.isCancelled else { return }
+        do {
+            // A load that wrote no row has nothing to fetch; its remainder is the rows.
+            if pointer.firstLsn != nil && pointer.lastLsn != nil {
+                guard let download = pointer.download else { throw RecordLogReceiptFailure("the pointer carries no grant") }
+                let base = download.path
+                let connection = try fetcher()
+                let bytes: Data
+                do {
+                    bytes = try await connection.fetchArtifact(base)
+                } catch {
+                    guard receiving(receipt) else { return }
+                    throw RecordLogReceiptFailure("fetching the manifest failed: \(Self.describe(error))")
+                }
+                guard receiving(receipt) else { return }
+                progressed()
+                let manifest = try recordLogLoadManifest(bytes, pointer: pointer)
+                if receipt.released { return try abandonReceipt(receipt, "the room released the subscription") }
+                // The same load with the same chunk list continues an attempt
+                // that did not complete: only the chunks it has not applied
+                // are fetched.
+                let fingerprint = recordLogReceiptFingerprint(.load(manifest))
+                let start = try binding.withOperation {
+                    try binding.store.beginReceipt(
+                        writer: receipt.writer, kind: .load, id: pointer.sessionId, fingerprint: fingerprint, chunks: manifest.count
+                    )
+                }
+                let attempt = start.attempt
+                receipt.attempt = attempt
+                resuming(receipt, start, chunks: manifest.count)
+                let writer = receipt.writer
+                let ended = {
+                    try self.receiptStale(receipt) {
+                        try self.abandonReceipt(receipt, "the store ended it: another client's catch-up made its rows right")
+                    }
+                }
+                for chunk in start.completed ? [] : manifest.dropFirst(start.done) {
+                    guard receiving(receipt) else { return }
+                    let applied = try await applyChunk(receipt, path: "\(base)/\(chunk.path)", read: {
+                        try RecordLogChunkReader.readLoadChunk($0, chunk)
+                    }, apply: { session, lines in
+                        try session.binding.withOperation {
+                            // The rows are the load's as of its last number: a model
+                            // another session cleared past it keeps none of them (#5994).
+                            try session.binding.store.applyLoadChunk(
+                                writer: writer, sessionId: pointer.sessionId, attempt: attempt, model: chunk.model,
+                                lines: lines, readAt: pointer.lastLsn
+                            )
+                        }
+                    })
+                    guard let reply = applied, receiving(receipt) else { return }
+                    if reply.stale { return try ended() }
+                    binding.notify(reply)
+                    receipt.applied += 1
+                    progressed()
+                    logger?.debug("[record-log] \(documentId): load \(pointer.sessionId) chunk \(chunk.place) applied (\(chunk.rows) rows)")
+                    if receipt.released { return try abandonReceipt(receipt, "the room released the subscription") }
+                }
+                // An attempt that completed its load (a refresh's removal ran)
+                // goes straight to the remainder: removing again would drop
+                // what the remainder restored.
+                if !start.completed {
+                    let completed = try binding.withOperation {
+                        try binding.store.completeLoad(
+                            writer: receipt.writer, sessionId: pointer.sessionId, attempt: attempt, mode: pointer.mode,
+                            models: pointer.models
+                        )
+                    }
+                    if completed.stale { return try ended() }
+                    binding.notify(completed)
+                }
+            }
+            guard receiving(receipt) else { return }
+            if receipt.released { return try abandonReceipt(receipt, "the room released the subscription") }
+            beginPaging(Paging(cursor: remainder.cursor, upTo: remainder.upTo, full: false, high: remainder.high, receipt: receipt))
+        } catch {
+            attempt("load receipt") { try receiptFailed(receipt, Self.describe(error)) }
+        }
+    }
+
+    private func receiveSegment(_ receipt: Receipt, _ segment: RecordLogSegmentPointer, upTo: Int, high: Int) async {
+        // The task starts after the frame handler that scheduled it returned;
+        // a disconnect or a close in between leaves the store untouched.
+        guard receiving(receipt), !Task.isCancelled else { return }
+        do {
+            guard let download = segment.download else { throw RecordLogReceiptFailure("the pointer carries no grant") }
+            let base = download.path
+            _ = try fetcher()
+            guard segment.chunks.allSatisfy(\.pathIsRelative), !segment.corrections.path.isEmpty,
+                  !segment.corrections.path.hasPrefix("/"), !segment.corrections.path.contains("..")
+            else { throw RecordLogReceiptFailure("a segment chunk's path leaves the grant") }
+            // The receipt is begun before its replacement, so a replacement that
+            // overtakes this one counts every change this one made. The same
+            // segment with the same chunk list continues an attempt that did
+            // not complete, under the replacement that attempt began.
+            // The segment the store's rows came from is read with the
+            // replacement's start: a chunk it lists is kept from those rows when
+            // the store agrees.
+            let fingerprint = recordLogReceiptFingerprint(
+                .segment(segmentId: segment.segmentId, chunks: segment.chunks, corrections: segment.corrections)
+            )
+            let (start, generation, held) = try binding.withOperation { () -> (RecordLogReceiptStart, Int?, RecordLogHeldSegment?) in
+                let start = try binding.store.beginReceipt(
+                    writer: receipt.writer, kind: .segment, id: segment.segmentId, fingerprint: fingerprint, chunks: segment.chunks.count
+                )
+                if let generation = start.generation { return (start, generation, start.held) }
+                let begun = try binding.store.beginSegmentReplacement(writer: receipt.writer, attempt: start.attempt)
+                return (start, begun.generation, begun.held)
+            }
+            let attempt = start.attempt
+            receipt.attempt = attempt
+            let writer = receipt.writer
+            guard let generation else { throw RecordLogReceiptFailure("the store handed out no replacement generation") }
+            let marker = RecordLogHeldSegment(segmentId: segment.segmentId, chunks: segment.chunks.map { chunk in
+                RecordLogHeldSegmentChunk(
+                    object: recordLogSegmentChunkObject(
+                        segmentId: segment.segmentId, model: chunk.model, index: chunk.index, source: chunk.source
+                    ),
+                    model: chunk.model, index: chunk.index, firstId: chunk.firstId, lastId: chunk.lastId, rows: chunk.rows,
+                    sha256: chunk.sha256
+                )
+            })
+            receipt.segment = marker
+            receipt.kept = 0
+            receipt.fetched = 0
+            resuming(receipt, start, chunks: segment.chunks.count)
+            let overtaken = {
+                try self.receiptStale(receipt, replacing: generation) {
+                    try self.abandonReceipt(receipt, "another client of the store began replacing it", replacing: generation)
+                }
+            }
+            var holds: [String: RecordLogHeldSegmentChunk] = [:]
+            for chunk in held?.chunks ?? [] { holds[chunk.object] = chunk }
+            for (at, chunk) in segment.chunks.enumerated() where at >= start.done && !start.completed {
+                guard receiving(receipt) else { return }
+                let mine = marker.chunks[at]
+                if let had = holds[mine.object], had.sha256 == mine.sha256, had.rows == mine.rows,
+                   had.firstId == mine.firstId, had.lastId == mine.lastId {
+                    let reply = try binding.withOperation {
+                        try binding.store.keepSegmentChunk(
+                            writer: writer, generation: generation, attempt: attempt, segmentId: segment.segmentId,
+                            object: mine.object, sha256: mine.sha256, model: mine.model, firstId: mine.firstId,
+                            lastId: mine.lastId, rows: mine.rows, readAt: segment.completedLsn
+                        )
+                    }
+                    guard receiving(receipt) else { return }
+                    if reply.stale { return try overtaken() }
+                    if !reply.mismatch {
+                        receipt.kept = (receipt.kept ?? 0) + 1
+                        receipt.applied += 1
+                        progressed()
+                        if receipt.released { return try abandonReceipt(receipt, "the room released the subscription") }
+                        continue
+                    }
+                    logger?.debug("[record-log] \(documentId): the held chunk \(mine.object) could not be kept; fetching it")
+                }
+                let applied = try await applyChunk(receipt, path: "\(base)/\(chunk.path)", read: {
+                    try RecordLogChunkReader.readSegmentChunk($0, chunk)
+                }, apply: { session, rows in
+                    try session.binding.withOperation {
+                        try session.binding.store.applySegmentChunk(
+                            writer: writer, generation: generation, attempt: attempt, rows: rows, readAt: segment.completedLsn
+                        )
+                    }
+                })
+                guard let reply = applied, receiving(receipt) else { return }
+                if reply.stale { return try overtaken() }
+                binding.notify(reply)
+                receipt.applied += 1
+                receipt.fetched = (receipt.fetched ?? 0) + 1
+                progressed()
+                if receipt.released { return try abandonReceipt(receipt, "the room released the subscription") }
+            }
+            if !start.completed {
+                let corrections = segment.corrections
+                let applied = try await applyChunk(receipt, path: "\(base)/\(corrections.path)", read: {
+                    try RecordLogChunkReader.readCorrectionsChunk($0, corrections)
+                }, apply: { session, lines in
+                    try session.binding.withOperation {
+                        try session.binding.store.applySegmentCorrections(
+                            writer: writer, generation: generation, attempt: attempt, lines: lines, readAt: segment.completedLsn
+                        )
+                    }
+                })
+                guard let reply = applied, receiving(receipt) else { return }
+                if reply.stale { return try overtaken() }
+                binding.notify(reply)
+                progressed()
+            }
+            // The pages from `C` belong to the replacement and to the receipt: it
+            // completes at the last of them (so no result held meanwhile is
+            // replayed over rows older than it), and a page that fails fails it.
+            guard current != nil else { return }
+            if receipt.released { return try abandonReceipt(receipt, "the room released the subscription") }
+            beginPaging(Paging(
+                cursor: segment.completedLsn, upTo: upTo, full: false, high: high, generation: generation, receipt: receipt
+            ))
+        } catch {
+            attempt("segment receipt") { try receiptFailed(receipt, Self.describe(error)) }
+        }
+    }
+
+    /// Fetch one chunk, read it off the session, and apply it on the session;
+    /// a chunk failing its check is fetched once more, and a second failure
+    /// fails the receipt. `nil` when the receipt stopped while the bytes were
+    /// on their way: whatever corrected the store since must not be undone.
+    private func applyChunk<Item: Sendable>(
+        _ receipt: Receipt, path: String, read: @escaping @Sendable (Data) throws -> Item,
+        apply: (isolated RecordLogSession, Item) throws -> RecordLogChunkReply
+    ) async throws -> RecordLogChunkReply? {
+        let connection = try fetcher()
+        var tries = 1
+        while true {
+            let bytes: Data
+            do {
+                bytes = try await connection.fetchArtifact(path)
+            } catch {
+                guard receiving(receipt) else { return nil }
+                throw RecordLogReceiptFailure("fetching \(recordLogShownPath(path)) failed: \(Self.describe(error))")
+            }
+            guard receiving(receipt) else { return nil }
+            // Each step of a chunk is progress: a long receipt keeps the
+            // client's handshake watchdog from timing out between chunks.
+            progressed()
+            let decoded = await Self.decode(bytes, read)
+            guard receiving(receipt) else { return nil }
+            progressed()
+            switch decoded {
+            case .success(let item):
+                return try apply(self, item)
+            case .failure(let error):
+                guard error is RecordLogChunkError else { throw error }
+                if tries >= 2 {
+                    throw RecordLogReceiptFailure(
+                        "the chunk at \(recordLogShownPath(path)) failed its check twice: \(Self.describe(error))"
+                    )
+                }
+                logger?.warn(
+                    "[record-log] \(documentId): the chunk at \(recordLogShownPath(path)) failed its check "
+                        + "(\(Self.describe(error))); fetching it again"
+                )
+                tries += 1
+            }
+        }
+    }
+
+    /// Read a chunk's bytes off the session: inflating and parsing a chunk is
+    /// the receipt's heaviest work, and frames keep being handled meanwhile.
+    private nonisolated static func decode<Item: Sendable>(
+        _ bytes: Data, _ read: @Sendable (Data) throws -> Item
+    ) async -> Result<Item, Error> {
+        Result { try read(bytes) }
+    }
+
+}

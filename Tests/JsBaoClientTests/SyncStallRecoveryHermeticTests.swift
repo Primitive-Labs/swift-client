@@ -18,6 +18,7 @@ import XCTest
 /// records frames but never answers, which is the lost-`syncComplete`
 /// condition itself. `syncComplete` frames are handed to the client's own
 /// message router when a test needs one.
+@available(*, deprecated)
 final class SyncStallRecoveryHermeticTests: XCTestCase {
     private var apiServers: [LoopbackAPIServer] = []
 

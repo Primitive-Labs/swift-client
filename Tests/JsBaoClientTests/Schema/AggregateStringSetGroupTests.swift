@@ -51,7 +51,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
         ))
         var byTag: [String: Int] = [:]
         for row in rows {
-            if let tag = row["tags"]?.stringValue { byTag[tag] = intVal(row["count"]) }
+            if let tag = row["group"]?["tags"]?.stringValue { byTag[tag] = intVal(row["count"]) }
         }
         // red: d1,d2 · blue: d2,d3 · green: d4 · (d5 empty -> excluded)
         XCTAssertEqual(byTag, ["red": 2, "blue": 2, "green": 1])
@@ -66,7 +66,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
         ))
         var byTag: [String: Int] = [:]
         for row in rows {
-            if let tag = row["tags"]?.stringValue { byTag[tag] = intVal(row["count"]) }
+            if let tag = row["group"]?["tags"]?.stringValue { byTag[tag] = intVal(row["count"]) }
         }
         // score>=20 keeps d2,d3,d4,d5 → red:{d2} blue:{d2,d3} green:{d4}
         XCTAssertEqual(byTag, ["red": 1, "blue": 2, "green": 1])
@@ -82,7 +82,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
         ))
         var byMembership: [String: Int] = [:]
         for row in rows {
-            if let key = row["has_tags_red"]?.stringValue { byMembership[key] = intVal(row["count"]) }
+            if let key = row["group"]?["has_tags_red"]?.stringValue { byMembership[key] = intVal(row["count"]) }
         }
         // contains red: d1,d2 (true=2) · rest d3,d4,d5 (false=3)
         XCTAssertEqual(byMembership, ["true": 2, "false": 3])
@@ -99,7 +99,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
         ))
         var sums: [String: Double] = [:]
         for row in rows {
-            if let key = row["has_tags_red"]?.stringValue { sums[key] = dblVal(row["sum_score"]) }
+            if let key = row["group"]?["has_tags_red"]?.stringValue { sums[key] = dblVal(row["sum_score"]) }
         }
         // true score sum: 10+20=30 · false: 30+40+50=120
         XCTAssertEqual(sums["true"], 30)
@@ -128,7 +128,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
         ))
         var byTag: [String: Int] = [:]
         for row in rows {
-            if let tag = row["tags"]?.stringValue { byTag[tag] = intVal(row["count"]) }
+            if let tag = row["group"]?["tags"]?.stringValue { byTag[tag] = intVal(row["count"]) }
         }
         // red: a1,a2 (2) · blue: a2,b1 (2) — counts must NOT leak across docs
         XCTAssertEqual(byTag, ["red": 2, "blue": 2])
@@ -142,7 +142,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
         ))
         var byMembership: [String: Int] = [:]
         for row in rows {
-            if let key = row["has_tags_blue"]?.stringValue { byMembership[key] = intVal(row["count"]) }
+            if let key = row["group"]?["has_tags_blue"]?.stringValue { byMembership[key] = intVal(row["count"]) }
         }
         // contains blue: a2,b1 (true=2) · rest a1 (false=1)
         XCTAssertEqual(byMembership, ["true": 2, "false": 1])
@@ -161,7 +161,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
         // Facet dropped → grouped by membership only.
         var byMembership: [String: Int] = [:]
         for row in rows {
-            if let key = row["has_tags_red"]?.stringValue { byMembership[key] = intVal(row["count"]) }
+            if let key = row["group"]?["has_tags_red"]?.stringValue { byMembership[key] = intVal(row["count"]) }
         }
         XCTAssertEqual(byMembership, ["true": 2, "false": 3])
     }
@@ -177,7 +177,7 @@ final class AggregateStringSetGroupTests: XCTestCase {
         // Grouped by score (5 distinct) — facet "tags" dropped, not faceted.
         XCTAssertEqual(rows.count, 5)
         XCTAssertEqual(rows.compactMap { intVal($0["count"]) }.reduce(0, +), 5)
-        XCTAssertNil(rows.first?["tags"], "facet field should be dropped, not in output")
+        XCTAssertEqual(rows.first?["group"]?["tags"], .null, "facet field is not grouped: its key holds null")
     }
 
     /// Two or more pure facet fields: unsupported in js-bao (recoverable

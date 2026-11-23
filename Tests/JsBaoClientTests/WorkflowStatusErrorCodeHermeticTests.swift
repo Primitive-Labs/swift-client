@@ -5,17 +5,17 @@ import XCTest
 /// phase 4.
 ///
 /// The filing requires the codes to be part of the run error vocabulary the
-/// clients already surface on `failure`. Swift's `failure` is built from
+/// clients already surface. Swift's run error is built from
 /// `status.error` alone, so the code has to ride IN that object — which is
 /// exactly what #3449 reserved the key for ("keep the object open and put a
 /// `code` in its own key rather than in `name`"). The spec pin holds the
 /// object's `required` at `["message"]` and leaves it open, so this is a
 /// purely additive server field.
 ///
-/// The point of this file is that **no Swift code changed**: the decoder folds
-/// every key besides `name` and `message` into `details`, so `code` arrives as
-/// `failure.details["code"]` on its own. `WorkflowRun.errorCode` is
-/// `String?` and decodes any value, so the run block carries it too.
+/// The function reader lifts the wire's `code` into `FunctionRunError.code`,
+/// and `FunctionRunInfo.errorCode` is `String?` and decodes any value, so the
+/// run block carries it too. (#3190 — the workflow status type that carried it
+/// under `failure.details` retired with `client.workflows`.)
 ///
 /// Server-free throughout, and deliberately written over
 /// `WorkflowStatusErrorHermeticTests.decodeStatusBytes(_:)` — the helper
@@ -51,27 +51,21 @@ final class WorkflowStatusErrorCodeHermeticTests: XCTestCase {
 
     // MARK: - Behavior 14 — the code arrives under `details`
 
-    func testTheEngineCodeArrivesAsFailureDetailsCode() throws {
+    func testTheEngineCodeArrivesAsTheErrorsCode() throws {
         let status = try WorkflowStatusErrorHermeticTests.decodeStatusBytes(Self.engineEvicted)
 
         XCTAssertEqual(status.status, "failed")
-        let failure = try XCTUnwrap(status.failure, "the structured error is the point")
+        let error = try XCTUnwrap(status.error, "the structured error is the point")
         // The engine's own two keys pass through untouched…
-        XCTAssertEqual(failure.name, "Error")
+        XCTAssertEqual(error.name, "Error")
         XCTAssertEqual(
-            failure.message,
+            error.message,
             "Connection closed: this Durable Object instance is no longer active"
         )
-        // …and the platform's classification is the remaining key, which the
-        // decoder folds into `details` with no client change at all.
-        let details = try XCTUnwrap(failure.details?.objectValue)
-        XCTAssertEqual(Set(details.keys), ["code"])
-        XCTAssertEqual(details["code"]?.stringValue, "ENGINE_ISOLATE_EVICTED")
-        // `error` keeps its `String?` type and stays the MESSAGE: the code is
-        // not in the message's prefix for an engine failure, which is the one
-        // thing the guide's `failure.message` paragraph has to say.
-        XCTAssertEqual(status.error, failure.message)
-        XCTAssertFalse(status.error?.hasPrefix("ENGINE_") == true)
+        // …and the platform's classification is lifted into `code`. The code
+        // is not the message's prefix for an engine failure.
+        XCTAssertEqual(error.code, "ENGINE_ISOLATE_EVICTED")
+        XCTAssertFalse(error.message.hasPrefix("ENGINE_"))
     }
 
     func testTheRunBlockCarriesTheSameCode() async throws {
@@ -110,18 +104,9 @@ final class WorkflowStatusErrorCodeHermeticTests: XCTestCase {
              "run":{"runId":"run-e","runKey":"rk-e","status":"failed","errorCode":"\(code)"}}
             """
             let status = try WorkflowStatusErrorHermeticTests.decodeStatusBytes(json)
-            XCTAssertEqual(
-                status.failure?.details?.objectValue?["code"]?.stringValue, code, code
-            )
+            XCTAssertEqual(status.error?.code, code, code)
             XCTAssertEqual(status.run?.errorCode, code, code)
-            XCTAssertTrue(status.failure?.details?.objectValue?["code"]?.stringValue?
-                .hasPrefix("ENGINE_") == true, code)
-            // #3565 — and the FUNCTION type reads the same bytes into its own
-            // `code`, so a caller on either surface can branch on the family.
-            let asFunction =
-                try WorkflowStatusErrorHermeticTests.decodeFunctionRunStatusBytes(json)
-            XCTAssertEqual(asFunction.error?.code, code, code)
-            XCTAssertEqual(asFunction.run?.errorCode, code, code)
+            XCTAssertTrue(status.error?.code?.hasPrefix("ENGINE_") == true, code)
         }
     }
 

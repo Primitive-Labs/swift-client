@@ -1,6 +1,8 @@
 import XCTest
 @testable import JsBaoClient
 
+// The experimental resource-metadata API compiles only under the condition.
+#if PRIMITIVE_EXPERIMENTAL_APIS
 /// Live tests for the resource-metadata value API (`client.resourceMetadata.*`)
 /// against the local dev server — the Swift mirror of the JS client's
 /// `tests/client/js-bao-client-resource-metadata.test.ts` (#1352 / #1402 /
@@ -22,6 +24,7 @@ import XCTest
 /// decoding identically to a miss) and by the JS client suite, which exercises
 /// them against the same endpoints. The partial-success behavior itself IS
 /// covered live below, using an undefined category as the failing entry.
+@available(*, deprecated)
 final class ResourceMetadataTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!
@@ -397,3 +400,4 @@ final class ResourceMetadataTests: XCTestCase {
         }
     }
 }
+#endif

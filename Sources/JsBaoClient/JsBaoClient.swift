@@ -40,63 +40,85 @@ public final class JsBaoClient: @unchecked Sendable {
     // them. They keep private implicitly-unwrapped storage assigned in
     // `setupSubApis()`, behind a non-optional public computed property.
 
+    /// - Stability: production
     public let collections: CollectionsAPI
-    public let databases: DatabasesAPI
+    /// - Stability: production
     public let session: SessionAPI
+    /// - Stability: production
     public let groups: GroupsAPI
-    public let ruleSets: RuleSetsAPI
-    public let groupTypeConfigs: GroupTypeConfigsAPI
-    public let integrations: IntegrationsAPI
-    public let prompts: PromptsAPI
-    public let workflows: WorkflowsAPI
+    /// - Stability: production
+    @available(*, deprecated, message: "Rule sets are app configuration only an app admin can change: author them in rule-sets/<name>.toml, apply them with `primitive config push` and read them with `primitive rule-sets`.")
+    public var ruleSets: RuleSetsAPI { _ruleSets }
+    private let _ruleSets: RuleSetsAPI
     /// Server functions (invoke / start / getStatus / waitFor / terminate).
     /// A request function answers its result; a task function answers a run
-    /// id polled on the workflow routes. Mirrors JS `client.functions.*`
-    /// (#3278).
+    /// id polled on the function run routes. Mirrors JS `client.functions.*`.
+    /// - Stability: production
     public let functions: FunctionsAPI
+    /// - Stability: production
     public let invitations: InvitationsAPI
+    #if PRIMITIVE_EXPERIMENTAL_APIS
     /// Sub-API for the notification inbox and push-device registration
     /// (list / unreadCount / markRead / markAllRead / send / registerDevice /
     /// listDevices / unregisterDevice). Live in-app notifications arrive as
     /// the `.notification` event. Mirrors JS `client.notifications.*`.
+    /// - Stability: experimental
     public let notifications: NotificationsAPI
-    /// Sub-API for the named lock service (tryAcquire / acquire / release /
-    /// renew / status / list). Leases are mandatory-TTL and the opaque
-    /// `handleId` proves holder identity. Mirrors JS `client.locks.*`.
-    public let locks: LocksAPI
     /// Sub-API for typed resource metadata values (get / set / getBatch /
     /// list / delete). Category definitions are admin-scoped and are not
     /// exposed here. Mirrors JS `client.resourceMetadata.*`.
-    public let resourceMetadata: ResourceMetadataAPI
+    /// - Stability: experimental
+    @available(*, deprecated, message: "Resource metadata is deprecated. Use user properties for per-user data, and a db3 database keyed by the group or collection id for group or collection data, instead. (api-surface-stability)")
+    public var resourceMetadata: ResourceMetadataAPI { _resourceMetadata }
+    private let _resourceMetadata: ResourceMetadataAPI
+    #endif
+    /// - Stability: production
     public let blobBuckets: BlobBucketsAPI
-    public let cronTriggers: CronTriggersAPI
-    public let collectionTypeConfigs: CollectionTypeConfigsAPI
-    public let databaseTypeConfigs: DatabaseTypeConfigsAPI
+    /// - Stability: production
+    @available(*, deprecated, message: "The databases family is deprecated: build on db3 and its types (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
+    public var databaseTypeConfigs: DatabaseTypeConfigsAPI { _databaseTypeConfigs }
+    private let _databaseTypeConfigs: DatabaseTypeConfigsAPI
+    /// - Stability: production
     public let analytics: AnalyticsAPI
-    /// Deep-link / universal-link routing (#931). Set
+    /// This copy of the app's version and platform, and its status against the
+    /// app's version policy. See ``AppVersionAPI``.
+    /// - Stability: beta
+    public let appVersion: AppVersionAPI
+    /// Deep-link / universal-link routing. Set
     /// `links.appBaseURL` to your app's public web base URL to enable
     /// the `shareURL(...)` builders.
+    /// - Stability: production
     public let links: LinksAPI
 
     // The five that cannot be `let`: private storage, non-optional accessor.
 
     /// `internal` rather than `private` so a hermetic test can put the sub-API
     /// on a stand-in transport and exercise the client paths that drive it —
-    /// the connect-time scope reconciliation among them (#2852).
+    /// the connect-time scope reconciliation among them.
     var _documents: DocumentsAPI!
     private var _me: MeAPI!
     private var _auth: AuthAPI!
     private var _users: UsersAPI!
     private var _cache: CacheFacade!
     private var _codegen: CodegenAPI!
+    private var _agents: AgentsAPI!
+    /// The db3 lifecycle `client.db3` fronts; `internal` so the client's own
+    /// record-log paths tell it what changed.
+    var _db3Lifecycle: Db3Lifecycle!
+    private var _db3: Db3API!
 
     /// Document sub-API. Wired during `init`; never nil for callers.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public var documents: DocumentsAPI { _documents }
     /// Current-user sub-API. Wired during `init`; never nil for callers.
+    /// - Stability: production
     public var me: MeAPI { _me }
     /// Authentication sub-API. Wired during `init`; never nil for callers.
+    /// - Stability: production
     public var auth: AuthAPI { _auth }
     /// User-directory sub-API. Wired during `init`; never nil for callers.
+    /// - Stability: production
     public var users: UsersAPI { _users }
     /// Cache facade for general-purpose caching. Wired during `init`; never
     /// nil for callers.
@@ -104,62 +126,87 @@ public final class JsBaoClient: @unchecked Sendable {
     /// The surface generated models call into. **App code should use the
     /// generated `Model.*` facade instead** — see ``CodegenAPI``. Wired during
     /// `init`; never nil for callers.
+    /// - Stability: production
     public var codegen: CodegenAPI { _codegen }
+    /// Agents: `agents.sessions` lists, gets, opens and drives agent sessions.
+    /// Mirrors JS `client.agents`. Wired during `init`; never nil for
+    /// callers.
+    /// - Stability: beta
+    public var agents: AgentsAPI { _agents }
+    /// db3s on this device: subscribe to one (`subscribe`), read its state
+    /// (`state`), and the copies this device holds (`stored`). Mirrors JS
+    /// `client.db3`. Wired during `init`; never nil for callers.
+    /// - Stability: beta
+    public var db3: Db3API { _db3 }
 
     // MARK: - Internal Components
 
     private let options: JsBaoClientOptions
 
-    /// How much room this app said it will give a large document (#3437,
-    /// behavior 34). Read by the format-2 bind, which hands it to the
-    /// coordinator; `nil` probes the client's own database volume.
-    var largeDocumentStorageOptions: LargeDocumentStorageOptions? {
-        options.largeDocumentStorage
-    }
+    /// The client's default for the device indexes its db3s' rooms place on it.
+    var deviceIndexDefault: Db3DeviceIndexes { options.deviceIndexes }
+
     /// `internal` (not `private`) so the client's own extensions in other
-    /// files of this module can log — the large-document front door in
-    /// `LargeDocuments/Format2Client.swift` is one (#3436). Not public.
+    /// files of this module can log — the record-log front door in
+    /// `RecordLog/RecordLogClient.swift` is one. Not public.
     let logger: Logger
     private let httpClient: HttpClient
-    /// `internal` for the same reason as `logger`: the large-document open
-    /// path raises the socket's receive limit before the handshake, and the
-    /// released-hold path puts kept frames back on the wire (#3436).
+    /// `httpClient` behind the offline gate: every HTTP call the app makes
+    /// through the client goes through it, so a call made while networking is
+    /// not allowed throws `.offline` instead of going out. Authentication and
+    /// the blob manager keep the ungated `httpClient`, as in the JS client.
+    let gatedTransport: NetworkGatedTransport
+    /// The API transport, for a test's pass-through observer (``observeTrafficForTest(requests:frames:)``).
+    var gatedTransportForTest: NetworkGatedTransport { gatedTransport }
+    /// `internal` for the same reason as `logger`: the open path raises the
+    /// socket's receive limit before the handshake, and the record-log
+    /// session sends its frames on it.
     let wsManager: WebSocketManager
     /// `internal` (not `private`) so `@testable import JsBaoClient`
     /// tests can drive auth flows directly (e.g., concurrent-refresh
     /// coalescing tests). Not part of the public surface.
     internal let authController: AuthController
     /// The socket work the most recent token application started, so the
-    /// sign-in entry points can await it (#2657). See `handleTokenApplied`.
+    /// sign-in entry points can await it. See `handleTokenApplied`.
     private let pendingTokenConnect = PendingTokenConnectBox()
     /// The `openDocument` network waits in flight, so a refusal the router
-    /// handles can fail one instead of leaving it to time out (#3436).
-    private let awaitingOpens = AwaitingOpenRegistry()
+    /// handles can fail one instead of leaving it to time out.
+    let awaitingOpens = AwaitingOpenRegistry()
+    /// The db3 types this build was generated with (`registerDb3Types`), and
+    /// the db3s let in through `allowUnknownType` (#6024).
+    let db3KnownTypes = Db3KnownTypeRegistry()
     let documentManager: DocumentManager
-    private let blobManager: BlobManager
-    /// `internal` so the large-document open path can ask the provider whether
-    /// it can host one at all (#3436). Not public.
+    /// `internal` so an agent session view reaches its attachments and
+    /// artifacts through it rather than the public `documents`. Not public.
+    let blobManager: BlobManager
+    /// `internal` so the record-log open path can ask the provider whether it
+    /// can host one at all. Not public.
     let offlineStore: OfflineStore
-    /// The large documents this client has open, built on first use (#3436).
-    /// A client that never opens one never builds a coordinator, a client id,
-    /// or a single format-2 table.
-    let format2State = Format2ClientState()
+    /// The record-log (format-3) documents this client has open, built on
+    /// first use. A client that never opens one never mints a writer or
+    /// creates a single record-log table.
+    let recordLogState = RecordLogClientState()
     /// Internal (not `private`) so `@testable` integration tests can observe
     /// logged events via `AnalyticsQueue.onEventLogged` — the Swift analog of
     /// the JS tests poking `client.analyticsQueue` (#963 coverage).
     let analyticsQueue: AnalyticsQueue
     private let kvCache: KvCache
     /// Refreshes the access token when the WebSocket fails to authenticate and
-    /// reconnects with the new one (#2637). Driven from the transport delegate
+    /// reconnects with the new one. Driven from the transport delegate
     /// methods below; `JsBaoClient` is its `WsAuthRecoveryHost`.
     private let wsAuthRecovery: WsAuthRecovery
+    /// The version policy state behind `appVersion`. `internal` so the socket
+    /// delegate reads the refusal hold and tests can observe it.
+    let appVersionController: AppVersionController
+    /// The version and platform every request and socket connect reports.
+    let versionHeaders: ClientVersionHeaders
 
     private let lock = NSLock()
     /// A refresh triggered by an `auth_required` / `auth_failed` frame is
     /// running, so a second challenge for the same expiry must not start
-    /// another one (#2660). Guarded by `lock`.
+    /// another one. Guarded by `lock`.
     private var wsAuthRefreshInFlight = false
-    /// Challenge-driven refreshes spent on the current connection (#2660).
+    /// Challenge-driven refreshes spent on the current connection.
     /// Guarded by `lock`; reset when the socket opens.
     private var wsAuthChallengeRefreshes = 0
     private var networkModeStorage: NetworkMode = .auto
@@ -206,7 +253,7 @@ public final class JsBaoClient: @unchecked Sendable {
     private var subscribedDocuments: Set<String> = []
 
     /// Documents the platform has REFUSED on this connection because the format
-    /// this client declared is not the one it resolved (#3764).
+    /// this client declared is not the one it resolved.
     ///
     /// Guarded by `lock`, beside the other per-document session state. A refused
     /// document is torn down once — a second frame for it is not a second
@@ -220,14 +267,16 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Documents that have already reported a syncStep1 skipped for a
     /// disconnected transport, so the report is one line per document per
-    /// disconnected->connected transition instead of one per 350ms retry tick
-    /// (#2621). Cleared on every connect; a document's entry is dropped when it
+    /// disconnected->connected transition instead of one per 350ms retry tick.
+    /// Cleared on every connect; a document's entry is dropped when it
     /// closes. Guarded by `lock`.
     private var disconnectedSyncSkipReported: Set<String> = []
 
     private var outboundDebounceTimers: [String: Task<Void, Never>] = [:]
     private var pendingUpdates: [String: [[UInt8]]] = [:]
     private var isDestroyed = false
+    /// Whether `destroy()` began, for the db3 lifecycle.
+    var isDestroyedForDb3: Bool { lock.withLock { isDestroyed } }
 
     // MARK: Sync watchdog (#2664, C7)
 
@@ -251,12 +300,12 @@ public final class JsBaoClient: @unchecked Sendable {
     var syncRetryMax: TimeInterval = 15
 
     /// Documents whose failing sync has been reported to the app as a
-    /// `.documentSyncStateChanged` "error" (#3390). Kept so the matching
+    /// `.documentSyncStateChanged` "error". Kept so the matching
     /// "synced" recovery is emitted only for a document the app was actually
     /// warned about. Guarded by `lock`.
     private var syncErrorReported: Set<String> = []
     /// Documents whose current cycle's `syncStep2` carried an `updateUrl` that
-    /// could not be downloaded (#3390). The frame still counts as received
+    /// could not be downloaded. The frame still counts as received
     /// for the stale-state check, but no server state reached the document,
     /// so the `syncComplete` that ends the cycle is not reported to the app as
     /// the recovery. Cleared when the next cycle's `syncStep1` goes out.
@@ -264,19 +313,19 @@ public final class JsBaoClient: @unchecked Sendable {
     private var syncStep2PayloadFailedFor: Set<String> = []
 
     /// Consecutive handshake-budget timeouts per document, cleared when a cycle
-    /// completes or the document closes (#3390). Guarded by `lock`.
+    /// completes or the document closes. Guarded by `lock`.
     private var syncTimeoutStreak: [String: Int] = [:]
     /// Documents whose stall has already asked for a fresh socket. It outlives
     /// the reconnect it triggers — only a completed sync or a close clears it —
     /// so one stalled document rebuilds the connection once rather than every
-    /// few budgets (#3390). Guarded by `lock`.
+    /// few budgets. Guarded by `lock`.
     private var syncStallReconnectRequested: Set<String> = []
     /// Whether the current connection has already been rebuilt for a stalled
     /// document. Reset on connect, so a burst of stalled documents costs one
     /// reconnect between them. Guarded by `lock`.
     private var syncStallReconnectOnThisConnection = false
     /// The close now being delivered is one this client asked the transport to
-    /// make (#3437). Set from `webSocketManagerWillDeliverDeliberateClose()`,
+    /// make. Set from `webSocketManagerWillDeliverDeliberateClose()`,
     /// which the manager calls synchronously immediately before the close, and
     /// read-and-cleared by the close handler — the same sample-it-here
     /// discipline `handshakeCompletedAtClose` uses, and for the same reason: by
@@ -284,7 +333,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Guarded by `lock`.
     private var deliberateCloseInFlight = false
     /// Consecutive handshake-budget timeouts on a live socket before the client
-    /// stops trusting the connection and rebuilds it (#3390).
+    /// stops trusting the connection and rebuilds it.
     private static let syncStallReconnectAfterTimeouts = 3
 
     // MARK: Stale local state recovery (#2664, C14)
@@ -312,7 +361,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `flushOutboundUpdates` refuses to clear the flag while this is non-zero:
     /// during that window `pendingUpdates` looks empty even though a local edit
     /// is on its way in, so an "everything drained" clear would leave the flag
-    /// false with an unsent edit behind it (the Codex finding on PR #2104).
+    /// false with an unsent edit behind it (a Codex review finding).
     private var outboundEnqueuesInProgress: [String: Int] = [:]
 
     /// Ownership token of the flush currently draining each document's outbound
@@ -322,7 +371,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// owns it, a concurrent flush returns immediately, and the owner re-checks
     /// the queue before it releases ownership, so anything queued meanwhile is
     /// drained by that owner. Without this, two flushes could each hold an
-    /// unconfirmed batch and neither could see the other's (#2105).
+    /// unconfirmed batch and neither could see the other's.
     ///
     /// The value is a token rather than a bare `Set` membership because
     /// ownership can be revoked underneath a running flush: `closeDocument` and
@@ -332,7 +381,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// must not touch the new owner's queue, remove its head, release its
     /// ownership, or decide the flag. Comparing the token it acquired against
     /// the current one tells it whether it is still the owner; if not, it exits
-    /// without touching any shared state (the Codex finding on PR #2396).
+    /// without touching any shared state (another Codex review finding).
     private var outboundFlushOwner: [String: UInt64] = [:]
 
     /// Monotonic source of `outboundFlushOwner` tokens. Guarded by `lock`.
@@ -387,7 +436,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// check has run. Fires only for the flush that *owns* the drain — on
     /// every one of its exits: queue drained, send failed, or its ownership
     /// revoked mid-send by `closeDocument`/`destroy`. It never fires for a
-    /// concurrent flush that returned without draining (#2105). Never set in
+    /// concurrent flush that returned without draining. Never set in
     /// production code.
     var onOutboundFlushedForTest: ((String) -> Void)?
 
@@ -396,6 +445,63 @@ public final class JsBaoClient: @unchecked Sendable {
     /// which is the window a classification resolving concurrently has to
     /// survive. Internal; never set in production code.
     var onOutboundClassificationHoldForTest: (@Sendable (String) async -> Void)?
+
+    /// Test seam inside `startNetworkSync`: awaited after the claim is taken
+    /// and before the `syncStep1` goes to the socket, which is where a test
+    /// holds a handshake send in flight. Internal; never set in production
+    /// code.
+    var onSyncStep1SendForTest: (@Sendable (String) async -> Void)?
+
+    /// Test seam inside a format-3 receipt's artifact fetch: awaited with the
+    /// grant path before the request goes out, where a test holds a fetch in
+    /// flight or fails it by throwing. Internal; never set in production code.
+    var recordLogArtifactFetchForTest: (@Sendable (String) async throws -> Void)?
+    /// Test seam after a format-3 artifact read: its grant path and the status
+    /// it was answered (`nil` when no HTTP answer came). Internal; never set in
+    /// production code.
+    var recordLogArtifactStatusForTest: (@Sendable (String, Int?) -> Void)?
+
+    /// Test seam for the documents API's answer to "what format is this
+    /// document?", asked before a handshake. Answers in place of the request
+    /// when set. Internal; never set in production code.
+    var documentFormatLookupForTest: (@Sendable (String) async throws -> Int?)?
+
+    /// Test seams on the format-3 frames: each frame routed to a session as it
+    /// arrives, and each frame a session hands the socket (its JSON text).
+    /// Internal; never set in production code.
+    var recordLogFrameForTest: (@Sendable ([String: JSONValue]) -> Void)?
+    var recordLogFrameSentForTest: (@Sendable (String) -> Void)?
+    /// Test seam before a format-3 frame reaches its session: awaited with the
+    /// frame, which is dropped when it answers `false` (a test slows a stream
+    /// by sleeping in it). Internal; never set in production code.
+    var recordLogFrameGateForTest: (@Sendable ([String: JSONValue]) async -> Bool)?
+    /// Test seam inside the binding of a stored db3, awaited with its id before
+    /// the store is bound: a test holds a start-up binding while a logout
+    /// races it. Internal; never set in production code.
+    var db3BindHoldForTest: (@Sendable (String) async -> Void)?
+    /// Test seam at the top of the db3 lifecycle's close of a db3 on the
+    /// socket, awaited with its id: a test holds an identity release while a
+    /// subscribe or a sign-out races it. Internal; never set in production code.
+    var db3CloseHoldForTest: (@Sendable (String) async -> Void)?
+    /// The identity changes in progress, and the db3s each is releasing.
+    let db3IdentityRelease = Db3IdentityRelease()
+    /// Test seam told each time the client reads a db3's index list, with its
+    /// id. Internal; never set in production code.
+    var db3IndexReadForTest: (@Sendable (String) -> Void)?
+    /// Test seam awaited before each index-list read leaves, with the db3's
+    /// id, so a test can hold a read in flight. Internal; never set in production code.
+    var db3IndexReadHoldForTest: (@Sendable (String) async -> Void)?
+    /// Each db3's index-list reads; `ready()` waits for the open's.
+    var db3IndexRefresher: RecordLogIndexRefresher!
+    /// The client's work on its db3s' shared ANN models.
+    var db3VectorModels: Db3VectorModels!
+    /// What trains a db3 vector index's ANN model off the store's queue.
+    let vec1Trainer = RecordLogVec1Trainer()
+    /// Test seam: how long each request of the model loop may take.
+    /// Internal; never set in production code.
+    nonisolated(unsafe) var db3ModelRequestTimeoutForTest: TimeInterval?
+    /// The document doors this client has logged a db3 deprecation line for.
+    let db3DoorWarnings = Db3DoorWarnings()
 
     // MARK: Outbound work handed off the receive loop (#3559)
 
@@ -411,6 +517,30 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Monotonic source of `outboundLane` tokens. Guarded by `lock`.
     private var outboundLaneTokenSeq: UInt64 = 0
 
+    // MARK: Metadata session fence
+
+    /// Bumped whenever the signed-in user changes, logout included. A
+    /// `syncMetadata` answer fetched under one generation lists that user's
+    /// documents: once the generation has moved on, it is dropped rather than
+    /// written into the cache the next user reads. Mirrors js-bao's
+    /// `metadataSessionGeneration`. Guarded by `metadataSessionLock`, not
+    /// `lock`: `handleTokenApplied` bumps it inline on whatever thread applied
+    /// the token, where taking `lock` is a deadlock risk.
+    private var metadataSessionGeneration: UInt64 = 0
+    private let metadataSessionLock = NSLock()
+
+    private var currentMetadataSession: UInt64 {
+        metadataSessionLock.withLock { metadataSessionGeneration }
+    }
+
+    /// The metadata session now, for a caller in another file that fences its
+    /// own writes on it (`client.db3`'s create).
+    var metadataSessionToken: UInt64 { currentMetadataSession }
+
+    private func endMetadataSession() {
+        metadataSessionLock.withLock { metadataSessionGeneration &+= 1 }
+    }
+
     // MARK: Storage-init completion signal (#1780)
 
     /// Guards `storageReady` + `storageReadyWaiters`.
@@ -422,6 +552,12 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Continuations parked in `awaitStorageReady()` before the signal fired,
     /// keyed so a cancelled waiter can remove only its own.
     private var storageReadyWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+    /// Guards `storedLocalOnly`.
+    let storedLocalOnlyLock = NSLock()
+    /// The local-only db3s the signed-in user's store held when a request
+    /// first asked this session, read once per user.
+    var storedLocalOnly: (userId: String, ids: Task<Set<String>?, Never>)?
 
     // MARK: Analytics session lifecycle (#963)
 
@@ -464,7 +600,7 @@ public final class JsBaoClient: @unchecked Sendable {
     private var analyticsEventSubscriptions: [EventSubscription] = []
 
     /// Subscription that fires the WebSocket auth recovery's pending reconnect
-    /// when a token lands from any path (#2637). Cancelled on `destroy()` /
+    /// when a token lands from any path. Cancelled on `destroy()` /
     /// `deinit`.
     private var wsAuthRecoverySubscription: EventSubscription?
 
@@ -494,6 +630,17 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Test seam for the ack timeout. Never set in production code.
     var channelSubscribeAckTimeoutForTest: TimeInterval?
 
+    /// Test seam: awaited at the top of `setupStorage()`'s task, so a test can
+    /// hold the client in its "storage not bound yet" window for as long as it
+    /// needs. Set only through the internal init. Never set in production code.
+    private let storageSetupHoldForTest: (@Sendable () async -> Void)?
+
+    /// Test seam: awaited in `setupStorage()`'s task right after the provider
+    /// is attached and before the signed-in user is bound, so a test can hold
+    /// the client in its "provider attached, no user yet" window. Set only
+    /// through the internal init. Never set in production code.
+    private let storageBindHoldForTest: (@Sendable () async -> Void)?
+
     // MARK: - Initialization
 
     /// Public entry point. Delegates to the internal designated init with no
@@ -507,19 +654,47 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `ConnectivityMonitor` for tests; when `nil` and `autoNetwork` is true,
     /// the real `NWPathConnectivityMonitor` is created. When `autoNetwork` is
     /// false no monitor is started (parity with the bundled consumer).
+    /// `storageSetupHoldForTest` holds the storage setup task before it binds
+    /// anything, and `storageBindHoldForTest` holds it after the provider is
+    /// attached and before the user is bound; tests only.
     internal init(
         options: JsBaoClientOptions,
-        connectivityMonitor injectedMonitor: ConnectivityMonitor?
+        connectivityMonitor injectedMonitor: ConnectivityMonitor?,
+        storageSetupHoldForTest: (@Sendable () async -> Void)? = nil,
+        storageBindHoldForTest: (@Sendable () async -> Void)? = nil,
+        bundleVersionForTest: (@Sendable () -> Any?)? = nil
     ) {
+        // The version and platform this client reports, from its options, the
+        // bundle and the OS. An illegal one stops construction here, naming the
+        // value, where it came from and the fix. The bundle is read only when
+        // no `appVersion` option is given.
+        let readBundleVersion = bundleVersionForTest ?? { Bundle.main.infoDictionary?["CFBundleShortVersionString"] }
+        let resolvedIdentity = ClientVersionRules.resolveClientIdentity(
+            optionVersion: options.appVersion,
+            optionPlatform: options.platform,
+            bundleVersion: readBundleVersion(),
+            osPlatform: ClientVersionRules.osPlatform
+        )
+        precondition(resolvedIdentity.refusal == nil, resolvedIdentity.refusal ?? "")
+        let identity = resolvedIdentity.identity
+        let versionHeaders = ClientVersionHeaders(version: identity.version, platform: identity.platform)
+        self.versionHeaders = versionHeaders
+        // A refusal can arrive on any request, before the controller below
+        // exists; the relay hands it on once it does.
+        let refusalRelay = UpdateRequiredRelay()
         self.options = options
+        self.storageSetupHoldForTest = storageSetupHoldForTest
+        self.storageBindHoldForTest = storageBindHoldForTest
+        // The root every component's logger is scoped from, so a runtime
+        // `setLogLevel(_:)` reaches all of them.
+        let logger = createLogger(level: options.logLevel, scope: "JsBaoClient")
+        self.logger = logger
         // Wired with its own logger so a stalled `stream(for:)` consumer's
         // high-water warning reaches the app's log. Held in a local as well as
         // the stored property so `KvCache`'s emitter closure can capture it
         // below — an escaping closure cannot capture `self` from an initializer
         // before the instance is fully initialized.
-        let eventEmitter = EventEmitter(
-            logger: createLogger(level: options.logLevel, scope: "EventEmitter")
-        )
+        let eventEmitter = EventEmitter(logger: logger.forScope(scope: "EventEmitter"))
         self.eventEmitter = eventEmitter
 
         // Resolve the monitor: an injected fake wins; otherwise the real
@@ -531,9 +706,6 @@ public final class JsBaoClient: @unchecked Sendable {
         } else {
             self.connectivityMonitor = nil
         }
-
-        // Logger
-        self.logger = createLogger(level: options.logLevel, scope: "JsBaoClient")
 
         // Offline store
         self.offlineStore = OfflineStore()
@@ -553,12 +725,14 @@ public final class JsBaoClient: @unchecked Sendable {
         // layer can forward the live connection id as `X-JB-Connection-Id`.
         // (`HttpClientConfig` is immutable; the previous `{ nil }` placeholder
         // could never be "set after wsManager init", so Swift HTTP writes were
-        // silently unattributed — JS forwards the id on every request, which
-        // is what makes `db.change` frames round-trip with `isOrigin: true`
-        // for the writer's own connection, #737.)
+        // silently unattributed — JS forwards the id on every request, so the
+        // server can tell the writer's own connection apart, #737.)
         let wsManager = WebSocketManager(
             logger: logger,
-            maxReconnectDelayMs: Int(options.maxReconnectDelay * 1000)
+            maxReconnectDelayMs: Int(options.maxReconnectDelay * 1000),
+            // An open socket waits for the server's `ready` within the sync
+            // handshake budget, as JS bounds it with `handshakeTimeoutMs` (#5578).
+            readyTimeoutMs: Int(max(0, options.sync.handshakeTimeout) * 1000)
         )
         self.wsManager = wsManager
         self.wsAuthRecovery = WsAuthRecovery(logger: logger)
@@ -582,9 +756,13 @@ public final class JsBaoClient: @unchecked Sendable {
                 await authController?.refreshAccessToken(
                     cause: AuthController.httpRequestCause
                 ) ?? .network(nil)
-            }
+            },
+            versionHeaders: versionHeaders,
+            onUpdateRequired: { refusalRelay.fire() }
         ))
         self.httpClient = httpClient
+        let gatedTransport = NetworkGatedTransport(base: httpClient)
+        self.gatedTransport = gatedTransport
 
         // Document manager
         self.documentManager = DocumentManager(logger: logger)
@@ -598,7 +776,13 @@ public final class JsBaoClient: @unchecked Sendable {
         // cannot capture `self` from an initializer before the instance is
         // fully initialized. The seventh setter, `getCurrentUserId`, is gone —
         // it was assigned and never read.
+        //
+        // Uploads read the signed-in identity (one token read, its user
+        // parsed from that token); session uploads also read the networking
+        // gate the API namespaces' transport applies. The queue is kept in
+        // the offline store's database so it survives the process (#4592).
         let authController = self.authController
+        let documentManager = self.documentManager
         self.blobManager = BlobManager(
             logger: logger,
             uploadConcurrency: options.blobUploadConcurrency,
@@ -607,7 +791,16 @@ public final class JsBaoClient: @unchecked Sendable {
             getAppId: { options.appId },
             getToken: { [weak authController] in authController?.getToken() },
             getGlobalAdminAppId: { options.globalAdminAppId },
-            emit: { [weak eventEmitter] payload in eventEmitter?.emitErased(payload) }
+            emit: { [weak eventEmitter] payload in eventEmitter?.emitErased(payload) },
+            currentIdentity: { [weak authController] in
+                guard let identity = authController?.identity() else { return UploadIdentity(token: nil, userId: nil) }
+                return UploadIdentity(token: identity.token, userId: identity.userId, epoch: identity.epoch)
+            },
+            networkingAllowed: { [weak gatedTransport] in gatedTransport?.networkingAllowed ?? true },
+            pendingDb3Create: { [weak documentManager] db3Id in documentManager?.isPendingCreate(db3Id) ?? false },
+            offlineStore: offlineStore,
+            versionHeaders: versionHeaders,
+            onUpdateRequired: { refusalRelay.fire() }
         )
 
         // Analytics queue. Its collaborators are supplied here rather than
@@ -622,7 +815,8 @@ public final class JsBaoClient: @unchecked Sendable {
             offlineStore: offlineStore,
             sendMessage: { [weak wsManager] message in try await wsManager?.send(message) },
             getConnectionId: { [weak wsManager] in wsManager?.connectionId },
-            getUserId: { [weak authController] in authController?.getUserId() }
+            getUserId: { [weak authController] in authController?.getUserId() },
+            appVersion: identity.version
         )
         self.analyticsQueue = analyticsQueue
 
@@ -645,73 +839,49 @@ public final class JsBaoClient: @unchecked Sendable {
         // in phase 1 as `let`s (#2367) so the public surface carries no
         // implicitly-unwrapped optional. Every closure captures a local
         // weakly — never `self`, which is not usable yet.
-        self.collections = CollectionsAPI(transport: httpClient)
-        self.session = SessionAPI(transport: httpClient)
+        self.collections = CollectionsAPI(transport: gatedTransport)
+        self.session = SessionAPI(transport: gatedTransport)
         self.links = LinksAPI()
-        self.groups = GroupsAPI(transport: httpClient)
-        self.ruleSets = RuleSetsAPI(transport: httpClient)
-        self.groupTypeConfigs = GroupTypeConfigsAPI(transport: httpClient)
-        // IntegrationsAPI needs the full HttpClientResponse to surface
-        // upstream status / headers / typed error mapping (the proxy
-        // envelope puts the upstream status in the body and the proxy's
-        // OWN status in the response status), so it uses
-        // `Transport.requestRaw`, which does not throw on a non-2xx status.
-        self.integrations = IntegrationsAPI(transport: httpClient)
-        self.prompts = PromptsAPI(transport: httpClient)
-        self.invitations = InvitationsAPI(transport: httpClient)
-        self.notifications = NotificationsAPI(transport: httpClient)
-        self.locks = LocksAPI(transport: httpClient)
-        self.resourceMetadata = ResourceMetadataAPI(transport: httpClient)
+        self.groups = GroupsAPI(transport: gatedTransport)
+        self._ruleSets = RuleSetsAPI(transport: gatedTransport)
+        self.invitations = InvitationsAPI(transport: gatedTransport)
+        #if PRIMITIVE_EXPERIMENTAL_APIS
+        self.notifications = NotificationsAPI(transport: gatedTransport)
+        self._resourceMetadata = ResourceMetadataAPI(transport: gatedTransport)
+        #endif
         // Blob upload/download go through `Transport.requestData`, which
         // returns the untouched response bytes.
-        self.blobBuckets = BlobBucketsAPI(transport: httpClient)
-        self.cronTriggers = CronTriggersAPI(transport: httpClient)
-        self.collectionTypeConfigs = CollectionTypeConfigsAPI(transport: httpClient)
-        self.databaseTypeConfigs = DatabaseTypeConfigsAPI(transport: httpClient)
-        let workflows = WorkflowsAPI(
-            transport: httpClient,
-            getConnectionId: { [weak wsManager] in wsManager?.connectionId ?? "" },
-            logger: logger,
-            events: eventEmitter
-        )
-        self.workflows = workflows
-        // Server functions ride the same transport. #3565 — and nothing else:
-        // the control routes are posted by that class itself and answer the
-        // function-native run status, so it holds no `WorkflowsAPI`.
-        self.functions = FunctionsAPI(transport: httpClient, logger: logger)
+        self.blobBuckets = BlobBucketsAPI(transport: gatedTransport)
+        self._databaseTypeConfigs = DatabaseTypeConfigsAPI(transport: gatedTransport)
+        // Server functions ride the same transport, and post their own
+        // control routes.
+        self.functions = FunctionsAPI(transport: gatedTransport, logger: logger)
         // Analytics namespace — a thin facade over the shared
         // `analyticsQueue`. All five methods fan out to the same queue.
         self.analytics = AnalyticsAPI(
             queue: analyticsQueue,
             resolveUserUlid: { [weak authController] in authController?.getUserId() }
         )
-        // Realtime DB subscriptions (`databases.subscribe`). The registry
-        // routes inbound `db.change` frames and is re-subscribed on reconnect.
-        let dbSubscriptionRegistry = DatabaseSubscriptionRegistry(logger: logger)
-        dbSubscriptionRegistry.setOriginContext(
-            DatabaseSubscriptionRegistry.OriginContext(
-                getConnectionId: { [weak wsManager] in wsManager?.connectionId },
-                getCurrentUserId: { [weak authController] in authController?.getUserId() }
-            )
+        // The version policy. Its fetch is a public read through the gated
+        // transport; the first ask waits for storage so the stored policy is
+        // read before the status is reported.
+        let storageReady = StorageReadyWaiter()
+        let appVersionController = AppVersionController(
+            identity: identity,
+            appId: options.appId,
+            transport: gatedTransport,
+            offlineStore: offlineStore,
+            logger: logger,
+            waitForStorage: { await storageReady.wait() }
         )
-        self.databases = DatabasesAPI(
-            transport: httpClient,
-            subscriptionRegistry: dbSubscriptionRegistry,
-            sendWSMessage: { [weak wsManager] message in
-                guard let wsManager else { return }
-                Task { try? await wsManager.send(message) }
-            },
-            isWebSocketOpen: { [weak wsManager] in wsManager?.isSocketOpen ?? false },
-            connectWebSocket: { [weak wsManager] in
-                guard let wsManager else { return }
-                Task { try? await wsManager.connect() }
-            },
-            logger: logger
-        )
-
+        self.appVersionController = appVersionController
+        self.appVersion = AppVersionAPI(controller: appVersionController)
+        refusalRelay.attach(appVersionController)
         // Wire up dependencies
         setupDependencies()
         setupSubApis()
+        storageReady.attach(self)
+        appVersionController.setReleaseHandler { [weak self] in self?.reconnectAfterVersionRelease() }
 
         // Bootstrap token synchronously so it's available for connect().
         // The async setupStorage() Task would set it too late.
@@ -734,6 +904,14 @@ public final class JsBaoClient: @unchecked Sendable {
         authController.setTokenAppliedHandler { [weak self] token, previous in
             self?.handleTokenApplied(token: token, previous: previous)
         }
+        // Session uploads stay with the user who queued them. The queue
+        // already reads the new user's epoch with every token it takes; this
+        // ends the previous user's waits and transfers without waiting for
+        // the queue's next step, whichever path changed the user.
+        let blobManager = self.blobManager
+        authController.setIdentityChangedHandler {
+            Task { await blobManager.syncIdentity() }
+        }
     }
 
     deinit {
@@ -750,6 +928,7 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Exchange an OAuth authorization code for an access token.
     /// This is a static method that doesn't require a client instance.
+    /// - Stability: production
     public static func exchangeOAuthCode(
         apiUrl: String,
         appId: String,
@@ -783,10 +962,11 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Boolean predicate: can THIS (native) client start Google sign-in?
     ///
-    /// Mirrors js-bao's `client.checkOAuthAvailable()`, against the client map
-    /// (#2891): the provider enabled AND the `ios` entry usable. Google
+    /// Mirrors js-bao's `client.checkOAuthAvailable()`, against the client map:
+    /// the provider enabled AND the `ios` entry usable. Google
     /// registers a client per platform, so a web-only app answers `false` here
     /// — the PKCE exchange this client runs would fail at Google.
+    /// - Stability: production
     public func checkOAuthAvailable() async -> Bool {
         guard let cfg = try? await auth.getAuthConfig() else { return false }
         return cfg.googleSignInAvailable
@@ -795,7 +975,14 @@ public final class JsBaoClient: @unchecked Sendable {
     // MARK: - Connection
 
     /// Connect to the WebSocket server
+    /// - Stability: production
     public func connect() async throws {
+        try await connect(origin: .caller)
+    }
+
+    /// `connect()` for any origin: the client's own connects pass
+    /// `.automatic`, which a refusal of this client holds.
+    private func connect(origin: ConnectOrigin) async throws {
         guard !isDestroyed else { return }
         // A caller-initiated connect is a fresh incident: it must not inherit
         // the auth-recovery attempt budget an earlier session spent, or the
@@ -803,30 +990,33 @@ public final class JsBaoClient: @unchecked Sendable {
         // Safe from the recovery's own reconnect, which goes through
         // `wsManager.forceReconnect()` and never reaches here.
         wsAuthRecovery.reset()
-        // #3436 — the receive limit has to be settled before the task is
+        // The receive limit has to be settled before the task is
         // built: Foundation ignores it on a task that is already running, so
         // deciding it afterwards would cost a rebuilt socket.
         await ensureReceiveLimitForKnownDocuments()
-        try await wsManager.connect()
+        try await wsManager.connect(origin: origin)
     }
 
     /// Disconnect from the WebSocket server
+    /// - Stability: production
     public func disconnect() async {
         await wsManager.disconnect()
     }
 
     /// Set whether the client should maintain a WebSocket connection
+    /// - Stability: production
     public func setShouldConnect(_ shouldConnect: Bool) async {
-        await wsManager.setDesiredConnection(shouldConnect: shouldConnect)
+        await wsManager.setDesiredConnection(shouldConnect: shouldConnect, origin: .caller)
     }
 
     /// Force reconnect the WebSocket, returning once the reconnect has been
     /// initiated.
+    /// - Stability: production
     public func forceReconnectAsync() async {
-        await wsManager.forceReconnect()
+        await wsManager.forceReconnect(origin: .caller)
     }
 
-    /// Check if WebSocket is connected
+    /// Check if WebSocket is connected: open, and receiving the user's events.
     public var isConnected: Bool {
         wsManager.isConnected
     }
@@ -860,6 +1050,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// the `.channelMessage` event; held grants are presented again after a
     /// reconnect, and a re-presented grant the server refuses is announced as
     /// `.channelSubscribeFailed`. Mirrors JS `subscribeToChannel`.
+    /// - Stability: beta
     public func subscribeToChannel(_ channel: String, grant: String) async throws -> ChannelSubscription {
         guard !channel.isEmpty else {
             throw JsBaoError(code: .invalidArgument, message: "subscribeToChannel: channel is required")
@@ -879,6 +1070,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// waiting for its ack throws rather than resolving with a subscription
     /// to a channel this client has already left. Mirrors JS
     /// `unsubscribeFromChannel`.
+    /// - Stability: beta
     public func unsubscribeFromChannel(_ channel: String) {
         // Grant, chain and generation go together, and the generation is
         // bumped BEFORE the pending calls are settled: a caller that
@@ -966,7 +1158,15 @@ public final class JsBaoClient: @unchecked Sendable {
                     sendControlFrame(ChannelSubscribeFrame(channel: channel, grant: grant))
                 }
             } else {
-                Task { [weak self] in try? await self?.wsManager.connect() }
+                // The receive limit is settled before the socket is built, as
+                // `connect()` does. A raise that lands after the open — storage
+                // setup's, when this join beat it — rebuilds the socket, and
+                // that close rejects this join before its ack can arrive.
+                Task { [weak self] in
+                    guard let self else { return }
+                    await self.ensureReceiveLimitForKnownDocuments()
+                    try? await self.wsManager.connect()
+                }
             }
         }
     }
@@ -1096,7 +1296,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// detached task per frame would let a leave-and-rejoin reach the server
     /// as subscribe-then-unsubscribe: the new call would resolve on its ack
     /// and the server would then remove the membership it had just granted
-    /// (CSO-002 on #3278). JS gets the order from `ws.send` for free; here
+    /// (CSO-002). JS gets the order from `ws.send` for free; here
     /// every send waits for the one before it.
     private func sendControlFrame<Frame: Encodable & Sendable>(_ frame: Frame) {
         guard let data = try? JSONCoding.encodeData(frame),
@@ -1132,7 +1332,7 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Wait until somebody is signed in, then report who and in which mode.
     ///
-    /// Mirrors js-bao's `client.waitForAuthReady()` (#2657, audit item A12): it
+    /// Mirrors js-bao's `client.waitForAuthReady()` (audit item A12): it
     /// resolves with a **non-optional** userId, and it THROWS when no user
     /// arrives — on `authFailed`, or when the timeout expires. It used to
     /// resolve at `markAuthReady()`, which made "nobody is signed in" a success
@@ -1142,6 +1342,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// To wait for session restore to settle WITHOUT requiring a signed-in user
     /// — the cold-start "is there a session?" question — use
     /// `waitForStorageReady(timeout:)`, which reports a Bool.
+    /// - Stability: production
     @discardableResult
     public func waitForAuthReady(
         timeout: TimeInterval = 10
@@ -1151,9 +1352,10 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Wait for a user id, including one from a sign-in that starts AFTER this
-    /// call — the JS semantics (#2657, audit item A12). It used to throw the
+    /// call — the JS semantics (audit item A12). It used to throw the
     /// moment auth-readiness landed, so awaiting it across an interactive
     /// sign-in could never succeed.
+    /// - Stability: production
     public func waitForUserId(timeout: TimeInterval = 10) async throws -> String {
         // JS's `waitForUserId` waits out its timeout regardless of auth-failed;
         // only `waitForAuthReady` races the failure event.
@@ -1231,6 +1433,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `client.isRootDocument(documentId)`. Local-only — reads
     /// `rootDocId` straight from the JWT payload (no network, no
     /// async).
+    /// - Stability: production
+    @available(*, deprecated, message: "Root documents are a documents feature with no db3 counterpart: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func isRootDocument(_ documentId: String) -> Bool {
         guard let root = rootDocIdFromJwt() else { return false }
         return root == documentId
@@ -1256,6 +1460,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// checks (the WebSocket sync protocol echoes this hash). Throws
     /// `notFound` if the doc isn't open. Matches js-bao's
     /// `client.getDocHash(documentId)`.
+    /// - Stability: production
+    @available(*, deprecated, message: "A Yjs document hash has no db3 counterpart; client.db3.state reports a db3's state: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func getDocHash(documentId: String) throws -> String {
         guard let hash = documentManager.getDocHash(documentId: documentId) else {
             throw JsBaoError(
@@ -1270,6 +1476,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `documents.getDocumentPermission(documentId:)`. js-bao exposes
     /// this on the client root, which is the call site cross-platform
     /// code tends to use.
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.state(_:) and its permission. It keeps answering until a later removal project. (api-surface-stability)")
     public func getDocumentPermission(_ documentId: String) -> DocumentPermission? {
         documentManager.getPermission(documentId)
     }
@@ -1285,6 +1493,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// data simply don't appear in the result.
     ///
     /// Returns `nil` if the doc isn't open.
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.schema(_:). It keeps answering until a later removal project. (api-surface-stability)")
     public func getDocumentSchema(
         documentId: String,
         modelNames: [String]
@@ -1312,6 +1522,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `getDocumentModelMapping(modelName)` returns this doc. Throws
     /// `notFound` if the doc isn't open. Mirrors js-bao's
     /// `client.addDocumentModelMapping(modelName, documentId)`.
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.setModelDefaultDb3(_:_:). It keeps answering until a later removal project. (api-surface-stability)")
     public func addDocumentModelMapping(
         modelName: String, documentId: String
     ) throws {
@@ -1327,7 +1539,31 @@ public final class JsBaoClient: @unchecked Sendable {
         }
     }
 
+    /// Bind `modelName` to the db3 `db3Id`: an untyped db3's open declares
+    /// the models bound to it, so their indexes and unique constraints are
+    /// in force before the first save. Bind before you subscribe; a binding
+    /// made while the db3 is open applies at its next open. Unlike
+    /// ``addDocumentModelMapping(modelName:documentId:)`` it checks nothing:
+    /// the db3 need not be open, bound or held on this device. Read back by
+    /// ``getDocumentModelMapping(modelName:)``, removed by
+    /// ``clearDocumentModelMapping(modelName:)``. No save reads it: every
+    /// save names its db3. The Swift form of js-bao's
+    /// `BaseModel.setModelDefaultDb3`.
+    /// - Stability: production
+    public func setModelDefaultDb3(_ modelName: String, _ db3Id: String) {
+        lock.withLock {
+            modelToDocumentId[modelName] = db3Id
+        }
+    }
+
+    /// The per-model bindings as set (no fallback to the default), and the
+    /// default document: what decides the models a db3's open declares.
+    func modelDefaultDb3s() -> (perModel: [String: String], global: String?) {
+        lock.withLock { (modelToDocumentId, defaultDocumentIdStorage) }
+    }
+
     /// Remove a `modelName → documentId` mapping. No-op if none exists.
+    /// - Stability: production
     public func clearDocumentModelMapping(modelName: String) {
         lock.withLock {
             _ = modelToDocumentId.removeValue(forKey: modelName)
@@ -1338,6 +1574,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// doc if no per-model mapping exists. Returns `nil` if neither
     /// is set. Matches js-bao's `getDocumentIdForModel` /
     /// `getDocumentModelMapping`.
+    /// - Stability: production
     public func getDocumentModelMapping(modelName: String) -> String? {
         return lock.withLock {
             modelToDocumentId[modelName] ?? defaultDocumentIdStorage
@@ -1345,9 +1582,21 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Set the doc used as a fallback when no per-model mapping
-    /// applies. Throws `notFound` if the doc isn't open.
+    /// applies. Throws `notFound` if the doc isn't open, unless it is a db3
+    /// whose store is bound here: a resident one is accepted, one whose rows
+    /// have not loaded is refused `DB3_NOT_RESIDENT`.
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.setDefaultDb3(_:). It keeps answering until a later removal project. (api-surface-stability)")
     public func setDefaultDocumentId(_ documentId: String) throws {
-        guard documentManager.isOpen(documentId) else {
+        try applyDefaultDocumentId(documentId)
+    }
+
+    /// `setDefaultDocumentId`'s body, for `setDefaultDb3` (#5365): the public
+    /// member is deprecated in favour of `setDefaultDb3` and delegates here.
+    func applyDefaultDocumentId(_ documentId: String) throws {
+        if !documentManager.isOpen(documentId), let binding = recordLogBinding(documentId), !binding.isClosed {
+            guard binding.isResident else { throw db3NotResidentError([documentId], source: "setDefaultDb3") }
+        } else if !documentManager.isOpen(documentId) {
             throw JsBaoError(
                 code: .notFound,
                 message: "Document `\(documentId)` is not open. " +
@@ -1359,6 +1608,21 @@ public final class JsBaoClient: @unchecked Sendable {
         }
     }
 
+    /// The `db3`-named form of ``setDefaultDocumentId(_:)``: the document used
+    /// as a fallback when no per-model mapping applies. As there, nothing in
+    /// Swift reads it automatically; every save names its document
+    /// (`save(in:)`).
+    /// - Throws: `DB3_NOT_RESIDENT` for a db3 whose rows have not loaded here;
+    ///   `notFound` for a document neither open nor a bound db3.
+    /// - Stability: production
+    public func setDefaultDb3(_ db3Id: String) throws {
+        if let binding = recordLogBinding(db3Id), !binding.isClosed, !binding.isResident {
+            throw db3NotResidentError([db3Id], source: "setDefaultDb3")
+        }
+        try applyDefaultDocumentId(db3Id)
+    }
+
+    /// - Stability: production
     public func clearDefaultDocumentId() {
         lock.withLock {
             defaultDocumentIdStorage = nil
@@ -1406,6 +1670,12 @@ public final class JsBaoClient: @unchecked Sendable {
             return model
         }
         guard newlyCreated else { return created }
+        // A model saved into a format-1 document is deprecated: records
+        // belong in a db3. One warning per model per document, in the JS
+        // client's words.
+        created.setFormat1SaveWarning { [logger] model, documentId in
+            logger.warn("saving `\(model)` into format-1 document \(documentId) is deprecated: records belong in a db3")
+        }
         // #3719 — registration stays non-throwing, but a schema declaring a
         // unique constraint on a stringset field will have every write
         // refused; say so once, when the model is first registered.
@@ -1420,7 +1690,7 @@ public final class JsBaoClient: @unchecked Sendable {
         for entry in documentManager.openDocumentsSnapshot() {
             created.connect(docId: entry.documentId, doc: entry.doc)
         }
-        bindLargeDocumentsTo(created)
+        bindRecordLogDocumentsTo(created)
         return created
     }
 
@@ -1430,8 +1700,7 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Every model registered with this client's shared cross-document stores.
-    /// A large document's overlay observer watches one map per model, so this
-    /// is the set it attaches to at bind (#3436).
+    /// A record-log document declares and projects this set at bind.
     func registeredModelNames() -> [String] {
         lock.withLock { Array(sharedModels.keys) }.sorted()
     }
@@ -1440,6 +1709,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// the debug inspector. Each entry is the per-doc writer for one model in
     /// one open document — so the inspector can surface cross-document data
     /// without apps binding per-doc models by hand.
+    /// - Stability: production
     public func inspectableSharedMembers() -> [(modelName: String, documentId: String, model: DynamicModel)] {
         let models = lock.withLock { sharedModels }
         var out: [(modelName: String, documentId: String, model: DynamicModel)] = []
@@ -1456,13 +1726,18 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Resolve the per-doc writer for a model. The member only exists while
     /// the document is open (connected to the shared store), so a closed
     /// doc throws — opening is always an explicit step (matches js-bao).
-    func requireMember(_ schema: PrimitiveSchema, in docId: String) throws -> DynamicModel {
+    /// `source` is the verb a not-resident db3's refusal names.
+    func requireMember(_ schema: PrimitiveSchema, in docId: String, source: String = "save") throws -> DynamicModel {
         guard let member = sharedModel(for: schema).member(docId: docId) else {
             throw JsBaoError(
                 code: .notFound,
                 message: "Document `\(docId)` is not open. Open it " +
                          "(client.openDocument) before writing `\(schema.name)` records."
             )
+        }
+        // A bound db3 is a destination once its rows are here.
+        if let local = member.local as? RecordLogModelDelegate, !local.binding.isResident {
+            throw db3NotResidentError([docId], source: source)
         }
         return member
     }
@@ -1473,43 +1748,13 @@ public final class JsBaoClient: @unchecked Sendable {
     /// generated `Model.query()` facade lazily registers on first use — but
     /// recommended at startup so a document opened before any query is
     /// already mirrored.
+    /// - Stability: production
     public func registerModels(_ schemas: [PrimitiveSchema]) {
         for schema in schemas { _ = sharedModel(for: schema) }
     }
 
-    /// Point every registered model's member for `documentId` at the binding
-    /// a late bind just produced (#3436).
-    ///
-    /// The mirror image of `bindLargeDocumentsTo`, and just as necessary: a
-    /// document whose format nothing local knew is bound only when the room's
-    /// `epoch.info` says so, which is AFTER `connectToSharedModels` ran. Every
-    /// member is reading nested Y.Maps at that point — the layout a large
-    /// document does not have — so without this a first open of one answers
-    /// nothing at all, however much the store holds.
-    func bindLargeDocumentToSharedModels(
-        _ documentId: String, binding: Format2DocumentBinding
-    ) {
-        let models = lock.withLock { Array(sharedModels.values) }
-        for model in models {
-            guard let member = model.member(docId: documentId) else { continue }
-            member.bindFormat2(binding)
-        }
-    }
-
-    /// Point a model registered AFTER a large document was opened at that
-    /// document's record store (#3436). `sharedModel(for:)` connects the open
-    /// documents; this is the half that knows which of them are large.
-    private func bindLargeDocumentsTo(_ model: MultiDocModel) {
-        guard let coordinator = format2State.coordinator else { return }
-        for documentId in coordinator.boundDocumentIds() {
-            guard let binding = coordinator.binding(documentId),
-                  let member = model.member(docId: documentId)
-            else { continue }
-            member.bindFormat2(binding)
-        }
-    }
-
     /// `PrimitiveModel.Type` overload: `client.registerModels([TodoRecord.self, …])`.
+    /// - Stability: production
     public func registerModels(_ types: [any PrimitiveModel.Type]) {
         registerModels(types.map { $0.primitiveSchema })
     }
@@ -1517,17 +1762,25 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Connect a freshly-opened document to every registered shared store.
     /// Called from the open/create paths; safe to call repeatedly (a
     /// re-connect re-seeds the doc's rows).
-    private func connectToSharedModels(documentId: String, doc: YDocument) {
+    func connectToSharedModels(documentId: String, doc: YDocument) {
         let models = lock.withLock { Array(sharedModels.values) }
-        // #3436 — a large document's records are not in the Y.Doc at all, so
+        // A record-log document's records are not in the Y.Doc at all, so
         // each member is pointed at the document's record store instead of at
         // nested maps. `nil` is an ordinary document and nothing below changes
         // for it.
-        let binding = format2State.coordinator?.binding(documentId)
+        let recordLog = recordLogState.binding(documentId)
         for model in models {
             let member = model.connect(docId: documentId, doc: doc)
-            if let binding { member.bindFormat2(binding) }
+            if let recordLog {
+                do {
+                    try member.bindRecordLog(recordLog)
+                } catch {
+                    logger.warn("[record-log] could not bind", model.schema.name, "to", documentId, ":", error.localizedDescription)
+                }
+            }
         }
+        // The models read the db3's store from here: it answers queries.
+        recordLog?.attached = true
     }
 
     /// Drop a closing document's rows from every shared store so later
@@ -1535,6 +1788,7 @@ public final class JsBaoClient: @unchecked Sendable {
     private func disconnectFromSharedModels(documentId: String) {
         let models = lock.withLock { Array(sharedModels.values) }
         for model in models { model.disconnect(docId: documentId) }
+        recordLogState.binding(documentId)?.attached = false
     }
 
     // MARK: - Default client (backs the codegen'd `Model.query()` facade)
@@ -1550,6 +1804,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `.subscribe(_:)`) reads. Call once after constructing your client —
     /// in a `PrimitiveApp` host this is wired for you. Replacing it (e.g.
     /// across a sign-out/sign-in) is allowed.
+    /// - Stability: production
     public static func configureDefault(_ client: JsBaoClient) {
         defaultClientLock.withLock {
             _defaultClient = client
@@ -1563,6 +1818,7 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Clear the default client. Mainly for test teardown.
+    /// - Stability: production
     public static func clearDefault() {
         defaultClientLock.withLock {
             _defaultClient = nil
@@ -1573,6 +1829,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// by the codegen'd facade — a missing default is a setup bug, so we
     /// fail loudly rather than silently returning no rows (which reads as
     /// "no data" and hides the cause).
+    /// - Stability: production
     public static func requireDefault(
         file: StaticString = #fileID, line: UInt = #line
     ) -> JsBaoClient {
@@ -1593,18 +1850,34 @@ public final class JsBaoClient: @unchecked Sendable {
     /// List metadata for all docs the local store has persisted.
     /// Returns one entry per documentId. Matches js-bao's
     /// `client.listLocalDocuments()`.
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.stored(). It keeps answering until a later removal project. (api-surface-stability)")
     public func listLocalDocuments() -> [String: LocalMetadataEntry] {
         documentManager.getMetadataIndex()
     }
 
     /// Evict a single doc's local data from this device. Background;
-    /// the call returns once the eviction task is scheduled.
+    /// the call returns once the eviction task is scheduled. A db3 that lives
+    /// only on this device is kept (its only copy is here): remove it with
+    /// `client.db3.delete`.
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.evict(_:options:). It keeps answering until a later removal project. (api-surface-stability)")
     public func evictLocalDocument(_ documentId: String) async {
-        // #3436 — the large-document purge is not here but inside
+        if await isLocalOnlyDb3(documentId) || isOtherUsersLocalOnlyDb3Row(documentId) {
+            logger.warn("[evict]", documentId, "— kept: it lives only on this device; remove it with client.db3.delete")
+            return
+        }
+        await forgetLocalDocument(documentId)
+    }
+
+    /// `evictLocalDocument` with no local-only guard: the lifecycle's own
+    /// removal of a db3 whose store it has already purged.
+    func forgetLocalDocument(_ documentId: String) async {
+        // A record-log document's purge is not here but inside
         // `evictLocalData`, which is the one path every eviction passes
         // through: an evicting `closeDocument`, a retention sweep and a
         // document the server reports gone all reach it without coming through
-        // this method. See `DocumentManager.purgeFormat2Data`.
+        // this method. See `DocumentManager.purgeLocalStoreData`.
         await documentManager.evictLocalData(documentId: documentId)
         // #3764 — the eviction took the row the refused belief was read from,
         // which is the recovery the docs prescribe for a client whose row is
@@ -1618,13 +1891,31 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `lastOpenedAt` and `localBytes` fields that enforcement reads.
     private var retentionPolicyStorage: RetentionPolicy = .init()
 
+    /// Every retention run the `retentionPolicy` setter started, the last
+    /// one waiting for the ones before it: settles once all have.
+    var retentionEnforcement: Task<Void, Never>? { lock.withLock { retentionEnforcementStorage } }
+    private var retentionEnforcementStorage: Task<Void, Never>?
+
     /// Apply a retention policy that bounds the local document store.
     ///
-    /// - `ttlMs`: docs whose `lastOpenedAt` is older than this are
-    ///   evicted on the next enforcement pass.
-    /// - `maxDocs`: only the most-recently-opened N docs are kept.
+    /// - `ttl`: docs whose `lastOpenedAt` is older than this are
+    ///   evicted on the next enforcement pass; a db3 copy stored here
+    ///   whose last use is older. A positive number of seconds, a fraction
+    ///   included; `nil` is no TTL. A policy with a `ttl` of `0`, a negative
+    ///   or a non-finite number is refused the same way as a refused
+    ///   `maxDocs` below.
+    /// - `maxDocs`: only the most-recently-opened N docs are kept, N a
+    ///   positive integer; `nil` is no cap. A policy with `maxDocs` of `0`
+    ///   or a negative is refused: the policy stays as it was, no
+    ///   enforcement runs, and one error line is logged
+    ///   (`client.db3.setRetentionPolicy(_:)` throws instead). For
+    ///   db3s, the most copies stored on this device (`db3.stored()`), the
+    ///   least recently used evicted first: a copy's last use is the later
+    ///   of its last open and the end of its last subscription. A
+    ///   subscribed copy, one with unsent writes and a pending create are
+    ///   never evicted and still count.
     /// - `maxBytes`: oldest docs are evicted until total `localBytes`
-    ///   fits the budget.
+    ///   fits the budget. Never removes a db3 copy.
     /// - `default`/`preserveOnSignOut`: stored for parity with js-bao's
     ///   shape; not yet enforced (matches JS — those fields are set
     ///   but not consumed by `enforceRetentionPolicy` either).
@@ -1634,15 +1925,34 @@ public final class JsBaoClient: @unchecked Sendable {
     public var retentionPolicy: RetentionPolicy {
         get { lock.withLock { retentionPolicyStorage } }
         set {
+            // A setter cannot throw: a refused cap or TTL leaves everything as it was.
+            if let refusal = newValue.refusal(call: "client.retentionPolicy") {
+                logger.error(refusal.message)
+                return
+            }
+            // Each call's format-1 pass applies its own policy, as before;
+            // its db3 sweep follows it, after every earlier call's (#5085).
             lock.withLock {
                 retentionPolicyStorage = newValue
-            }
-            Task { [newValue, weak self] in
-                await self?.documentManager.enforceRetentionPolicy(
-                    ttlMs: newValue.ttl.map(\.wholeMilliseconds),
-                    maxDocs: newValue.maxDocs,
-                    maxBytes: newValue.maxBytes
-                )
+                let previous = retentionEnforcementStorage
+                retentionEnforcementStorage = Task { [newValue, weak self] in
+                    guard let self else { return }
+                    // The db3 rows its `ttl` pass would hand the lifecycle go
+                    // first, so its `maxDocs` count is the one it took before.
+                    if let ttlMs = newValue.ttl.map(\.wholeMilliseconds) {
+                        await self._db3Lifecycle.retentionExpire(self.db3RowsPastTtl(ttlMs))
+                    }
+                    await self.documentManager.enforceRetentionPolicy(
+                        ttlMs: newValue.ttl.map(\.wholeMilliseconds),
+                        maxDocs: newValue.maxDocs,
+                        maxBytes: newValue.maxBytes
+                    )
+                    await previous?.value
+                    await self._db3Lifecycle.enforceRetention(
+                        ttlMs: newValue.ttl.map { Int64($0.wholeMilliseconds) },
+                        maxDocs: newValue.maxDocs
+                    )
+                }
             }
         }
     }
@@ -1657,6 +1967,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// gone, not just marked. If you only need the dedup signal in
     /// cross-platform code, call this method conditionally on the
     /// platform.
+    /// - Stability: production
+    @available(*, deprecated, message: "Document metadata sync has no db3 counterpart: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func markMetadataDeleted(_ documentId: String) async {
         await documentManager.evictLocalData(documentId: documentId)
     }
@@ -1672,6 +1984,8 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Wait until `isSynced(documentId)` reports true (initial sync
     /// completed for the doc). Throws `unavailable` on timeout.
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.subscribe(_:options:) and its ready(). It keeps answering until a later removal project. (api-surface-stability)")
     public func waitForInitialSync(
         documentId: String,
         timeout: TimeInterval = 10,
@@ -1688,6 +2002,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Because it depends on a real server round trip, it correctly does
     /// NOT confirm while the socket is down or a local edit is still in the
     /// outbound debounce — `checkStateVector` reports `(false, false)` then.
+    /// - Stability: production
+    @available(*, deprecated, message: "The stateVectorCheck frame is deprecated with the documents family: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func waitForInSync(
         documentId: String,
         timeout: TimeInterval = 10,
@@ -1708,6 +2024,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// trip, it correctly does NOT confirm a write that's still in the 50ms
     /// outbound debounce or unsendable because the socket is down —
     /// `checkStateVector` reports `(false, false)` then.
+    /// - Stability: production
+    @available(*, deprecated, message: "The stateVectorCheck frame is deprecated with the documents family: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func waitForWriteConfirmation(
         documentId: String,
         timeout: TimeInterval = 10,
@@ -1728,7 +2046,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// the server never answers a `stateVectorCheck`, an unbounded inner call
     /// would block for the full 5s before the outer deadline was re-checked,
     /// so a short-timeout waiter (e.g. `waitForInSync(timeout: 0.3)`) could
-    /// block for ~5s instead of the requested 300ms (issue #1979).
+    /// block for ~5s instead of the requested 300ms.
     private func awaitStateVector(
         documentId: String,
         timeout: TimeInterval,
@@ -1742,7 +2060,7 @@ public final class JsBaoClient: @unchecked Sendable {
             if remaining <= 0 { break }
             // Bound the round trip by the time the caller still has, so a
             // silent server can't stretch the wait past `timeout`.
-            if satisfied(await checkStateVector(documentId: documentId, timeout: remaining)) {
+            if satisfied(await stateVectorCheck(documentId: documentId, timeout: remaining)) {
                 return
             }
             // Sleep the poll interval, but never past the deadline.
@@ -1781,7 +2099,18 @@ public final class JsBaoClient: @unchecked Sendable {
     /// whether the server holds all of this client's writes
     /// (`includesWrites`) and whether both sides are identical (`inSync`).
     /// Mirrors js-bao's `checkStateVector(documentId, timeoutMs)`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The stateVectorCheck frame is deprecated with the documents family: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func checkStateVector(
+        documentId: String,
+        timeout: TimeInterval = 5
+    ) async -> (includesWrites: Bool, inSync: Bool) {
+        await stateVectorCheck(documentId: documentId, timeout: timeout)
+    }
+
+    /// `checkStateVector`'s round trip, for the client's own callers: the
+    /// public member is deprecated, and the waiters built on it are not all.
+    func stateVectorCheck(
         documentId: String,
         timeout: TimeInterval = 5
     ) async -> (includesWrites: Bool, inSync: Bool) {
@@ -1852,11 +2181,10 @@ public final class JsBaoClient: @unchecked Sendable {
     // MARK: - Oversize outbound payloads (#3559)
     //
     // A payload too large for one inline frame is uploaded to R2 and named by
-    // `uploadId`, exactly as the JS client does (`transmitLocalUpdate` /
-    // `sendFormat2SyncStep2`). Two steps, in this order: ask the room for an
-    // upload URL over the socket, then PUT the bytes at it. The room mints the
-    // key, so the URL cannot be composed here; and a large document's key is
-    // in the signature-only subtree, which only the room can address.
+    // `uploadId`, exactly as the JS client does (`transmitLocalUpdate`). Two
+    // steps, in this order: ask the room for an upload URL over the socket,
+    // then PUT the bytes at it. The room mints the key, so the URL cannot be
+    // composed here.
     //
     // The waiter pattern is `checkStateVector`'s, keyed on the request id the
     // room echoes rather than on a document: several documents can have an
@@ -2015,6 +2343,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `waitForAuthReady` in that `waitForAuthReady` returns on
     /// *online* readiness; `waitForAuthBootstrap` returns on either
     /// online OR offline-with-grant.
+    /// - Stability: production
     public func waitForAuthBootstrap(timeout: TimeInterval = 10) async throws {
         try await pollUntil(
             timeout: timeout, pollInterval: 0.1
@@ -2060,6 +2389,7 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Check if user is authenticated
+    /// - Stability: production
     public func isAuthenticated() -> Bool {
         authController.isAuthenticated()
     }
@@ -2082,6 +2412,7 @@ public final class JsBaoClient: @unchecked Sendable {
     ///
     /// Convenience overload mirroring the original `wipeLocal`-only signature.
     /// Forwards to `logout(options:)`.
+    /// - Stability: production
     public func logout(wipeLocal: Bool = false) async throws {
         try await logout(options: LogoutOptions(wipeLocal: wipeLocal))
     }
@@ -2101,6 +2432,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// (`redirectTo` is web-only `window.location` navigation and has no
     /// native analog — apps drive their own navigation after logout, so it is
     /// intentionally not modeled on `LogoutOptions`.)
+    /// - Stability: production
     public func logout(options: LogoutOptions) async throws {
         // The local teardown (close sweep, user-scoped reset, and the
         // `wipeLocal` purge) lives in `runLogoutCleanup`, which the auth
@@ -2110,7 +2442,7 @@ public final class JsBaoClient: @unchecked Sendable {
         await disconnect()
     }
 
-    /// Every document the logout has to close (#2874): the ones the document
+    /// Every document the logout has to close: the ones the document
     /// manager still holds (open, or open-then-evicted with their update
     /// observer intact) plus every document still connected to a shared
     /// cross-document store.
@@ -2128,9 +2460,22 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Everything the client tears down for a logout, awaited by
-    /// `AuthController.logout` through `onLogoutCleanup` (#2874). Mirrors the
+    /// `AuthController.logout` through `onLogoutCleanup`. Mirrors the
     /// JS client's `handleLogoutCleanup`.
     private func runLogoutCleanup(options: LogoutOptions) async {
+        // The signed-out user's db3s are released from here: nothing is sent
+        // for them, and a db3 open or bind waits until the cleanup settled.
+        let db3Release = beginDb3IdentityRelease()
+        defer { db3IdentityRelease.end(db3Release) }
+        // A `me.ownedDocuments` refresh still in flight answers with the
+        // signed-out user's documents. Stop it before the cleanup below, or
+        // its rows land in the local cache after the wipe and the next user's
+        // local-first list returns them.
+        await _me.cancelBackgroundRefresh()
+        // A `syncMetadata` in flight has nothing to cancel it, so it is fenced
+        // instead: whatever it fetched for the signed-out user is dropped.
+        endMetadataSession()
+
         // Close every document the app may still be holding. `closeDocument`
         // is the client-level close, so each document also leaves every shared
         // cross-document store (`disconnectFromSharedModels`), loses its
@@ -2160,7 +2505,8 @@ public final class JsBaoClient: @unchecked Sendable {
             for documentId in documentIds {
                 _ = await closeDocument(
                     documentId,
-                    options: CloseDocumentOptions(evictLocal: false)
+                    options: CloseDocumentOptions(evictLocal: false),
+                    door: nil
                 )
             }
         }
@@ -2175,9 +2521,20 @@ public final class JsBaoClient: @unchecked Sendable {
             }
         }
 
+        // Every db3 subscription ends (`DB3_DISPOSED`) and every db3 is closed
+        // on the socket and unbound, wipe or not: the sweep's close keeps a
+        // db3's store bound, so this is what takes the signed-out user's db3s
+        // out of reads and writes. A start-up binding still running for them
+        // is discarded when it finishes.
+        forgetDb3Identity()
+        await _db3Lifecycle.releaseAll(unbind: true)
+
         // On every logout, wipe or not: a signed-out user's failed create may
         // not retry under the next session's transport.
         documentManager.resetUserScopedStateForLogout()
+        // The signed-out user's session uploads go inert, kept in memory for
+        // their user's next sign-in in this process; waits on them end.
+        await blobManager.identityChanged()
 
         // The wipe runs AFTER the sweep, and the order is required — this is
         // the one deliberate departure from JS, which wipes first.
@@ -2190,10 +2547,13 @@ public final class JsBaoClient: @unchecked Sendable {
         if options.wipeLocal {
             await documentManager.evictAllLocalData()
             await kvCache.clearAll()
-            // #3436 — and every large document's own tables, including the
-            // ones this session never opened. Leaving a previous account's
-            // records on the device is what criterion 7 forbids.
-            await purgeAllLargeDocuments()
+            // And every document's own tables, including the ones this session
+            // never opened — the record-log stores, and whatever large
+            // documents a pre-removal build left on the device. Leaving a
+            // previous account's records behind is what the wipe exists to
+            // prevent.
+            await purgeLegacyLargeDocumentTables()
+            await purgeAllRecordLogDocuments()
         }
     }
 
@@ -2204,7 +2564,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// This is the raw building block for apps that drive their own auth UI.
     /// For the one-call native experience (system browser sheet + callback +
     /// code exchange), use `signInWithGoogle(presentationAnchor:)` instead
-    /// (see GoogleSignIn.swift, issue #928).
+    /// (see GoogleSignIn.swift).
     ///
     /// - Parameters:
     ///   - redirectUri: The OAuth redirect URI (must be allow-listed for the app).
@@ -2212,12 +2572,13 @@ public final class JsBaoClient: @unchecked Sendable {
     ///     after the flow completes.
     ///   - waitlist: Optional waitlist enrollment carried through the state bag.
     ///     Mirrors JS `startOAuthFlow(continueUrl, { waitlist })` — the callback
-    ///     enrolls the user in the app's waitlist (#466).
+    ///     enrolls the user in the app's waitlist.
     ///   - inviteToken: Optional invite token threaded through the state bag.
     ///     Mirrors JS `startOAuthFlow(continueUrl, { inviteToken })` — the
     ///     callback accepts the named invitation server-side and resolves
     ///     deferred grants to the new user even when the OAuth email differs
-    ///     from the invited email (#466).
+    ///     from the invited email.
+    /// - Stability: production
     public func startOAuthFlow(
         redirectUri: String,
         continueUrl: String? = nil,
@@ -2237,17 +2598,18 @@ public final class JsBaoClient: @unchecked Sendable {
     ///
     /// Mirrors JS `handleOAuthCallback` sequencing (src/client/JsBaoClient.ts):
     /// after the exchange, the WebSocket is connected if it isn't already open.
-    /// That decision is no longer made here — since #2657 it belongs to
+    /// That decision is no longer made here — it belongs to
     /// `handleTokenApplied`, which applies the same sequencing to EVERY sign-in
     /// flow rather than to the two OAuth callbacks alone. This still awaits it,
     /// so the call returns with the connection attempt finished, as before.
-    /// An open socket is re-authenticated instead of rebuilt (#2660): the same
+    /// An open socket is re-authenticated instead of rebuilt: the same
     /// user's new token goes out in band, and only a switch to a different user
     /// rebuilds the connection, so signing in again as yourself does not
     /// re-sync every open document.
     ///
     /// Returns the typed server response (`{token, isNewUser}`) so callers
     /// can read `isNewUser`.
+    /// - Stability: production
     @discardableResult
     public func handleOAuthCallback(code: String, state: String) async throws -> OAuthCallbackResult {
         let result = try await authController.handleOAuthCallback(code: code, state: state)
@@ -2292,17 +2654,13 @@ public final class JsBaoClient: @unchecked Sendable {
 
     // MARK: - Magic Link
 
-    /// Request a magic link email for the given address.
-    public func magicLinkRequest(email: String, redirectUri: String) async throws -> Bool {
-        try await authController.magicLinkRequest(email: email, redirectUri: redirectUri)
-    }
-
     /// Verify a magic link token received from the email callback.
     ///
-    /// `inviteToken` mirrors JS `magicLinkVerify(token, { inviteToken })`
-    /// (#466): when present, the named invitation is accepted server-side
+    /// `inviteToken` mirrors JS `magicLinkVerify(token, { inviteToken })`:
+    /// when present, the named invitation is accepted server-side
     /// during verify and deferred grants resolve to the signing-in user, even
     /// when the magic-link email differs from the invited email.
+    /// - Stability: production
     public func magicLinkVerify(
         token: String,
         inviteToken: String? = nil
@@ -2312,18 +2670,14 @@ public final class JsBaoClient: @unchecked Sendable {
 
     // MARK: - OTP
 
-    /// Request a one-time password sent to the given email.
-    public func otpRequest(email: String) async throws -> Bool {
-        try await authController.otpRequest(email: email)
-    }
-
     /// Verify a one-time password code.
     ///
-    /// `inviteToken` mirrors JS `otpVerify(email, code, { inviteToken })`
-    /// (#466 / #1110): when present, the named invitation is accepted
+    /// `inviteToken` mirrors JS `otpVerify(email, code, { inviteToken })`:
+    /// when present, the named invitation is accepted
     /// server-side during verify and deferred grants resolve to the
     /// signing-in user, even when the signup email differs from the
     /// invited email.
+    /// - Stability: production
     public func otpVerify(
         email: String,
         code: String,
@@ -2335,6 +2689,7 @@ public final class JsBaoClient: @unchecked Sendable {
     // MARK: - Token Management
 
     /// Update the auth token externally (e.g. after a custom auth flow).
+    /// - Stability: production
     public func updateToken(_ token: String?, cause: String? = nil) {
         authController.updateToken(token, cause: cause)
     }
@@ -2359,6 +2714,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// reconnect/sync/request gating goes through the internal
     /// `networkingAllowed()` (mode-based), so a reporting change here never
     /// suppresses the reconnect loop.
+    /// - Stability: production
     public func isOnline() -> Bool {
         networkStatus.isOnline
     }
@@ -2370,6 +2726,20 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `mode != .offline` and no gating behavior changes.
     internal func networkingAllowed() -> Bool {
         lock.withLock { (networkModeStorage == .online) || (networkModeStorage == .auto && reachable) }
+    }
+
+    /// The error an HTTP call throws instead of going out when networking is
+    /// not allowed — the app pinned `.offline`, or the network is unreachable
+    /// in `.auto`. `nil` while networking is allowed. Mirrors the JS client's
+    /// `offlineRequestError`, message and `details` included.
+    internal func offlineRequestError(method: HTTPMethod, path: String) -> JsBaoError? {
+        guard !networkingAllowed() else { return nil }
+        let (mode, reachable) = lock.withLock { (networkModeStorage, self.reachable) }
+        return JsBaoError(
+            code: .offline,
+            message: "Client is offline (networkMode=\(mode.rawValue)\(reachable ? "" : ", no network reachable"))",
+            details: ["method": .string(method.rawValue), "path": .string(path)]
+        )
     }
 
     /// The single reporting formula shared by `networkStatus.isOnline`
@@ -2456,6 +2826,7 @@ public final class JsBaoClient: @unchecked Sendable {
     ///     the view appears, a status stream without replay commonly misses the
     ///     connection that already happened. Asking for replay on any other
     ///     event is harmless — there is simply nothing retained to deliver.
+    /// - Stability: production
     public func stream<E: JsBaoEventPayload>(
         for type: E.Type,
         buffering: AsyncStream<E>.Continuation.BufferingPolicy = .unbounded,
@@ -2506,6 +2877,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// inside it includes that hop. When the timestamp has to be the emit's own,
     /// use ``observeOnMainActor(_:withDelivery:)`` and read
     /// ``EventDelivery/emittedAt``.
+    /// - Stability: production
     public func observeOnMainActor<E: JsBaoEventPayload>(
         _ type: E.Type,
         handler: @escaping @Sendable @MainActor (E) -> Void
@@ -2542,6 +2914,7 @@ public final class JsBaoClient: @unchecked Sendable {
     ///
     /// As with the no-metadata form, the result is deliberately not
     /// `@discardableResult` — dropping it cancels the subscription.
+    /// - Stability: production
     public func observeOnMainActor<E: JsBaoEventPayload>(
         _ type: E.Type,
         withDelivery handler: @escaping @Sendable @MainActor (E, EventDelivery) -> Void
@@ -2586,6 +2959,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// - Throws: `JsBaoError` with code `.unavailable` if `timeout` elapses
     ///   first. An event that already fired is not redelivered, so start the
     ///   wait before triggering the work you are waiting on.
+    /// - Stability: production
     public func nextEvent<E: JsBaoEventPayload>(
         _ type: E.Type,
         timeout: TimeInterval = 10,
@@ -2634,12 +3008,14 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `setNetworkMode("online")`. Use this when the caller wants to
     /// observe the full handoff (refresh attempt → connect, or
     /// `.authOnlineRequired` + offline revert) before continuing.
+    /// - Stability: production
     public func goOnline() async {
         applyNetworkMode(.online, options: SetNetworkModeOptions())
         await runOnlineAuthHandoff(cause: OnlineHandoffCause.explicitOnline)
     }
 
     /// Switch to offline mode
+    /// - Stability: production
     public func goOffline() async {
         setNetworkMode(.offline)
         await disconnect()
@@ -2651,7 +3027,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// js-bao's `setNetworkMode(mode, opts)` shape.
     ///
     /// Setting `.online` kicks the same auth handoff JS's
-    /// `setNetworkMode("online")` runs (#1059 / #1113): the mode flips
+    /// `setNetworkMode("online")` runs: the mode flips
     /// to `.online` first (emitting `networkMode`, same as JS), then —
     /// asynchronously, since this method is synchronous — if there is
     /// no valid token a refresh is attempted before connecting. When
@@ -2660,6 +3036,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `.offline` (emitting a second `networkMode`), never connecting
     /// without a token. `goOnline()` runs the identical handoff,
     /// awaited.
+    /// - Stability: production
     public func setNetworkMode(
         _ mode: NetworkMode,
         options: SetNetworkModeOptions = SetNetworkModeOptions()
@@ -2689,6 +3066,20 @@ public final class JsBaoClient: @unchecked Sendable {
             return mode == .auto && !wasAuto
         }
         authController.setNetworkMode(mode)
+        // The socket may have stayed open while networking was not allowed:
+        // record-log entries queued meanwhile leave once it is allowed again.
+        if mode != .offline {
+            recordLogKick()
+            // No socket-open event follows on a socket that stayed open: an
+            // index list owed by a read that failed meanwhile is read again (#5101).
+            db3IndexRefresher?.socketOpened()
+            // A model upload kept while offline goes out, and wants heard meanwhile are met (#5230).
+            runDb3VectorModels()
+        }
+        _db3Lifecycle.connectionChanged()
+        // Session uploads wait for networking: arm the queue for them again.
+        let blobManager = self.blobManager
+        Task { await blobManager.networkingChanged() }
         eventEmitter.emit(NetworkModeEvent(
             mode: mode,
             isOnline: computeReportedOnline(),
@@ -2742,7 +3133,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// The deferred pause action shared by `applyReachability` and
     /// `reconcileAutoSocket` — the body of the unstructured `Task` both queue.
     ///
-    /// Revalidates before acting (#2078). Both callers decide under `lock` and
+    /// Revalidates before acting. Both callers decide under `lock` and
     /// act outside it, so by the time this task is scheduled the client may
     /// have transitioned again: the app pinned `.online`, or reachability came
     /// back and the restore handoff already reconnected. Pausing on that stale
@@ -2833,6 +3224,8 @@ public final class JsBaoClient: @unchecked Sendable {
             return (act, networkModeStorage)
         }
         guard let decision else { return }
+        let blobManager = self.blobManager
+        Task { await blobManager.networkingChanged() }
 
         // Reporting/observability event — mode UNCHANGED, isOnline recomputed
         // (reads the WS manager outside the client lock).
@@ -2910,7 +3303,7 @@ public final class JsBaoClient: @unchecked Sendable {
         static let reachabilityRestore = "auto-network:online"
     }
 
-    /// The `setNetworkMode("online")` auth handoff (#1059 / #1113),
+    /// The `setNetworkMode("online")` auth handoff,
     /// mirroring JS: with no token, attempt a refresh before connecting;
     /// on failure emit `.authOnlineRequired`, revert to offline
     /// (`networkMode` fires again with reason "onlineAuthRequired"),
@@ -2998,14 +3391,14 @@ public final class JsBaoClient: @unchecked Sendable {
         // serialized after the loss disconnect, and always wins. (JS runs the
         // handoff inline, so it can't hit this window.)
         guard networkingAllowed() else { return }
-        await setShouldConnect(true)
+        await wsManager.setDesiredConnection(shouldConnect: true)
 
         // Re-drive any documents created while offline. `createDocument` only
         // schedules the background server commit when already online, and
         // nothing else re-triggers it on the online transition — so offline
         // creates would otherwise sit in `pendingCreate` indefinitely. Mirrors
         // js-bao's `autoCommitPendingCreates("online", …)`.
-        for documentId in listPendingCreates() {
+        for documentId in documentManager.listPendingCreates() {
             documentManager.scheduleCommitRetry(documentId: documentId)
         }
     }
@@ -3014,12 +3407,14 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Enable offline access by requesting a grant from the server and storing it securely.
     /// Requires online connectivity.
+    /// - Stability: production
     public func enableOfflineAccess(options: EnableOfflineAccessOptions = EnableOfflineAccessOptions()) async throws -> EnableOfflineAccessResult {
         try await authController.enableOfflineAccess(options: options)
     }
 
     /// Unlock offline access by reading the stored grant.
     /// If biometric-protected, this triggers Face ID / Touch ID.
+    /// - Stability: production
     public func unlockOffline() async throws -> Bool {
         let result = try await authController.unlockOffline()
         if result {
@@ -3029,6 +3424,7 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Check if an offline access grant is available.
+    /// - Stability: production
     public func isOfflineGrantAvailable() -> Bool {
         authController.isOfflineGrantAvailable()
     }
@@ -3039,11 +3435,13 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Renew the offline access grant while online.
+    /// - Stability: production
     public func renewOfflineGrantOnline(options: EnableOfflineAccessOptions = EnableOfflineAccessOptions()) async throws -> Bool {
         try await authController.renewOfflineGrantOnline(options: options)
     }
 
     /// Revoke the offline access grant.
+    /// - Stability: production
     public func revokeOfflineGrant(options: RevokeOfflineGrantOptions = RevokeOfflineGrantOptions()) async throws {
         try await authController.revokeOfflineGrant(options: options)
         if options.wipeLocal {
@@ -3058,27 +3456,58 @@ public final class JsBaoClient: @unchecked Sendable {
 
     // MARK: - Document Operations
 
-    /// Open a document
+    /// Open a document. On a db3 the open works as before and logs once per
+    /// client that `client.db3.subscribe` is the db3 form.
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.subscribe(_:options:). It keeps answering until a later removal project. (api-surface-stability)")
     public func openDocument(
         _ documentId: String,
         options: OpenDocumentOptions = OpenDocumentOptions()
     ) async throws -> YDocument {
+        try await openDocument(documentId, options: options, door: .openDocument)
+    }
+
+    /// The open, naming the document door it came through: `nil` for the db3
+    /// lifecycle's own open, which warns nothing and does not hold the db3
+    /// open for a door.
+    func openDocument(
+        _ documentId: String,
+        options: OpenDocumentOptions,
+        door: Db3Door?
+    ) async throws -> YDocument {
+        // The `[open]` lines are the trace an app follows a waiting open by
+        // (#4191): start, the network wait, the handshake's download and apply,
+        // and the event that settles it. All `debug`, so they cost nothing
+        // until `setLogLevel(.debug)` turns them on.
+        let openStartedAt = Date()
+        logger.debug(
+            "[open] start", documentId, "waitForLoad:", options.waitForLoad,
+            "availabilityWait:", options.availabilityWait, "s"
+        )
+
         // #3764 — the platform refused this document on this connection because
         // of the format this client opened it as, and nothing will handshake for
         // it until the mark is cleared by a close or an eviction. Answering the
         // refusal here is the honest answer AND the documented one: an open that
         // proceeded would wait out its availability budget and report a network
         // timeout instead of the disagreement. JS rejects at the same point.
-        if let refusal = formatRefusal(documentId) { throw refusal }
+        if let refusal = formatRefusal(documentId) {
+            logger.debug("[open] threw", documentId, refusal.code.rawValue, "— refused before the open")
+            throw refusal
+        }
 
-        // #3436 — what kind of document is this, and can this client hold it?
+        // What kind of document is this, and can this client hold it?
         // Deliberately the FIRST thing the open does: the socket's receive
-        // limit has to be raised while there is still time (the frame that
-        // would tell this client the format is the frame the limit protects),
-        // and an app that configured storage which cannot hold a large
-        // document is told so before a single frame goes out rather than
-        // being connected to a document it cannot store.
+        // limit has to be raised while there is still time, and a large
+        // document (format 2), which is no longer served, is refused before a
+        // single frame goes out and before anything is opened.
         try await prepareDocumentFormat(documentId)
+        // A record-log (format-3) document is resolved the same way, and must
+        // be, before any frame: the room answers a Yjs frame for one with
+        // DOCUMENT_FORMAT_MISMATCH. A device that never saw the document asks
+        // the documents API when it may use the network — and is refused if
+        // the answer is 2.
+        try await prepareRecordLogFormat(documentId)
 
         let (doc, origin) = try await documentManager.openDocumentReportingOrigin(
             documentId: documentId,
@@ -3105,7 +3534,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // `networkTimeout` where JS resolves with the empty document (#2667,
         // C8) — would make the create → open → write flow fail offline. JS
         // counts its pending creates the same way (`hasLocalCopy`).
-        let effectiveHasLocal = documentManager.ydocHasData(documentId)
+        var effectiveHasLocal = documentManager.ydocHasData(documentId)
             || documentManager.isPendingCreate(documentId)
             || documentManager.isLocalOnly(documentId)
 
@@ -3115,11 +3544,28 @@ public final class JsBaoClient: @unchecked Sendable {
         // and the local state has to be discarded (#2664, C14).
         noteSuspectedStaleLocalState(documentId)
 
-        // #3436 — a large document's Y.Doc IS the current epoch's overlay, so
-        // the binding is made over the document this open produced, and only
-        // now that there is one. The capability check that could refuse this
-        // ran before the open, so nothing here can fail for storage.
-        try await bindLargeDocumentIfResolved(documentId, doc: doc)
+        // A record-log document is bound before its models connect, so each
+        // member reads the document's store. Its Y.Doc stays empty, so whether
+        // it holds data locally is the store's answer.
+        // The store's view indexes come from the room's list, read without
+        // holding the open, by an open that syncs the db3 (a subscription's or
+        // a door's); a db3 bound at its create or at start-up reads none. The
+        // list is on its way from the bind, and `ready()` waits for it (#5101).
+        let readsIndexes = options.enableNetworkSync && !options.deferNetworkSync
+            && (documentManager.documentFormat(documentId) ?? recordLogState.resolvedFormat(documentId)) == RecordLogTransport.documentFormat
+        if readsIndexes { db3IndexRefresher.opening(documentId) }
+        do {
+            try await bindRecordLogDocumentIfResolved(documentId)
+        } catch {
+            if readsIndexes { db3IndexRefresher.openFailed(documentId) }
+            throw error
+        }
+        if isRecordLogDocument(documentId) {
+            effectiveHasLocal = effectiveHasLocal || recordLogHasLocalData(documentId)
+            if readsIndexes { db3IndexRefresher.opened(documentId) }
+        } else if readsIndexes {
+            db3IndexRefresher.openFailed(documentId)
+        }
 
         // Mirror the doc into every registered cross-document store so
         // `Model.query()` sees it. Covers `openDocumentByAlias` too (it
@@ -3155,6 +3601,11 @@ public final class JsBaoClient: @unchecked Sendable {
         let needsNetworkWait =
             options.waitForLoad == .network
             || (options.waitForLoad == .localIfAvailableElseNetwork && !effectiveHasLocal)
+        logger.debug(
+            "[open] opened locally", documentId, "origin:", origin,
+            "hasLocal:", effectiveHasLocal, "recordLog:", isRecordLogDocument(documentId),
+            "needsNetworkWait:", needsNetworkWait
+        )
 
         // An open that needs the network answers with a typed, catchable
         // error when the network path cannot be satisfied, instead of
@@ -3229,111 +3680,216 @@ public final class JsBaoClient: @unchecked Sendable {
                 early.fail(error)
             }
             defer { awaitingOpens.withdraw(earlyToken) }
-            await startNetworkSync(documentId: documentId)
-            if needsNetworkWait && !documentManager.isSynced(documentId) {
-                let syncDocId = documentId
-                // Nothing else will bring the socket up for this wait:
-                // `startNetworkSync` only sends on a live transport, so an
-                // open that needs the network while the socket is down would
-                // otherwise burn the whole budget without a single frame
-                // going out and report `NETWORK_TIMEOUT` against a perfectly
-                // healthy server. JS starts the connection on the same path
-                // (`connect()` before `waitForAvailability`, and
-                // `ctx.connectWebSocket()` from its retry tick).
-                connectForAvailabilityIfNeeded(syncDocId)
-                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                    // One `SubscriptionHolder` owns everything this wait has to
-                    // settle: the `.sync` subscription, the availability-timeout
-                    // task, and the resume-once claim. It cannot be a captured
-                    // `var` — the handler can fire on the WebSocket's thread
-                    // before `subscribe` has returned here, so reading a plain
-                    // local would race the assignment. That race is the second
-                    // `EventSubscription` entry in #1910's ThreadSanitizer
-                    // baseline.
-                    let wait = SubscriptionHolder()
-
-                    // #3436 — a refusal the router handles fails this wait
-                    // directly. `CLIENT_UPGRADE_REQUIRED` is the room's last
-                    // word before it closes the socket, so nothing will ever
-                    // arrive to settle the wait the ordinary way and the
-                    // caller would be told `NETWORK_TIMEOUT` half a minute
-                    // later about a server that answered at once.
-                    // #3764, D9 — attached rather than registered here: the
-                    // registration happened before the send, so a refusal
-                    // answered while it was suspended is delivered the moment
-                    // this wait exists.
-                    early.attach { error in
-                        if wait.claim() { cont.resume(throwing: error) }
-                    }
-                    wait.set(onSettled: { [weak self] in
-                        self?.awaitingOpens.withdraw(earlyToken)
-                    })
-
-                    wait.set(self.eventEmitter.subscribe(SyncEvent.self) { event in
-                        guard event.documentId == syncDocId, event.synced else { return }
-                        // A sync that ended in a stale-state reset has not
-                        // delivered anything yet: the reset is discarding the
-                        // local state and re-syncing from an empty state
-                        // vector. Resuming now would hand the caller the empty
-                        // document the reset exists to repair, so wait for the
-                        // resync's own sync event (still bounded by the
-                        // availability timeout below). JS waits on the same
-                        // condition (#2664, C14).
-                        if self.isStaleResetInProgress(syncDocId),
-                           !self.documentManager.ydocHasData(syncDocId) {
-                            return
-                        }
-                        if wait.claim() { cont.resume() }
-                    })
-
-                    // Retry tick — mirrors js-bao's `waitForAvailability`
-                    // (350ms `setInterval` → re-`sendSyncStep1`). A freshly
-                    // `documents.create`'d doc is `pendingCreate` (committed to
-                    // the server in the background), so the initial `syncStep1`
-                    // above reaches the server before the doc exists there — no
-                    // `syncComplete` comes back. Re-send `syncStep1` every 350ms
-                    // until the background commit lands and the server can
-                    // answer (or the timeout below fires). Without this, a
-                    // `.network` open of a just-created doc always burned the
-                    // full `availabilityWaitMs` (~30s) regardless of how fast
-                    // the commit actually completed.
-                    Task { [weak self] in
-                        while !wait.isSettled {
-                            try? await Task.sleep(nanoseconds: 350 * 1_000_000)
-                            if wait.isSettled { break }
-                            guard let self else { break }
-                            if self.networkingAllowed() {
-                                await self.startNetworkSync(documentId: syncDocId, explicit: false)
-                            }
-                        }
-                    }
-
-                    // Bound the wait by `availabilityWait` (JS parity): once
-                    // the network-availability budget is exhausted the open
-                    // FAILS with `NETWORK_TIMEOUT` rather than handing back
-                    // whatever local state exists. Before #2667 it resumed
-                    // with the document, so a caller could not tell an
-                    // unreachable server from a genuinely empty document —
-                    // the whole point of parity item C8. A value of 0 means
-                    // "don't wait for the network", so it fails at once.
-                    let wait_ = options.availabilityWait
-                    wait.set(timeoutTask: Task {
-                        try? await Task.sleep(nanoseconds: UInt64(max(0, wait_) * 1_000_000_000))
-                        if wait.claim() {
-                            self.logger.warn("[availability] timeout", syncDocId)
-                            cont.resume(throwing: JsBaoError(
-                                code: .networkTimeout,
-                                message: "Network timeout",
-                                details: ["documentId": .string(syncDocId)]
-                            ))
-                        }
-                    })
-                }
+            if needsNetworkWait {
+                try await waitForAvailability(
+                    documentId, options: options, early: early, earlyToken: earlyToken,
+                    openStartedAt: openStartedAt
+                )
+            } else {
+                await startNetworkSync(documentId: documentId, explicit: true)
+                logger.debug(
+                    "[open] resolved", documentId,
+                    "from local state; sync continues in the background"
+                )
             }
+        } else {
+            logger.debug("[open] resolved", documentId, "without the network")
         }
 
         openCompleted = true
+        if let door, isRecordLogDocument(documentId) {
+            warnDb3Door(door, documentId)
+            _db3Lifecycle.openedByDoor(documentId)
+        }
         return doc
+    }
+
+    /// Wait for the server's answer to an open that needs it, bounded by
+    /// `availabilityWait` from the moment the open decides to wait.
+    ///
+    /// Everything the wait settles on is armed BEFORE the handshake goes out:
+    /// the `.sync` subscription, the refusal, and the timeout. The handshake
+    /// itself — the first `syncStep1`, then the 350ms retry tick — runs off
+    /// this wait, so nothing it suspends on (a send that does not return, a
+    /// socket being rebuilt) can hold the caller past its budget, and a
+    /// `syncComplete` that lands while the send is still in flight settles
+    /// the wait instead of being missed. Before #4191 the timeout was armed
+    /// only after the first send returned, so an open whose send never did
+    /// neither resolved nor threw.
+    private func waitForAvailability(
+        _ documentId: String,
+        options: OpenDocumentOptions,
+        early: EarlyRefusal,
+        earlyToken: UUID,
+        openStartedAt: Date
+    ) async throws {
+        let budget = options.availabilityWait
+        logger.debug(
+            "[open] network wait", documentId, "— bounded by", budget, "s from here"
+        )
+        let elapsedMs = { Int(Date().timeIntervalSince(openStartedAt) * 1000) }
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            // One `SubscriptionHolder` owns everything this wait has to
+            // settle: the `.sync` subscription, the availability-timeout
+            // task, and the resume-once claim. It cannot be a captured
+            // `var` — the handler can fire on the WebSocket's thread
+            // before `subscribe` has returned here, so reading a plain
+            // local would race the assignment. That race is the second
+            // `EventSubscription` entry in #1910's ThreadSanitizer
+            // baseline.
+            let wait = SubscriptionHolder()
+
+            // A refusal the router handles fails this wait directly.
+            // `DOCUMENT_FORMAT_UNSUPPORTED` is the platform's last word
+            // for the document, so nothing will ever arrive to settle
+            // the wait the ordinary way and the caller would be told
+            // `NETWORK_TIMEOUT` half a minute later about a server that
+            // answered at once.
+            // #3764, D9 — attached rather than registered here: the
+            // registration happened before the open got this far, so a
+            // refusal answered in between is delivered the moment this
+            // wait exists.
+            early.attach { error in
+                if wait.claim() {
+                    self.logger.debug(
+                        "[open] threw", documentId, error.code.rawValue,
+                        "— refused by the room after", elapsedMs(), "ms"
+                    )
+                    cont.resume(throwing: error)
+                }
+            }
+            wait.set(onSettled: { [weak self] in
+                self?.awaitingOpens.withdraw(earlyToken)
+            })
+
+            wait.set(self.eventEmitter.subscribe(SyncEvent.self) { event in
+                guard event.documentId == documentId, event.synced else { return }
+                // A sync that ended in a stale-state reset has not
+                // delivered anything yet: the reset is discarding the
+                // local state and re-syncing from an empty state
+                // vector. Resuming now would hand the caller the empty
+                // document the reset exists to repair, so wait for the
+                // resync's own sync event (still bounded by the
+                // availability timeout below). JS waits on the same
+                // condition (#2664, C14).
+                if self.isStaleResetInProgress(documentId),
+                   !self.documentManager.ydocHasData(documentId) {
+                    self.logger.debug(
+                        "[open] still waiting", documentId,
+                        "— the sync ended in a stale-state reset"
+                    )
+                    return
+                }
+                if wait.claim() {
+                    self.logger.debug(
+                        "[open] resolved by sync event", documentId,
+                        "after", elapsedMs(), "ms"
+                    )
+                    cont.resume()
+                }
+            })
+
+            // Already synced — a document another open has already brought
+            // in, or an answer that landed before the subscription above
+            // existed — is answered now rather than by a sync event that has
+            // already been emitted. Settled BEFORE the timeout is armed: a
+            // zero budget's timer would otherwise race this claim and fail an
+            // open that already holds the state it is waiting for. The
+            // handshake still goes out, as it did before the wait existed.
+            if self.documentManager.isSynced(documentId), wait.claim() {
+                self.logger.debug(
+                    "[open] resolved", documentId, "— already synced, after",
+                    elapsedMs(), "ms"
+                )
+                cont.resume()
+                Task { [weak self] in
+                    await self?.startNetworkSync(documentId: documentId, explicit: true)
+                }
+                return
+            }
+
+            // Bound the wait by `availabilityWait` (JS parity): once
+            // the network-availability budget is exhausted the open
+            // FAILS with `NETWORK_TIMEOUT` rather than handing back
+            // whatever local state exists. Before #2667 it resumed
+            // with the document, so a caller could not tell an
+            // unreachable server from a genuinely empty document —
+            // the whole point of parity item C8. A value of 0 means
+            // "don't wait for the network", so it fails at once.
+            //
+            // The budget bounds a wait WITHOUT progress (#4609): a format-3
+            // open's first catch-up reports each `building` answer, page and
+            // chunk, and each starts the budget again.
+            let deadline = AvailabilityDeadline(budget: budget)
+            self.awaitingOpens.attach(deadline, to: earlyToken)
+            wait.set(timeoutTask: Task {
+                while true {
+                    let remaining = deadline.remaining
+                    if remaining <= 0 { break }
+                    try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+                    if Task.isCancelled { return }
+                }
+                if wait.claim() {
+                    self.logger.warn(
+                        "[availability] timeout", documentId, "after", budget, "s —",
+                        self.handshakeProgress(documentId)
+                    )
+                    cont.resume(throwing: JsBaoError(
+                        code: .networkTimeout,
+                        message: "Network timeout",
+                        details: ["documentId": .string(documentId)]
+                    ))
+                }
+            })
+
+            // The handshake, off this wait. `startNetworkSync` suspends in
+            // the socket's send, and the wait above is already bounded, so
+            // the open no longer waits on that send to arm anything.
+            Task { [weak self] in
+                await self?.startNetworkSync(documentId: documentId, explicit: true)
+            }
+            // Nothing else will bring the socket up for this wait:
+            // `startNetworkSync` only sends on a live transport, so an
+            // open that needs the network while the socket is down would
+            // otherwise burn the whole budget without a single frame
+            // going out and report `NETWORK_TIMEOUT` against a perfectly
+            // healthy server. JS starts the connection on the same path
+            // (`connect()` before `waitForAvailability`, and
+            // `ctx.connectWebSocket()` from its retry tick).
+            self.connectForAvailabilityIfNeeded(documentId)
+
+            // Retry tick — mirrors js-bao's `waitForAvailability`
+            // (350ms `setInterval` → re-`sendSyncStep1`). A freshly
+            // `documents.create`'d doc is `pendingCreate` (committed to
+            // the server in the background), so the initial `syncStep1`
+            // above reaches the server before the doc exists there — no
+            // `syncComplete` comes back. Re-send `syncStep1` every 350ms
+            // until the background commit lands and the server can
+            // answer (or the timeout above fires). Without this, a
+            // `.network` open of a just-created doc always burned the
+            // full `availabilityWaitMs` (~30s) regardless of how fast
+            // the commit actually completed.
+            Task { [weak self] in
+                while !wait.isSettled {
+                    try? await Task.sleep(nanoseconds: 350 * 1_000_000)
+                    if wait.isSettled { break }
+                    guard let self else { break }
+                    if self.networkingAllowed() {
+                        await self.startNetworkSync(documentId: documentId, explicit: false)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Where a waiting open's handshake had got to, for the line that reports
+    /// its timeout: whether a `syncStep1` went out, and whether any server
+    /// state came back for it.
+    private func handshakeProgress(_ documentId: String) -> String {
+        let sent = documentManager.getSyncTimings(documentId)?["syncStep1SentAt"] != nil
+        let received = lock.withLock { syncStep2ReceivedFor.contains(documentId) }
+        let synced = documentManager.isSynced(documentId)
+        return "syncStep1 sent: \(sent), syncStep2 received: \(received), synced: \(synced)"
     }
 
     /// Bring the socket up for an open that is about to wait on it. JS does
@@ -3360,7 +3916,7 @@ public final class JsBaoClient: @unchecked Sendable {
               !wsManager.isConnected,
               !wsManager.isConnecting else { return }
         Task { [weak self] in
-            try? await self?.connect()
+            try? await self?.connect(origin: .automatic)
         }
     }
 
@@ -3368,20 +3924,12 @@ public final class JsBaoClient: @unchecked Sendable {
     /// document manager's. `removeOpenDoc` alone leaves the document wired
     /// into every registered shared model, so `Model.query()` would keep
     /// returning its rows — and hand out a writer backed by a YDocument whose
-    /// update observer has just been cancelled, silently dropping writes
-    /// (#2667). This mirrors the per-document state `closeDocument` clears,
+    /// update observer has just been cancelled, silently dropping writes.
+    /// This mirrors the per-document state `closeDocument` clears,
     /// minus the flush/evict/announce work: nothing was handed to a caller,
     /// so there is nothing to persist and no `close` to report.
     private func abortOpenedDocument(_ documentId: String) {
-        // #3436 — the large-document binding goes with the document, for the
-        // same reason `closeDocument` releases it: a binding holds the Y.Doc
-        // that IS this document's epoch overlay, and this method is dropping
-        // that document. A binding left behind is handed back by the next
-        // `bindLargeDocument` on this client, so a retry after a failed open
-        // would attach every model to the overlay of a document whose update
-        // observer and persistence are already gone — writes published where
-        // nothing sends them, updates arriving somewhere else.
-        format2State.coordinator?.unbind(documentId: documentId)
+        Task { [weak self] in await self?.closeRecordLogDocument(documentId) }
         disconnectFromSharedModels(documentId: documentId)
         clearSyncWatchdog(documentId)
         lock.withLock {
@@ -3491,21 +4039,10 @@ public final class JsBaoClient: @unchecked Sendable {
         let documentId: String
     }
 
-    /// Drop the outbound updates queued for a document whose epoch has moved
-    /// (#3437, behavior 10).
-    ///
-    /// Only ever called for a LARGE document, and only by an epoch move. Every
-    /// queued update is a Yjs DELTA built on the overlay the room has just
-    /// archived, so the room cannot integrate it — it PARKS it, and from then
-    /// on it answers every later update from that connection with another
-    /// resync request instead of an acknowledgement, permanently. Measured
-    /// live: a document whose pre-seal delta reached the room after the seal
-    /// never got another ack, and a probe with nothing owed at the seal was
-    /// acknowledged normally.
-    ///
-    /// Discarding a queued update would lose a write on any other path. Here
-    /// it loses nothing: the carry has just written that write's content onto
-    /// the fresh overlay, and the whole-state frame that follows carries it.
+    /// Drop the outbound updates queued for a document the platform has
+    /// refused on this connection. Every one of them was built for a document
+    /// the room will not serve this client; what they wrote stays in the
+    /// document's local persistence.
     func discardQueuedOutboundUpdates(documentId: String) {
         let dropped: Int = lock.withLock {
             outboundDebounceTimers[documentId]?.cancel()
@@ -3514,8 +4051,8 @@ public final class JsBaoClient: @unchecked Sendable {
         }
         guard dropped > 0 else { return }
         logger.debug(
-            "[format2] dropped", dropped, "queued update(s) for", documentId,
-            "— each is a delta against the overlay the room has archived"
+            "dropped", dropped, "queued update(s) for", documentId,
+            "— the platform refused the document on this connection"
         )
     }
 
@@ -3523,7 +4060,7 @@ public final class JsBaoClient: @unchecked Sendable {
     ///
     /// Mirrors js-bao's `closeDocument` (`src/client/JsBaoClient.ts`):
     ///
-    /// 1. Queued outbound updates are flushed first. Before #2668 they were
+    /// 1. Queued outbound updates are flushed first. Earlier they were
     ///    dropped with their debounce timer, so an edit made just before close
     ///    only reached the server via the next open's diff — and was lost for
     ///    good when the document was evicted in the same call.
@@ -3538,12 +4075,34 @@ public final class JsBaoClient: @unchecked Sendable {
     ///
     /// The attribute below belongs to THIS declaration: most callers close a
     /// document without reading the flag back. Anything inserted between the
-    /// two would take the attribute with it (#3588).
+    /// two would take the attribute with it.
+    /// - Stability: production
     @discardableResult
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.unsubscribe(_:). It keeps answering until a later removal project. (api-surface-stability)")
     public func closeDocument(
         _ documentId: String,
         options: CloseDocumentOptions = CloseDocumentOptions()
     ) async -> CloseDocumentResult {
+        await closeDocument(documentId, options: options, door: .closeDocument)
+    }
+
+    /// The close, naming the document door it came through (`nil` for the
+    /// client's own closes: the db3 lifecycle's, the logout sweep's). A db3's
+    /// close releases its session and keeps its store bound, so it still
+    /// answers reads and takes writes, unless the close evicts it; a door's
+    /// close also ends this client's subscriptions to it and logs once per
+    /// client that `client.db3.unsubscribe` / `client.db3.evict` are the db3 forms.
+    @discardableResult
+    func closeDocument(
+        _ documentId: String,
+        options: CloseDocumentOptions,
+        door: Db3Door?
+    ) async -> CloseDocumentResult {
+        let db3 = isRecordLogDocument(documentId)
+        if db3, let door {
+            warnDb3Door(door, documentId)
+            _db3Lifecycle.closedByDoor(documentId)
+        }
         // Flush before any teardown: the queue and its debounce timer are torn
         // down below, so anything still pending would otherwise be discarded.
         await flushOutboundUpdates(documentId: documentId)
@@ -3556,15 +4115,34 @@ public final class JsBaoClient: @unchecked Sendable {
         // document opened with `retainLocal: false`, which evicts at close too.
         var effectiveOptions = options
         let retainLocalEvicts = documentManager.retainLocalSetting(documentId) == false
-        if options.evictLocal || retainLocalEvicts {
+        // #5155 — a db3 that lives only on this device is its only copy: no
+        // close removes it (its delete does). An evicting close, or one its
+        // open's retention would make evicting, keeps the copy. Asked only of
+        // a close that would remove local data: any other close touches no store.
+        var localOnly = false
+        if options.evictLocal || retainLocalEvicts { localOnly = await isLocalOnlyDb3(documentId) }
+        if localOnly {
+            logger.warn(
+                "[closeDocument]", documentId,
+                "— local data kept: it lives only on this device; remove it with client.db3.delete"
+            )
+            effectiveOptions.evictLocal = false
+            documentManager.preserveLocalOnClose(documentId)
+        } else if options.evictLocal || retainLocalEvicts {
             let confirmed: Bool
-            do {
-                try await waitForWriteConfirmation(
-                    documentId: documentId, timeout: 0.5, pollInterval: 0.1
-                )
-                confirmed = true
-            } catch {
-                confirmed = false
+            if db3, let binding = recordLogBinding(documentId) {
+                // A db3's writes are confirmed when none is left unjudged.
+                confirmed = (try? binding.store.storedState().writers.isEmpty) ?? false
+            } else {
+                do {
+                    try await awaitStateVector(
+                        documentId: documentId, timeout: 0.5, pollInterval: 0.1,
+                        operation: "waitForWriteConfirmation"
+                    ) { $0.includesWrites }
+                    confirmed = true
+                } catch {
+                    confirmed = false
+                }
             }
             if !confirmed {
                 logger.warn(
@@ -3578,9 +4156,14 @@ public final class JsBaoClient: @unchecked Sendable {
             }
         }
 
+        // A db3 the close does not evict keeps its store bound.
+        let keepBinding = db3
+            && !(effectiveOptions.evictLocal || documentManager.retainLocalSetting(documentId) == false)
+
         // Tell the server we are done with this document before the local state
         // goes away. Best-effort: a closed socket simply has nothing to tell.
-        if isConnected {
+        // Nothing names a db3 that lives only on this device (#5155).
+        if isConnected, !localOnly, !isLocalOnlyDb3Known(documentId) {
             do {
                 let payload = try JSONCoding.encodeData(
                     UnsubscribeFrame(documentId: documentId)
@@ -3619,13 +4202,14 @@ public final class JsBaoClient: @unchecked Sendable {
             syncErrorReported.remove(documentId)
         }
 
-        // #3436 — release the large-document binding with the document. A
-        // large document's Y.Doc IS its epoch overlay, so a reopen produces a
-        // NEW one; a binding kept across the close would leave every later
-        // write publishing into the document that was closed, where nothing
-        // reads it and nothing sends it. The STORE stays — that is what an
-        // ordinary close keeps, and what makes the next open cheap.
-        format2State.coordinator?.unbind(documentId: documentId)
+        // A record-log document's session stops and its binding closes; its
+        // store keeps everything, and the next open catches up from the cursor.
+        // The db3 lifecycle's close only releases the session.
+        if keepBinding {
+            await releaseRecordLogSession(documentId)
+        } else {
+            await closeRecordLogDocument(documentId)
+        }
 
         // Nothing may keep re-syncing a document the caller closed (#2664, C7).
         clearSyncWatchdog(documentId)
@@ -3641,8 +4225,11 @@ public final class JsBaoClient: @unchecked Sendable {
 
         // Drop this doc's rows from every cross-document store before the
         // YDocument is torn down, so later `Model.query()` reads don't
-        // surface stale state.
-        disconnectFromSharedModels(documentId: documentId)
+        // surface stale state. A db3 whose binding stays keeps its members:
+        // they read its store, not the Y.Doc.
+        if !keepBinding {
+            disconnectFromSharedModels(documentId: documentId)
+        }
 
         // Read the (possibly downgraded) retainLocal decision before the manager
         // drops it, so the caller learns whether local data actually went away.
@@ -3659,7 +4246,7 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Create a document. **Metadata-only and local-first**, mirroring
-    /// js-bao's `createDocument` (#852, #3200): the local metadata row is
+    /// js-bao's `createDocument`: the local metadata row is
     /// written immediately and, when `options.localOnly` is false (the
     /// default), a server commit is scheduled in the background and the
     /// `pendingCreate` metadata flag is cleared on success. On failure the
@@ -3669,9 +4256,9 @@ public final class JsBaoClient: @unchecked Sendable {
     /// The new document is **not open**: open it with
     /// `openDocument(_:)` / `documents.open` before reading it through the
     /// model facade or writing to it. A write before that throws
-    /// `JsBaoError(code: .notFound, "Document `<id>` is not open…")`, exactly
+    /// `JsBaoError(code: .notFound, "Document <id> is not open…")`, exactly
     /// as in the JS client — an unopened document has no update observer, so
-    /// an accepted write could never reach the server (#3200). A `localOnly`
+    /// an accepted write could never reach the server. A `localOnly`
     /// document is opened the same way (`waitForLoad: .local,
     /// enableNetworkSync: false` is the recommended shape); a pending-create
     /// or local-only document counts as locally available, so a default-option
@@ -3679,10 +4266,12 @@ public final class JsBaoClient: @unchecked Sendable {
     ///
     /// Returns `{ metadata }` — the freshly-written local metadata for
     /// the new document — matching js-bao's
-    /// `createDocument(options): Promise<{ metadata }>` exactly (#1108).
-    /// The document id rides inside `metadata.documentId`. Before #1108
+    /// `createDocument(options): Promise<{ metadata }>` exactly.
+    /// The document id rides inside `metadata.documentId`. Previously
     /// this returned a Swift-only `(documentId, doc)` tuple.
+    /// - Stability: beta
     @discardableResult
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.create(title:). It keeps answering until a later removal project. (api-surface-stability)")
     public func createDocument(options: CreateDocumentOptions = CreateDocumentOptions()) async throws -> CreateDocumentResult {
         // The server's `POST /documents` route validates documentId
         // against `^[0-9A-HJKMNP-TV-Z]{26}$` (Crockford ULID). Pre-#852
@@ -3706,6 +4295,17 @@ public final class JsBaoClient: @unchecked Sendable {
         // forward what a caller writes into one. Connecting it anyway is what
         // made a write before `openDocument` readable through `Model.query()`
         // and invisible to sync (#3200). `openDocument` connects it.
+        //
+        // A db3 is the exception: its records are in its store, which a
+        // subscription later sends from, so it is bound at once — resident,
+        // taking writes and answering reads before it ever syncs (#4701).
+        if options.documentFormat == RecordLogTransport.documentFormat {
+            do {
+                try await bindStoredDb3(documentId)
+            } catch {
+                logger.warn("[db3] \(documentId): binding the new db3's store failed:", error.localizedDescription)
+            }
+        }
 
         // Schedule the server commit in the background. `localOnly`
         // docs stay local forever; everything else races up to the
@@ -3732,6 +4332,8 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Get a Y.Doc for an open document
+    /// - Stability: production
+    @available(*, deprecated, message: "A YDocument has no db3 counterpart; a db3 is read through its models: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func getDoc(_ documentId: String) -> YDocument? {
         documentManager.getDocument(documentId)
     }
@@ -3742,7 +4344,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// The per-document update observer that `openDocument` installs is the
     /// single owner of outbound forwarding, so this method does **not** compute
     /// its own diff and enqueue it — that forwarded every wrapped transaction
-    /// twice (#3200). It survives as the ergonomic write entry point and as the
+    /// twice. It survives as the ergonomic write entry point and as the
     /// open-document guard; `doc.transactSync` directly is equally well
     /// forwarded.
     ///
@@ -3750,9 +4352,11 @@ public final class JsBaoClient: @unchecked Sendable {
     /// recoverable, caller-inducible condition (e.g. a lifecycle race between
     /// close/evict and a write, or a `documents.create` whose document has not
     /// been opened yet). This mirrors the JS client, whose write path
-    /// (`runLocalTransaction`) throws rather than crashing; before #1984 this
-    /// method called `fatalError`, taking the host app down.
+    /// (`runLocalTransaction`) throws rather than crashing; this method used
+    /// to call `fatalError`, taking the host app down.
+    /// - Stability: production
     @discardableResult
+    @available(*, deprecated, message: "A Yjs transaction has no db3 counterpart; a db3 is written through its models: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func transactAndSync<T>(_ documentId: String, _ changes: @escaping (YrsTransaction) -> T) throws -> T {
         guard let doc = documentManager.getDocument(documentId) else {
             throw JsBaoError(
@@ -3768,8 +4372,10 @@ public final class JsBaoClient: @unchecked Sendable {
     /// to avoid deadlocking with the WebSocket message handler. Safe to call from `@MainActor`.
     ///
     /// Throws `JsBaoError(code: .notFound)` if the document isn't open — see
-    /// `transactAndSync` for the rationale (JS-parity, no more `fatalError`; #1984).
+    /// `transactAndSync` for the rationale (JS-parity, no more `fatalError`).
+    /// - Stability: production
     @discardableResult
+    @available(*, deprecated, message: "A Yjs transaction has no db3 counterpart; a db3 is written through its models: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func transactAndSyncAsync<T: Sendable>(_ documentId: String, _ changes: @escaping @Sendable (YrsTransaction) -> T) async throws -> T {
         guard let doc = documentManager.getDocument(documentId) else {
             throw JsBaoError(
@@ -3809,21 +4415,29 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Check if a document is synced
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.state(_:) and its phase. It keeps answering until a later removal project. (api-surface-stability)")
     public func isSynced(_ documentId: String) -> Bool {
         documentManager.isSynced(documentId)
     }
 
     /// Check if a document is open
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.state(_:) and its subscribed. It keeps answering until a later removal project. (api-surface-stability)")
     public func isDocumentOpen(_ documentId: String) -> Bool {
         documentManager.isOpen(documentId)
     }
 
     /// List open document IDs
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.stored(). It keeps answering until a later removal project. (api-surface-stability)")
     public func listOpenDocuments() -> [String] {
         documentManager.listOpenDocuments()
     }
 
     /// Check if document is read-only
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.state(_:) and its permission. It keeps answering until a later removal project. (api-surface-stability)")
     public func isDocumentReadOnly(_ documentId: String) -> Bool {
         documentManager.isReadOnly(documentId)
     }
@@ -3834,16 +4448,21 @@ public final class JsBaoClient: @unchecked Sendable {
     /// with the offline identity as a final fallback (exactly the JS
     /// `authController.getRootDocId()` lookup). No HTTP call — the
     /// value is available immediately after sign-in in any auth flow
-    /// (OTP / OAuth / magic link / offline grant). The pre-#1109
+    /// (OTP / OAuth / magic link / offline grant). The former
     /// `async throws` + `refresh:` surface is gone: there is nothing
     /// to refetch.
-    public var rootDocId: String? {
+    @available(*, deprecated, message: "Root documents are a documents feature with no db3 counterpart: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
+    public var rootDocId: String? { currentRootDocId }
+
+    /// `rootDocId`'s value, for the client's own callers (#5365): the public
+    /// member is deprecated with the documents family and delegates here.
+    var currentRootDocId: String? {
         if let root = rootDocIdFromJwt() { return root }
         return authController.getOfflineIdentity()?.rootDocId
     }
 
     /// Build the alias-resolve request path, percent-encoding the alias as a
-    /// single path segment through the shared escaper (#2076) so a `/` (or any
+    /// single path segment through the shared escaper so a `/` (or any
     /// reserved character) in the alias can't split it into extra path
     /// segments. `internal` for unit testing.
     static func aliasResolvePath(alias: String) -> String {
@@ -3854,6 +4473,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// documentId via the server, then opens it via the standard
     /// `openDocument` path. Mirrors js-bao's
     /// `client.openDocumentByAlias(alias)`.
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.aliases to resolve the alias, then client.db3.subscribe(_:options:). It keeps answering until a later removal project. (api-surface-stability)")
     public func openDocumentByAlias(
         _ alias: String,
         options: OpenDocumentOptions = OpenDocumentOptions()
@@ -3862,7 +4483,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // without it still surfaces as `aliasNotFound` (what the old
         // dictionary cast did) rather than a decoding error.
         struct AliasResolution: Decodable, Sendable { let documentId: String? }
-        let result: AliasResolution? = try await httpClient.requestOptional(
+        let result: AliasResolution? = try await gatedTransport.requestOptional(
             method: .get, path: Self.aliasResolvePath(alias: alias)
         )
         guard let documentId = result?.documentId else {
@@ -3875,16 +4496,84 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Check if a document is a pending create
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.state(_:) and its pendingCreate. It keeps answering until a later removal project. (api-surface-stability)")
     public func isPendingCreate(_ documentId: String) -> Bool {
         documentManager.isPendingCreate(documentId)
     }
 
+    /// Wait until the pending create of `documentId` has committed.
+    /// Throws `JsBaoError(.pendingCreate)` when the network mode is or becomes
+    /// `.offline`, or when `timeout` elapses; `CancellationError` when the
+    /// calling task is cancelled. See `EventEmitter.waitForPendingCreateCommit`.
+    func awaitPendingCreateCommit(documentId: String, timeout: TimeInterval) async throws {
+        let documentManager = self.documentManager
+        try await eventEmitter.waitForPendingCreateCommit(
+            documentId: documentId,
+            timeout: timeout,
+            stillPending: { documentManager.isPendingCreate(documentId) },
+            isOffline: { [weak self] in self?.networkMode == .offline }
+        )
+    }
+
+    /// Wait, before a request naming `db3Id`, for a db3 created here whose
+    /// create the server does not have yet, as
+    /// `awaitPendingCreateCommit` waits for a document's. The wait joins the
+    /// commit in flight, or starts one, and returns once the server has the
+    /// db3. It throws the create's refusal (an `HttpError` with the server's
+    /// status and code, `details.db3Id` in its body) once the server refused
+    /// it, and `JsBaoError(.pendingCreate)` (`details["db3Id"]`) when the
+    /// network mode is or becomes `.offline` or the commit has not landed
+    /// within `DocumentsAPI.pendingCreateWaitSeconds`. A transient failure does
+    /// not end it: the backoff tries again.
+    func awaitPendingDb3Create(_ db3Id: String) async throws {
+        // #5155 — a db3 that lives only on this device has no server record to ask about.
+        try await assertNotLocalOnlyDb3(
+            db3Id, call: "client.db3",
+            instead: "read and write it with the model APIs, see it with client.db3.state or client.db3.stored, "
+                + "and remove it with client.db3.delete"
+        )
+        let documentManager = self.documentManager
+        guard documentManager.isPendingCreate(db3Id) else { return }
+        try await eventEmitter.waitForPendingDb3Create(
+            db3Id: db3Id,
+            timeout: DocumentsAPI.pendingCreateWaitSeconds,
+            stillPending: { documentManager.isPendingCreate(db3Id) },
+            isOffline: { [weak self] in self?.networkMode == .offline },
+            refusal: { Self.db3CreateRefusalError(db3Id, documentManager.getLocalMetadata(db3Id)) },
+            commit: {
+                Task {
+                    _ = try? await documentManager.joinDb3Commit(documentId: db3Id, metadata: documentManager.getLocalMetadata(db3Id))
+                    // A transient failure: make sure the backoff tries again.
+                    if documentManager.isPendingCreate(db3Id) { documentManager.scheduleCommitRetry(documentId: db3Id) }
+                }
+            }
+        )
+    }
+
+    /// The refusal a db3 create met at its last commit, as a call waiting
+    /// for the create throws it, or `nil` while it was not refused.
+    static func db3CreateRefusalError(_ db3Id: String, _ meta: LocalMetadataEntry?) -> HttpError? {
+        guard let meta, meta.commitRefused == true, let refusal = meta.commitError else { return nil }
+        let code = refusal.code ?? "DB3_CREATE_FAILED"
+        let status = refusal.status ?? 409
+        let body: JSONValue = .object([
+            "error": .string(refusal.message), "code": .string(code), "details": .object(["db3Id": .string(db3Id)]),
+        ])
+        let text = (try? JSONEncoder().encode(body)).flatMap { String(data: $0, encoding: .utf8) }
+        return HttpError(status: status, message: "HTTP \(status)", body: text, serverCode: code, serverMessage: refusal.message)
+    }
+
     /// Check if a document is local-only (never syncs to server)
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.state(_:) and its localOnly. It keeps answering until a later removal project. (api-surface-stability)")
     public func isLocalOnly(_ documentId: String) -> Bool {
         documentManager.isLocalOnly(documentId)
     }
 
     /// Check if document has local copy
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.state(_:) and its resident. It keeps answering until a later removal project. (api-surface-stability)")
     public func hasLocalCopy(_ documentId: String) -> Bool {
         documentManager.hasLocalCopy(documentId)
     }
@@ -3894,11 +4583,40 @@ public final class JsBaoClient: @unchecked Sendable {
     /// - Parameters:
     ///   - documentId: The document to commit.
     ///   - onExists: Behavior when document already exists on server: "fail" (default) or "link".
+    ///
+    /// A db3 `client.db3.create` made on this device commits through
+    /// `POST db3`, and the call waits for the server's answer: an attempt
+    /// already in flight is joined, a refusal is cleared and tried again. It
+    /// answers `["created": true]` when the server has it now,
+    /// `["refused": true, "reason": …]` when the server refused it (also
+    /// `Db3CreateFailedEvent`), and `["created": false, "reason":
+    /// "not_pending"]` when its create had already landed. A transient
+    /// failure throws, and the client keeps retrying it with backoff.
+    /// - Stability: beta
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.commitCreate(_:). It keeps answering until a later removal project. (api-surface-stability)")
     public func commitOfflineCreate(documentId: String, onExists: String = "fail") async throws -> [String: Any] {
-        try await documentManager.commitOfflineCreate(documentId: documentId, onExists: onExists)
+        try await commitPendingCreateNow(documentId, onExists: onExists)
+    }
+
+    /// The one implementation of `commitOfflineCreate(documentId:onExists:)`
+    /// and `client.db3.commitCreate(_:)` (#5365): a db3 created on this device
+    /// commits through `POST db3` now (a refusal cleared first, an attempt in
+    /// flight joined) and answers its outcome; a db3 with no pending create
+    /// answers `not_pending` with nothing sent. With `db3Only`, an id that is
+    /// not a db3 create answers `not_pending` too; without it, a document's
+    /// pending create commits through `POST documents`.
+    func commitPendingCreateNow(_ documentId: String, onExists: String = "fail", db3Only: Bool = false) async throws -> [String: Any] {
+        if documentManager.getLocalMetadata(documentId)?.db3Create == true {
+            guard documentManager.isPendingCreate(documentId) else { return ["created": false, "reason": "not_pending"] }
+            return try await documentManager.commitDb3CreateNow(documentId: documentId)
+        }
+        if db3Only { return ["created": false, "reason": "not_pending"] }
+        return try await documentManager.commitOfflineCreate(documentId: documentId, onExists: onExists)
     }
 
     /// List all documents pending server creation.
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.stored() and each db3's pendingCreate. It keeps answering until a later removal project. (api-surface-stability)")
     public func listPendingCreates() -> [String] {
         documentManager.listPendingCreates()
     }
@@ -3908,14 +4626,29 @@ public final class JsBaoClient: @unchecked Sendable {
     /// - Parameters:
     ///   - documentId: The document to cancel.
     ///   - evictLocal: If true, also removes the local copy.
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.cancelPendingCreate(_:evictLocal:). It keeps answering until a later removal project. (api-surface-stability)")
     public func cancelPendingCreate(_ documentId: String, evictLocal: Bool = false) async {
+        await cancelPendingCreateLocally(documentId, evictLocal: evictLocal)
+    }
+
+    /// The one implementation of `cancelPendingCreate(_:evictLocal:)` and
+    /// `client.db3.cancelPendingCreate(_:evictLocal:)` (#5365). It is local:
+    /// it sends nothing, drops the pending create and its retry timer, and
+    /// with `evictLocal` removes the local copy too. A db3's subscriptions
+    /// hear its new state, as JS's do.
+    func cancelPendingCreateLocally(_ documentId: String, evictLocal: Bool = false) async {
+        let db3Create = documentManager.getLocalMetadata(documentId)?.db3Create == true
         await documentManager.cancelPendingCreate(documentId)
+        if db3Create { _db3Lifecycle.createChanged(documentId) }
         if evictLocal {
             await documentManager.evictLocalData(documentId: documentId)
         }
     }
 
     /// Start network sync for a document
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.subscribe(_:options:), which keeps a db3 in sync. It keeps answering until a later removal project. (api-surface-stability)")
     public func startNetworkSync(documentId: String) async {
         // A caller asking for sync explicitly hands the timing back to the
         // client: a document opened with `deferNetworkSync` becomes
@@ -3941,6 +4674,17 @@ public final class JsBaoClient: @unchecked Sendable {
             )
             return
         }
+        // #5155 — a db3 that lives only on this device has no room to open.
+        if isLocalOnlyDb3Known(documentId) {
+            logger.debug("[db3] not syncing", documentId, "— it lives only on this device")
+            return
+        }
+        // A db3 of the previous user, being released (or not yet released
+        // under the new user's token): nothing is sent for it but its close.
+        if isDb3Releasing(documentId) {
+            logger.debug("[db3] not syncing", documentId, "— it is being released for the previous user")
+            return
+        }
         if explicit {
             documentManager.setStartNetworkMode(documentId, .immediate)
             // An explicit call is the caller taking over the timing, so it
@@ -3953,6 +4697,13 @@ public final class JsBaoClient: @unchecked Sendable {
             // silently swallows the caller's request for up to the 10s
             // staleness window.
             documentManager.completePendingSyncOperation(documentId)
+        }
+        // #5000 — a db3 `client.db3.create` made here whose create the server
+        // does not have yet has no room to open: a `record.open` now would be
+        // refused. Its commit starts the sync (`onPendingCreateCommitted`).
+        if documentManager.isPendingCreate(documentId), documentManager.getLocalMetadata(documentId)?.db3Create == true {
+            logger.debug("startNetworkSync: db3 create not committed yet, holding its open:", documentId)
+            return
         }
         // A syncStep1 can only go out on a live transport. JS gates the same
         // way — `sendSyncStep1` returns early unless
@@ -3980,6 +4731,14 @@ public final class JsBaoClient: @unchecked Sendable {
             }
             return
         }
+        // A document whose format nothing local knows is asked about now that
+        // the socket is up, before a handshake that could be the wrong one: a
+        // format-3 document must open with `record.open` (its open could not
+        // ask if it began before the socket connected).
+        guard await resolveRecordLogBeforeHandshake(documentId) else { return }
+        // A db3 bound for residency but not open here is not subscribed: its
+        // room hears from it when a subscription (or a door) opens it.
+        if recordLogSession(documentId) != nil, !documentManager.isOpen(documentId) { return }
         // One syncStep1->syncComplete cycle in flight per document (JS
         // parity: `sendSyncStep1` skips while `hasPendingSyncOperation`).
         // Without this, the 350ms availability-retry loop floods the
@@ -3989,6 +4748,16 @@ public final class JsBaoClient: @unchecked Sendable {
         // below - or by aging out (the `staleAfter` watchdog stand-in).
         guard documentManager.beginPendingSyncOperation(documentId) else {
             logger.debug("startNetworkSync: sync already in progress for", documentId)
+            return
+        }
+        // A record-log (format-3) document opens with `record.open`, never a
+        // `syncStep1`: its session holds the conversation. The claim and the
+        // watchdog are the same; the session reports synced when its catch-up
+        // completes.
+        if let session = recordLogSession(documentId) {
+            lock.withLock { _ = subscribedDocuments.insert(documentId) }
+            scheduleSyncWatchdog(documentId)
+            await session.start()
             return
         }
         guard let message = documentManager.buildSyncStep1Message(documentId: documentId) else {
@@ -4018,6 +4787,7 @@ public final class JsBaoClient: @unchecked Sendable {
         scheduleSyncWatchdog(documentId)
 
         do {
+            if let hook = onSyncStep1SendForTest { await hook(documentId) }
             try await wsManager.send(message)
         } catch {
             logger.warn("Failed to send syncStep1 for", documentId, error.localizedDescription)
@@ -4031,6 +4801,33 @@ public final class JsBaoClient: @unchecked Sendable {
             lock.withLock { syncWatchdogTimers.removeValue(forKey: documentId)?.cancel() }
             scheduleSyncRetry(documentId)
         }
+    }
+
+    /// A record-log document's session completed its open as this client's
+    /// writer: the same completion `syncComplete` gives an ordinary document.
+    func recordLogSessionSynced(_ documentId: String) async {
+        // A room that refused this client's writes (WRITE_ACCESS_DENIED) left
+        // the store read-only; an open the document's permission allows to
+        // write lifts it.
+        if let binding = recordLogBinding(documentId), binding.isReadOnly,
+           !documentManager.isReadOnly(documentId) {
+            await recordLogSession(documentId)?.adoptWriteAccess()
+        }
+        clearSyncWatchdog(documentId)
+        documentManager.handleSyncComplete(documentId: documentId, synced: true)
+        reconcileUnsyncedAfterSync(documentId: documentId, synced: true)
+        reportSyncRecovered(documentId)
+    }
+
+    /// A record-log document's open made progress without completing (a
+    /// `building` answer, a chunk of a receipt, a catch-up page): a watchdog
+    /// armed for it starts its handshake budget again, so a receipt longer
+    /// than the budget neither reports a sync error nor rebuilds the socket,
+    /// and an open waiting on it starts its `availabilityWait` again.
+    func recordLogSyncProgress(_ documentId: String) {
+        let armed = lock.withLock { syncWatchdogTimers[documentId] != nil }
+        if armed { scheduleSyncWatchdog(documentId) }
+        awaitingOpens.progress(documentId: documentId)
     }
 
     // MARK: - Sync watchdog (#2664, C7)
@@ -4127,7 +4924,7 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Rebuild the socket for a document that has missed the handshake budget
-    /// several times in a row while the transport still reads as open (#3390).
+    /// several times in a row while the transport still reads as open.
     ///
     /// Retrying is only recovery while the connection still carries answers.
     /// A half-open socket reads as open from here — every `syncStep1` goes
@@ -4140,7 +4937,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// the stall there was a server-side sync-in-progress marker keyed on
     /// that id, which a new socket carries along — only a process restart
     /// (a new id) ended it. That marker, and the broadcast mapping a
-    /// reconnect lost, are fixed on the server (#3390). The rebuild stays for
+    /// reconnect lost, are fixed on the server. The rebuild stays for
     /// the transport failure it does address.
     ///
     /// Bounded on purpose. One document rebuilds the connection once — the
@@ -4149,10 +4946,13 @@ public final class JsBaoClient: @unchecked Sendable {
     /// many documents are stalled on it. A document that still cannot sync on
     /// the fresh socket is left to the retry chain rather than reconnected in a
     /// loop.
-    private func rebuildConnectionForStalledSync(_ documentId: String) async {
+    func rebuildConnectionForStalledSync(_ documentId: String) async {
         // Nothing to rebuild on a transport that is already down: the reconnect
         // path owns that case and its sweep re-syncs on the way back up.
         guard wsManager.isSocketOpen else { return }
+        // A refused client keeps the socket it has: the rebuild's reconnect
+        // would be held, so it would only lose a working connection.
+        guard !appVersionController.isRefused else { return }
         let shouldRebuild: Bool = lock.withLock {
             guard !isDestroyed, !syncStallReconnectOnThisConnection else { return false }
             guard syncStallReconnectRequested.insert(documentId).inserted else { return false }
@@ -4168,7 +4968,7 @@ public final class JsBaoClient: @unchecked Sendable {
         await wsManager.forceReconnect()
     }
 
-    /// Tell the app that a document's sync is failing (#3390).
+    /// Tell the app that a document's sync is failing.
     ///
     /// Before this the timeout only logged, so an app had no way to know that
     /// what it was rendering had stopped converging — the session just looked
@@ -4182,7 +4982,7 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// A document the app was warned about has synced. Report the recovery once
-    /// so the app can clear the error it surfaced (#3390).
+    /// so the app can clear the error it surfaced.
     private func reportSyncRecovered(_ documentId: String) {
         let wasReported = lock.withLock { syncErrorReported.remove(documentId) != nil }
         guard wasReported else { return }
@@ -4192,7 +4992,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Arm the next `syncStep1` for a document whose cycle did not complete,
     /// after the current backoff — then double it, capped.
     ///
-    /// The retry keeps the chain alive (#3390). `startNetworkSync` returns
+    /// The retry keeps the chain alive. `startNetworkSync` returns
     /// without arming anything whenever it cannot start a cycle: the transport
     /// is down, a claim from an earlier cycle is still held, the document has
     /// no state vector to send, or the send itself throws. Before this both
@@ -4283,7 +5083,7 @@ public final class JsBaoClient: @unchecked Sendable {
     ///
     /// Returns whether a reset was scheduled — a completion that needs another
     /// sync has not left the document with server state, and the caller must
-    /// not report it to the app as a recovery (#3390).
+    /// not report it to the app as a recovery.
     @discardableResult
     private func handleSyncCompleteStaleCheck(_ documentId: String) -> Bool {
         let shouldReset: Bool = lock.withLock {
@@ -4325,7 +5125,7 @@ public final class JsBaoClient: @unchecked Sendable {
     ///
     /// A session whose refresh the server rejects never reconnects, so the
     /// 350ms availability-retry loop would otherwise report the same skip about
-    /// three times a second for as long as the document stays open (#2621).
+    /// three times a second for as long as the document stays open.
     /// Bounding it to one line per document per connectivity transition keeps
     /// the first, diagnostic occurrence and drops the churn.
     @discardableResult
@@ -4347,7 +5147,9 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `connectionId` (the wire key remote peers store the local state
     /// under — JS `sendAwarenessState` does the same) and emits a local
     /// `.awareness` delta event (`added` on the first set, `updated`
-    /// after), mirroring JS `setLocalAwarenessState` (#996).
+    /// after), mirroring JS `setLocalAwarenessState`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The awareness frame is deprecated with the documents family: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func setAwareness(_ documentId: String, state: [String: JSONValue]) {
         let result = documentManager.setLocalAwarenessState(documentId, state: state)
         guard result.exists else { return }
@@ -4371,8 +5173,8 @@ public final class JsBaoClient: @unchecked Sendable {
     ///
     /// Wire format is `[clientId, state]` tuples, keyed by connectionId.
     /// (Previously Swift sent a bare `[state]`, which JS peers could not
-    /// destructure — #996.) `state` is the typed `[String: JSONValue]` shape
-    /// (#2367); lower it back to the `Any` graph `JSONSerialization` needs.
+    /// destructure.) `state` is the typed `[String: JSONValue]` shape;
+    /// lower it back to the `Any` graph `JSONSerialization` needs.
     /// Encoding only fails on a value `JSONEncoder` rejects (a non-finite
     /// `.number`) — but publishing an empty state to every peer is a visible
     /// behavior change, not a no-op, so it is logged rather than swallowed.
@@ -4416,7 +5218,9 @@ public final class JsBaoClient: @unchecked Sendable {
     ///
     /// Broadcasts `[clientId, null]` removal tuples to the server and emits
     /// a local `.awareness` delta event with the requested IDs in
-    /// `removed`, mirroring JS `removeAwarenessStates` (#996).
+    /// `removed`, mirroring JS `removeAwarenessStates`.
+    /// - Stability: production
+    @available(*, deprecated, message: "The awareness frame is deprecated with the documents family: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func removeAwareness(documentId: String, clientIds: [String]) {
         // Clearing our own wire key also clears the local state (JS parity).
         let removeLocal = clientIds.contains(connectionId)
@@ -4453,6 +5257,8 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Get all awareness states for a document (local + remote).
     /// Returns a dictionary keyed by client ID.
+    /// - Stability: production
+    @available(*, deprecated, message: "Awareness is a Yjs document feature with no db3 counterpart: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func getAwarenessStates(documentId: String) -> [String: [String: JSONValue]] {
         guard let snapshot = documentManager.getAwarenessSnapshot(documentId) else { return [:] }
         var states = snapshot.remoteStates
@@ -4480,23 +5286,25 @@ public final class JsBaoClient: @unchecked Sendable {
     /// does not decode as `Response`. Use ``requestJSON(method:path:body:options:)``
     /// when the shape is genuinely dynamic, and
     /// ``requestData(method:path:body:options:)`` for bytes.
+    /// - Stability: production
     public func request<Body: Encodable & Sendable, Response: Decodable & Sendable>(
         method: HTTPMethod,
         path: String,
         body: Body,
         options: RequestOptions? = nil
     ) async throws -> Response {
-        try await httpClient.request(method: method, path: path, body: body, options: options)
+        try await gatedTransport.request(method: method, path: path, body: body, options: options)
     }
 
     /// No request body. (A `Body?` of `nil` cannot infer `Body`, so the
     /// no-body form is its own overload — same as on `Transport`.)
+    /// - Stability: production
     public func request<Response: Decodable & Sendable>(
         method: HTTPMethod,
         path: String,
         options: RequestOptions? = nil
     ) async throws -> Response {
-        try await httpClient.request(method: method, path: path, options: options)
+        try await gatedTransport.request(method: method, path: path, options: options)
     }
 
     /// Call an endpoint whose response shape you do not want to model, and
@@ -4516,22 +5324,24 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Note the number rule described on ``JSONValue``: every JSON number
     /// decodes as `Double`, so integers beyond 2^53 lose precision. Model
     /// those fields with a typed struct and ``request(method:path:options:)``.
+    /// - Stability: production
     public func requestJSON<Body: Encodable & Sendable>(
         method: HTTPMethod,
         path: String,
         body: Body,
         options: RequestOptions? = nil
     ) async throws -> JSONValue? {
-        try await httpClient.requestOptional(method: method, path: path, body: body, options: options)
+        try await gatedTransport.requestOptional(method: method, path: path, body: body, options: options)
     }
 
     /// No request body.
+    /// - Stability: production
     public func requestJSON(
         method: HTTPMethod,
         path: String,
         options: RequestOptions? = nil
     ) async throws -> JSONValue? {
-        try await httpClient.requestOptional(method: method, path: path, options: options)
+        try await gatedTransport.requestOptional(method: method, path: path, options: options)
     }
 
     /// Send and receive raw bytes — file uploads and downloads.
@@ -4539,26 +5349,14 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Returns the response bytes **untouched** with the status, and does not throw on a non-2xx
     /// status (inspect the returned status). Takes `RequestOptions`, so a
     /// timeout and custom headers are both available.
+    /// - Stability: production
     public func requestData(
         method: HTTPMethod,
         path: String,
         body: Data? = nil,
         options: RequestOptions? = nil
     ) async throws -> (Data, Int) {
-        try await httpClient.requestData(method: method, path: path, body: body, options: options)
-    }
-
-    // MARK: - HTTP API (deprecated `Any` surface)
-
-    /// The last untyped hop inside `JsBaoClient` itself.
-    ///
-    /// A few call sites still need the loosely-typed JSON graph because the
-    /// surface *they* feed is untyped — `DocumentManager.handleServerDocuments`
-    /// / `createRemoteDocument` exchange `[String: Any]` documents. They read
-    /// the graph through this one private hop rather than a public untyped
-    /// entry point, which #2367 removed.
-    private func legacyJSONGraph(_ method: String, _ path: String, _ data: Any? = nil) async throws -> Any? {
-        try await httpClient.request(method: method, path: path, data: data)
+        try await gatedTransport.requestData(method: method, path: path, body: body, options: options)
     }
 
     // MARK: - Configuration
@@ -4573,6 +5371,7 @@ public final class JsBaoClient: @unchecked Sendable {
     public var globalAdminAppId: String { options.globalAdminAppId }
 
     /// Set log level
+    /// - Stability: production
     public func setLogLevel(_ level: LogLevel) {
         logger.setLevel(level)
     }
@@ -4583,6 +5382,7 @@ public final class JsBaoClient: @unchecked Sendable {
     // stale image.
 
     /// Set blob upload concurrency, returning once the setting is in effect.
+    /// - Stability: production
     public func setBlobUploadConcurrencyAsync(_ value: Int) async {
         await blobManager.setUploadConcurrency(value)
     }
@@ -4594,9 +5394,20 @@ public final class JsBaoClient: @unchecked Sendable {
 
     // MARK: - Offline Data
 
-    /// Evict all local data
+    /// Evict all local data. A db3 that lives only on this device is kept,
+    /// its metadata row and its copy: only `client.db3.delete` and
+    /// `logout(wipeLocal: true)` remove it.
+    /// - Stability: production
     public func evictAllLocal(force: Bool = false) async {
+        // #5155 — the sweep evicts what can be re-synced, never what exists only here.
+        let kept = documentManager.getMetadataIndex().values.filter {
+            $0.localOnly == true && $0.documentFormat == RecordLogTransport.documentFormat
+        }
         await documentManager.evictAllLocalData()
+        for row in kept {
+            logger.log("[evict]", row.documentId, "— kept by the sweep: it lives only on this device")
+            await documentManager.restoreLocalOnlyRow(row)
+        }
         await kvCache.clearAll()
         await blobManager.clearCache()
         // #3764 — the same rule one level up: a wipe takes the rows every
@@ -4607,6 +5418,8 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Get offline info for a document
+    /// - Stability: production
+    @available(*, deprecated, message: "Documents are deprecated: for a db3 use client.db3.state(_:). It keeps answering until a later removal project. (api-surface-stability)")
     public func getOfflineInfo(_ documentId: String) -> [String: Any] {
         return [
             "hasLocalCopy": hasLocalCopy(documentId),
@@ -4614,15 +5427,24 @@ public final class JsBaoClient: @unchecked Sendable {
         ]
     }
 
-    /// Build the whole-scope `syncMetadata` request path, routing the query
-    /// value through the shared `URLQuery` builder (#2076); `payloadType` was
-    /// previously appended unescaped. A scoped sync does not come through
-    /// here — it asks about its document by path (`documentMetadataPath`), as
-    /// js-bao does. `internal` for unit testing.
-    static func syncMetadataPath(payloadType: String?) -> String {
+    /// Documents per page of the whole-scope `syncMetadata` walk. The server
+    /// caps `limit` at 100 (`parseListLimitParam`), so asking for more buys
+    /// nothing.
+    static let syncMetadataPageSize = 100
+
+    /// One page of the whole-scope `syncMetadata` walk: `GET
+    /// /me/owned-documents` or `GET /me/shared-documents`, the pair that
+    /// replaced the legacy `GET /documents` union list. An ids sync asks the
+    /// owned list for `fields=ids`, as js-bao does; the shared list takes no
+    /// such option. A scoped sync does not come through here — it asks about
+    /// its document by path (`documentMetadataPath`). `internal` for unit
+    /// testing.
+    static func syncMetadataPagePath(owned: Bool, payloadType: String?, cursor: String?) -> String {
         var query = URLQuery()
-        query.appendIfPresent("payloadType", payloadType)
-        return "/documents\(query.queryString)"
+        if owned, payloadType == "ids" { query.append("fields", "ids") }
+        query.append("limit", syncMetadataPageSize)
+        if let cursor, !cursor.isEmpty { query.append("cursor", cursor) }
+        return "/me/\(owned ? "owned" : "shared")-documents\(query.queryString)"
     }
 
     /// The single-document fetch a scoped sync answers from, mirroring
@@ -4631,7 +5453,32 @@ public final class JsBaoClient: @unchecked Sendable {
         "/documents/\(URLEncoding.encodeComponent(documentId))"
     }
 
-    /// Sync metadata. With no options, refreshes the full doc list.
+    /// Lower one server document row to the `[String: Any]` shape
+    /// `DocumentManager.handleServerDocuments` reads. `nil` for anything that
+    /// is not a JSON object, which the caller ignores. This is the one seam
+    /// left between the typed transport and the manager's untyped rows; a
+    /// later change removes it when it retypes them. `internal` for unit testing.
+    static func documentRow(_ value: JSONValue?) -> [String: Any]? {
+        guard case .object(let fields)? = value else { return nil }
+        return fields.mapValues { $0.toAny() }
+    }
+
+    /// A listing: every element must be an object, else the whole answer is
+    /// ignored. `internal` for unit testing.
+    static func documentRows(_ value: JSONValue?) -> [[String: Any]]? {
+        guard case .array(let items)? = value else { return nil }
+        var rows: [[String: Any]] = []
+        rows.reserveCapacity(items.count)
+        for item in items {
+            guard let row = documentRow(item) else { return nil }
+            rows.append(row)
+        }
+        return rows
+    }
+
+    /// Sync metadata. With no options, refreshes the user's whole document
+    /// scope — the documents they own plus the ones shared with them, each
+    /// list read to the end. A failed request throws and changes nothing.
     /// `options.documentId` restricts to one doc;
     /// `options.payloadType` (`"ids"` | `"full"`) controls the wire
     /// shape; `options.background` runs without blocking. Matches
@@ -4642,6 +5489,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// single-document sync removes its target when the server answers that
     /// the document is gone. That is how a document deleted — or revoked —
     /// while this client was offline leaves the device.
+    /// - Stability: production
+    @available(*, deprecated, message: "Document metadata sync has no db3 counterpart; client.db3.listMine and client.db3.stored list db3s: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func syncMetadata(
         options: SyncMetadataOptions = SyncMetadataOptions()
     ) async throws {
@@ -4659,18 +5508,46 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// The body of `syncMetadata`, shared by the awaited and the background
     /// call.
+    ///
+    /// The answer is about the user signed in when the sync started. Every
+    /// write after a fetch first checks that user is still signed in, so a
+    /// sync that outlives a logout or a user switch writes nothing. The check
+    /// travels into the merge too, which suspends between rows: the document
+    /// manager asks it again for every row it writes and every document it
+    /// evicts.
     private func runSyncMetadata(_ options: SyncMetadataOptions) async throws {
+        let session = currentMetadataSession
+        let sessionEnded = { [weak self] in self?.currentMetadataSession != session }
+
         if let documentId = options.documentId, !documentId.isEmpty {
-            try await syncOneDocumentMetadata(documentId: documentId, options: options)
+            try await syncOneDocumentMetadata(
+                documentId: documentId, options: options, sessionEnded: sessionEnded
+            )
             return
         }
 
-        let path = Self.syncMetadataPath(payloadType: options.payloadType)
-        let result = try await legacyJSONGraph("GET", path, nil)
-        guard let docs = result as? [[String: Any]] else { return }
+        // The app root is not part of the owned list unless asked for, so its
+        // absence from the scope is not news. Only the documents cached before
+        // the walk starts may be evicted, each still carrying the stamp it had
+        // then: the walk spans several round trips, and a document confirmed
+        // while it runs can be absent from a page that had already gone by.
+        var retainIds: Set<String> = []
+        if let rootDocId = currentRootDocId { retainIds.insert(rootDocId) }
+        let candidates = documentManager.evictionCandidateSnapshot(
+            seenIds: [], retainIds: retainIds
+        )
+        let listing = try await fetchWholeScopeListing(
+            payloadType: options.payloadType, sessionEnded: sessionEnded
+        )
+        guard let listing, let docs = Self.documentRows(.array(listing)), !sessionEnded() else {
+            return
+        }
         await documentManager.handleServerDocuments(
             docs,
-            authoritative: Self.listingIsAuthoritative(options)
+            authoritative: Self.listingIsAuthoritative(options),
+            retainIds: retainIds,
+            evictOnly: candidates,
+            sessionEnded: sessionEnded
         )
 
         // An ids listing does not authorize an eviction by itself (see
@@ -4682,7 +5559,58 @@ public final class JsBaoClient: @unchecked Sendable {
         for doc in docs {
             if let documentId = doc["documentId"] as? String { seenIds.insert(documentId) }
         }
-        await verifyThenEvictUnlistedDocuments(seenIds: seenIds)
+        await verifyThenEvictUnlistedDocuments(seenIds: seenIds, sessionEnded: sessionEnded)
+    }
+
+    /// The caller's whole document scope: `GET /me/owned-documents` and `GET
+    /// /me/shared-documents`, each followed to exhaustion, concatenated and
+    /// deduplicated by id (the owned row wins). Mirrors js-bao's whole-scope
+    /// `syncMetadata`.
+    ///
+    /// A failed request throws. Anything else short of reaching the end of
+    /// both lists returns `nil`, which syncs nothing: a page that is not the
+    /// `{ items, hasMore, nextCursor }` envelope, a page that says more rows
+    /// remain but gives no cursor, a cursor already followed (a list that
+    /// cycles never ends), or a session that ended mid-walk. There is no page
+    /// budget: a valid list is followed however long it is. A listing that saw
+    /// only the owned half would read every shared document as evictable.
+    private func fetchWholeScopeListing(
+        payloadType: String?,
+        sessionEnded: () -> Bool
+    ) async throws -> [JSONValue]? {
+        var union: [JSONValue] = []
+        var unionIds: Set<String> = []
+
+        for owned in [true, false] {
+            var cursor: String? = nil
+            var followedCursors: Set<String> = []
+
+            while true {
+                guard !sessionEnded() else { return nil }
+                let page: JSONValue = try await gatedTransport.request(
+                    method: .get,
+                    path: Self.syncMetadataPagePath(
+                        owned: owned, payloadType: payloadType, cursor: cursor
+                    )
+                )
+                guard let items = page["items"]?.arrayValue else { return nil }
+                for item in items {
+                    if let documentId = item["documentId"]?.stringValue,
+                       !unionIds.insert(documentId).inserted {
+                        continue
+                    }
+                    union.append(item)
+                }
+
+                guard let next = page["nextCursor"]?.stringValue, !next.isEmpty else {
+                    guard page["hasMore"]?.boolValue != true else { return nil }
+                    break
+                }
+                guard followedCursors.insert(next).inserted else { return nil }
+                cursor = next
+            }
+        }
+        return union
     }
 
     /// Sync one document's metadata, which is the call an app makes to ask
@@ -4704,30 +5632,32 @@ public final class JsBaoClient: @unchecked Sendable {
     /// deleting the row — and the CRDT snapshot — the confirmation just wrote.
     private func syncOneDocumentMetadata(
         documentId: String,
-        options: SyncMetadataOptions
+        options: SyncMetadataOptions,
+        sessionEnded: () -> Bool
     ) async throws {
         let candidate = documentManager.evictionCandidate(for: documentId)
         var row: [String: Any]?
         do {
-            let result = try await legacyJSONGraph(
-                "GET", Self.documentMetadataPath(documentId: documentId), nil
+            let answer: JSONValue? = try await gatedTransport.requestOptional(
+                method: .get, path: Self.documentMetadataPath(documentId: documentId)
             )
             // An answer that is not a document row says nothing either way,
             // and nothing is what it is allowed to do.
-            guard let fetched = result as? [String: Any] else { return }
+            guard let fetched = Self.documentRow(answer) else { return }
             row = fetched
         } catch {
             guard Self.isAccessLostError(error) else { throw error }
             row = nil
         }
 
+        guard !sessionEnded() else { return }
         if let row {
-            await documentManager.handleServerDocuments([row])
+            await documentManager.handleServerDocuments([row], sessionEnded: sessionEnded)
             return
         }
         guard options.authoritative != false else { return }
         await documentManager.handleServerDocumentAbsent(
-            documentId, ifUnconfirmedSince: candidate
+            documentId, ifUnconfirmedSince: candidate, sessionEnded: sessionEnded
         )
     }
 
@@ -4743,11 +5673,15 @@ public final class JsBaoClient: @unchecked Sendable {
     /// The candidates carry the metadata stamp they had before the checks
     /// started, so a document confirmed by some other path while this runs is
     /// not evicted on the strength of a stale decision.
-    private func verifyThenEvictUnlistedDocuments(seenIds: Set<String>) async {
+    private func verifyThenEvictUnlistedDocuments(
+        seenIds: Set<String>,
+        sessionEnded: () -> Bool
+    ) async {
+        guard !sessionEnded() else { return }
         var retainIds: Set<String> = []
         // The app root is not part of the user's document listing, so its
         // absence from one is not news.
-        if let rootDocId { retainIds.insert(rootDocId) }
+        if let rootDocId = currentRootDocId { retainIds.insert(rootDocId) }
 
         let candidates = documentManager.evictionCandidateSnapshot(
             seenIds: seenIds, retainIds: retainIds
@@ -4755,15 +5689,17 @@ public final class JsBaoClient: @unchecked Sendable {
         for candidate in candidates {
             let documentId = candidate.documentId
             do {
-                let result = try await legacyJSONGraph(
-                    "GET", Self.documentMetadataPath(documentId: documentId), nil
+                let answer: JSONValue? = try await gatedTransport.requestOptional(
+                    method: .get, path: Self.documentMetadataPath(documentId: documentId)
                 )
-                guard let row = result as? [String: Any] else { continue }
-                await documentManager.handleServerDocuments([row])
+                guard !sessionEnded() else { return }
+                guard let row = Self.documentRow(answer) else { continue }
+                await documentManager.handleServerDocuments([row], sessionEnded: sessionEnded)
             } catch {
+                guard !sessionEnded() else { return }
                 guard Self.isAccessLostError(error) else { continue }
                 await documentManager.handleServerDocumentAbsent(
-                    documentId, ifUnconfirmedSince: candidate
+                    documentId, ifUnconfirmedSince: candidate, sessionEnded: sessionEnded
                 )
             }
         }
@@ -4805,13 +5741,13 @@ public final class JsBaoClient: @unchecked Sendable {
     // MARK: - Analytics
 
     // The analytics queue became an `actor` in #1993 Phase D3, so its work is
-    // `async`. Each member below keeps its synchronous shape for one release —
-    // a synchronous caller cannot add an `await`, so removing it outright would
-    // be a break with no local fix — and gains an `Async` twin that does the
-    // work on the caller's task. See `AnalyticsAPI` for why the twins carry a
+    // `async` and each member below does it on the caller's task. They carry
+    // the `Async` suffix because they arrived as twins of synchronous members
+    // that #2367 then removed; see `AnalyticsAPI` for why the twins took a
     // distinct name instead of being same-name `async` overloads.
 
     /// Log an analytics event, returning once it is buffered.
+    /// - Stability: production
     public func logAnalyticsEventAsync(_ event: [String: Any]) async {
         guard let prepared = analyticsQueue.prepared(event) else { return }
         await analyticsQueue.logEvent(prepared)
@@ -4820,18 +5756,21 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Flush pending analytics events, returning once the batch has reached the
     /// socket (or, on a send failure, once it has been re-buffered and
     /// persisted).
+    /// - Stability: production
     public func flushAnalyticsAsync() async {
         await analyticsQueue.flushAndWait()
     }
 
     /// Override the plan field on all subsequent analytics events, returning
     /// once the override is in effect.
+    /// - Stability: production
     public func setAnalyticsPlanOverrideAsync(_ plan: String?) async {
         await analyticsQueue.setPlanOverride(plan)
     }
 
     /// Override the app version field on all subsequent analytics events,
     /// returning once the override is in effect.
+    /// - Stability: production
     public func setAnalyticsAppVersionOverrideAsync(_ version: String?) async {
         await analyticsQueue.setAppVersionOverride(version)
     }
@@ -5021,7 +5960,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Two cases, split on whether a socket is open:
     ///
     ///  - **Open.** Re-authenticate it with the new token rather than tearing
-    ///    it down (`reauthenticateSocket`, #2660).
+    ///    it down (`reauthenticateSocket`).
     ///  - **Closed.** Connect. Every no-token→token transition connects in JS,
     ///    whatever produced the token — magic link, OTP, passkey, OAuth, a
     ///    manual `setToken`, a successful HTTP refresh. Before #2657 only the
@@ -5046,6 +5985,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // told about at all.
         if previous.flatMap(Self.userId(ofToken:)) != Self.userId(ofToken: token) {
             _documents?.resetScopeReconcileSchedule()
+            endMetadataSession()
         }
         // The destroyed check lives inside the Task, not here: this runs inline
         // on whatever thread applied the token, and taking the client's
@@ -5053,7 +5993,10 @@ public final class JsBaoClient: @unchecked Sendable {
         // a deadlock risk. The Task has no such constraint.
         let task = Task { [weak self] in
             guard let self, !self.lock.withLock({ self.isDestroyed }) else { return }
-            if await self.wsManager.isSocketOpenAsync {
+            // Open counts from the socket's open, not from the server's
+            // `ready` (#5578): a token for another user that lands while the
+            // socket waits for it must rebuild the socket too.
+            if await self.wsManager.isTransportOpenAsync {
                 await self.reauthenticateSocket(with: token, previous: previous)
             } else {
                 await self.connectForAppliedToken(token: token, previous: previous)
@@ -5083,7 +6026,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// that opted out of automatic networking drives its own connect.
     ///
     /// A token where there was none also re-arms `shouldConnect`, which a
-    /// `logout()` (or an explicit `disconnect()`) left false; since #2663
+    /// `logout()` (or an explicit `disconnect()`) left false; since
     /// `connect()` does not override that flag, so without the re-arm a
     /// re-login would sign the user in and never reconnect. A token REPLACING
     /// another does not re-arm — a refresh must not revive a connection the
@@ -5355,18 +6298,21 @@ public final class JsBaoClient: @unchecked Sendable {
     // MARK: - Document Context
 
     /// Get a scoped document context
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated, its document-scoped handle with it; db3 calls take the db3 id: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func document(_ documentId: String) -> DocumentContext {
         DocumentContext(
             documentId: documentId,
             client: self,
             blobManager: blobManager,
-            transport: httpClient
+            transport: gatedTransport
         )
     }
 
     // MARK: - Lifecycle
 
     /// Destroy the client and clean up resources
+    /// - Stability: production
     public func destroy() async {
         let alreadyDestroyed = lock.withLock { () -> Bool in
             if isDestroyed { return true }
@@ -5399,8 +6345,16 @@ public final class JsBaoClient: @unchecked Sendable {
         }
         guard !alreadyDestroyed else { return }
 
+        // Every db3 subscription ends (its `ready()` throws `DB3_DISPOSED`) and
+        // each db3 is closed on the socket while the socket is still up.
+        await _db3Lifecycle.destroy()
+        db3IndexRefresher?.destroy()
+        db3VectorModels?.destroy()
+
         // Idempotent; the monitor's own deinit also cancels as a safety net.
         connectivityMonitor?.cancel()
+        // No version policy fetch, timer or handler outlives the client.
+        appVersionController.destroy()
         // Unhook the applied-token handler and cancel whatever socket work it
         // has in flight: a token landing during or after teardown must not
         // re-authenticate or reopen the connection behind `disconnect()` below.
@@ -5409,6 +6363,10 @@ public final class JsBaoClient: @unchecked Sendable {
         // Cancel a pending refresh-retry (#2022) first, so no background
         // refresh starts while the rest of the teardown runs.
         authController.destroy()
+        // No upload attempt is selected and no upload outcome is recorded
+        // from here on; rows stay as written, so an upload in flight
+        // restores next launch (#4592).
+        await blobManager.shutdown()
         // Every join still waiting is rejected and every membership forgotten:
         // nothing may be re-presented by a client that is gone, and nothing
         // queued may register on the way down (#3278).
@@ -5433,6 +6391,10 @@ public final class JsBaoClient: @unchecked Sendable {
         // detached Task — wait for any outstanding write before the
         // storage layer pulls the connection out from under it.
         await authController.awaitPendingPersistence()
+        // The upload writes issued before the shutdown above, likewise.
+        await blobManager.awaitPendingPersistence()
+        // And the version policy's load or write (its fetch was cancelled above).
+        await appVersionController.awaitPendingPersistence()
         await offlineStore.closeStorage()
         eventEmitter.removeAll()
         // End every open `stream(for:)` so a `for await` loop exits instead of
@@ -5471,60 +6433,45 @@ public final class JsBaoClient: @unchecked Sendable {
         // same source JS uses (`fetchDocumentInfo: () => this.documents.get(id)`).
         documentManager.fetchDocumentInfo = { [weak self] documentId in
             guard let self = self else { throw JsBaoError(code: .unavailable) }
-            return try await self.documents.get(documentId: documentId)
+            return try await self._documents.fetchDocumentInfo(documentId: documentId)
         }
         documentManager.createRemoteDocument = { [weak self] body in
             guard let self = self else { throw JsBaoError(code: .unavailable) }
-            let result = try await self.legacyJSONGraph("POST", "/documents", body)
-            return result as? [String: Any] ?? [:]
+            let typedBody = try JSONValue.typedRow(from: body, subject: "Document create body")
+            let created: JSONValue? = try await self.gatedTransport.requestOptional(
+                method: .post, path: "/documents", body: typedBody
+            )
+            return Self.documentRow(created) ?? [:]
+        }
+        // #4921 — a db3 `client.db3.create` made here commits through `POST db3`.
+        documentManager.createRemoteDb3 = { [weak self] body in
+            guard let self = self else { throw JsBaoError(code: .unavailable) }
+            return try await self.gatedTransport.request(method: .post, path: "/db3", body: body)
+        }
+        documentManager.onDb3CreateCommitted = { [weak self] db3Id, info in
+            await self?.db3CreateCommitted(db3Id, info: info)
+        }
+        documentManager.onDb3CreateRefused = { [weak self] db3Id, event in
+            guard let self else { return }
+            self._db3Lifecycle.createChanged(db3Id)
+            self.eventEmitter.emit(event)
         }
         // Wire up document update observer — fires for ALL local writes to any open doc.
         // This is the equivalent of JS `doc.on("update", handler)`.
         documentManager.onLocalUpdate = { [weak self] documentId, update in
             self?.queueOutboundUpdate(documentId: documentId, update: update)
         }
-        // #3436 — a large document's `update` frame says which local sequences
-        // it carries; the claim is made when the frame is built and settled
-        // when the socket has answered for it.
-        // #3436 — every eviction, whichever door it came through, takes the
-        // large document's own tables with it (decision 3436-SO-06).
-        documentManager.purgeFormat2Data = { [weak self] documentId in
-            await self?.purgeLargeDocument(documentId)
+        // Every eviction, whichever door it came through, takes a record-log
+        // document's rows, entries and projections with it, its unsent writes
+        // handed back as DOCUMENT_STORE_PURGED.
+        documentManager.purgeLocalStoreData = { [weak self] documentId in
+            await self?.purgeRecordLogDocument(documentId)
         }
-        // #3437, behavior 17 — while a large document is behind the room its
-        // overlay stays the client's own: the room's current epoch is not
-        // merged into an overlay the epoch move is about to read owed values
-        // off. Every format-1 document, and every large document that is not
-        // behind, answers `true` and applies frames exactly as before.
-        documentManager.acceptsInboundFrame = { [weak self] documentId in
-            guard let coordinator = self?.format2State.coordinator,
-                  coordinator.isLargeDocument(documentId)
-            else { return true }
-            return coordinator.admitInbound(documentId)
-        }
-        documentManager.stampOutboundUpdate = { [weak self] documentId, mergedCount in
-            guard let coordinator = self?.format2State.coordinator else { return nil }
-            return try? coordinator.outboundClaim(
-                documentId: documentId, covering: mergedCount
-            )
-        }
-        documentManager.settleOutboundUpdate = { [weak self] documentId, claim, settlement in
-            guard let coordinator = self?.format2State.coordinator else { return }
-            switch settlement {
-            case .sent:
-                coordinator.markSent(documentId: documentId, claim: claim)
-            case .failed:
-                coordinator.restoreClaim(documentId: documentId, claim: claim)
-            case .stale:
-                coordinator.discardClaim(documentId: documentId, claim: claim)
-            }
-        }
-        // #3559 — the epoch generation an outbound payload was built against.
-        // Zero for an ordinary document, and for a client with no coordinator:
-        // a constant answer is an answer that never goes stale, which is right
-        // for a document that has no epochs to move between.
-        documentManager.outboundGeneration = { [weak self] documentId in
-            self?.format2State.coordinator?.outboundGeneration(documentId) ?? 0
+        // The format-1 retention pass asks a db3 row the lifecycle's keep
+        // verdict and removes nothing: the db3 sweep that follows removes
+        // stored copies only (#5085).
+        documentManager.evictDb3ForRetention = { [weak self] documentId in
+            await self?._db3Lifecycle.retentionWouldRemove(documentId) ?? false
         }
         // A `pendingCreate` doc doesn't exist server-side yet, so the
         // syncStep1 sent at open time never gets a `syncComplete` back and its
@@ -5535,6 +6482,36 @@ public final class JsBaoClient: @unchecked Sendable {
         // Only fires for documents whose sync this client drives — the
         // `deferNetworkSync` / `enableNetworkSync: false` opens are filtered
         // out by `DocumentManager.applyPostCommitPolicy`.
+        // A permission heard for a bound db3 reaches its store before the
+        // event: `reader` refuses saves here, a write-capable one takes them
+        // again, with no reopen (#5020); then its state is read again (#5070).
+        documentManager.permissionApplied = { [weak self] documentId, permission in
+            guard let self, let binding = self.recordLogBinding(documentId), !binding.isClosed else { return }
+            do {
+                try binding.applyPermissionChange(permission)
+            } catch {
+                self.logger.warn("[record-log]", documentId, "— applying the permission", permission.rawValue, "failed:", error.localizedDescription)
+            }
+            // Its state is read again, so `db3:state` carries the level (#5070).
+            self._db3Lifecycle?.permissionChanged(documentId)
+        }
+        // A level the server sent just now is a grant the lifecycle hears: a
+        // refused db3 asks its room again (#5101). The store takes it first,
+        // as above; a level it already took changes nothing.
+        documentManager.permissionHeard = { [weak self] documentId, permission in
+            guard let self, let binding = self.recordLogBinding(documentId), !binding.isClosed else { return }
+            // #5888 — recorded as a grant before the store takes it: a refusal
+            // of an ask made before it does not end the db3's subscriptions.
+            // Frames are handled one at a time, so it is recorded before a
+            // refusal heard after it is.
+            if let level = Db3Permission(rawValue: permission.rawValue) { self._db3Lifecycle?.grantHeard(documentId, level) }
+            do {
+                try binding.applyPermissionChange(permission)
+            } catch {
+                self.logger.warn("[record-log]", documentId, "— applying the permission", permission.rawValue, "failed:", error.localizedDescription)
+            }
+            self._db3Lifecycle?.permissionChanged(documentId, heard: Db3Permission(rawValue: permission.rawValue))
+        }
         documentManager.onPendingCreateCommitted = { [weak self] documentId in
             Task { [weak self] in
                 guard let self, self.networkingAllowed() else { return }
@@ -5549,6 +6526,17 @@ public final class JsBaoClient: @unchecked Sendable {
         }
         documentManager.commitRetryBackoff = options.commitRetryBackoff
         documentManager.isOnlineProvider = { [weak self] in self?.networkingAllowed() ?? false }
+        // #5155 — a db3 that lives only on this device is never named to the server.
+        gatedTransport.setRequestCheck { [weak self] method, path, body in
+            guard let self, let db3Id = await self.localOnlyDb3Requested(path: path, body: body) else { return nil }
+            return Self.db3LocalOnlyError(
+                db3Id, call: "\(method.rawValue) \(path.split(separator: "?").first.map(String.init) ?? path)",
+                instead: "nothing naming it is sent"
+            )
+        }
+        gatedTransport.setOfflineCheck { [weak self] method, path in
+            self?.offlineRequestError(method: method, path: path)
+        }
 
         // (The blob manager and the analytics queue are wired in `init` — both
         // are actors, so their collaborators are supplied at construction,
@@ -5565,19 +6553,24 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `networkMode`, `networkingAllowed()`,
     /// `rootDocId`, `logout(...)` — so they can only be built once
     /// `self` is usable. They are assigned to private implicitly-unwrapped
-    /// storage read through non-optional public properties (#2367).
+    /// storage read through non-optional public properties.
     private func setupSubApis() {
         self._codegen = CodegenAPI(client: self)
+        self.db3IndexRefresher = RecordLogIndexRefresher(deps: makeDb3IndexRefresherDeps())
+        self.db3VectorModels = Db3VectorModels(deps: makeDb3VectorModelsDeps())
+        self._db3Lifecycle = Db3Lifecycle(deps: makeDb3LifecycleDeps())
+        self._db3 = Db3API(lifecycle: _db3Lifecycle, transport: gatedTransport, client: self, blobManager: blobManager)
+        self._agents = AgentsAPI(transport: gatedTransport, client: self)
 
         let cacheFacade = CacheFacade(
             kvCache: kvCache,
             getNetworkMode: { [weak self] in self?.networkMode ?? .auto },
-            transport: httpClient
+            transport: gatedTransport
         )
         self._cache = cacheFacade
 
         self._documents = DocumentsAPI(
-            transport: httpClient,
+            transport: gatedTransport,
             blobManager: blobManager,
             documentManager: documentManager,
             client: self
@@ -5595,7 +6588,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // through `Transport.requestData` like every other raw-bytes call
         // site now that `MeAPI` holds the transport.
         self._me = MeAPI(
-            transport: httpClient,
+            transport: gatedTransport,
             cache: cacheFacade,
             localMetadata: { [weak self] in self?.documentManager.getMetadataIndex() ?? [:] },
             isOnline: { [weak self] in self?.networkingAllowed() ?? false },
@@ -5610,10 +6603,10 @@ public final class JsBaoClient: @unchecked Sendable {
             },
             // Lets the local-first paths apply the same root filter the
             // server applies to `/me/owned-documents` (#848 / #2360).
-            rootDocId: { [weak self] in self?.rootDocId },
+            rootDocId: { [weak self] in self?.currentRootDocId },
             logger: logger
         )
-        self._users = UsersAPI(transport: httpClient, cache: cacheFacade)
+        self._users = UsersAPI(transport: gatedTransport, cache: cacheFacade)
         self._auth = AuthAPI(
             getUserId: { [weak self] in self?.authController.getUserId() },
             getToken: { [weak self] in self?.authController.getToken() },
@@ -5625,10 +6618,6 @@ public final class JsBaoClient: @unchecked Sendable {
                     redirectUri: redirectUri
                 )
             },
-            magicLinkRequest: { [weak self] email, redirectUri in
-                guard let self = self else { throw JsBaoError(code: .unavailable) }
-                return try await self.authController.magicLinkRequest(email: email, redirectUri: redirectUri)
-            },
             magicLinkVerify: { [weak self] token in
                 guard let self = self else { throw JsBaoError(code: .unavailable) }
                 return try await self.authController.magicLinkVerify(token: token)
@@ -5636,10 +6625,6 @@ public final class JsBaoClient: @unchecked Sendable {
             magicLinkVerifyWithInvite: { [weak self] token, inviteToken in
                 guard let self = self else { throw JsBaoError(code: .unavailable) }
                 return try await self.authController.magicLinkVerify(token: token, inviteToken: inviteToken)
-            },
-            otpRequest: { [weak self] email in
-                guard let self = self else { throw JsBaoError(code: .unavailable) }
-                return try await self.authController.otpRequest(email: email)
             },
             otpVerify: { [weak self] email, code in
                 guard let self = self else { throw JsBaoError(code: .unavailable) }
@@ -5650,10 +6635,10 @@ public final class JsBaoClient: @unchecked Sendable {
                 return try await self.authController.otpVerify(email: email, code: code, inviteToken: inviteToken)
             },
             getAuthConfig: { [httpClient] in
-                try await httpClient.request(method: .get, path: "/oauth-config")
+                try await httpClient.request(method: .get, path: "/settings/sign-in")
             },
             getAppConfig: { [httpClient] in
-                try await httpClient.request(method: .get, path: "/oauth-config")
+                try await httpClient.request(method: .get, path: "/settings/sign-in")
             },
             logout: { [weak self] wipeLocal in
                 guard let self = self else { throw JsBaoError(code: .unavailable) }
@@ -5730,8 +6715,25 @@ public final class JsBaoClient: @unchecked Sendable {
                 return try await self.authController.passkeyUpdate(
                     passkeyId: passkeyId, deviceName: deviceName
                 )
+            },
+            emailSignInRequestWithTarget: { [weak self] email, target in
+                guard let self = self else { throw JsBaoError(code: .unavailable) }
+                return try await self.authController.emailSignInRequest(email: email, target: target)
+            },
+            emailSignInLinkTarget: { [weak self] target in
+                self?.authController.emailSignInLinkTarget(target)
+            },
+            handleSignInCallback: { [weak self] url, inviteToken in
+                guard let self = self else { throw JsBaoError(code: .unavailable) }
+                let result = try await self.authController.handleSignInCallback(url, inviteToken: inviteToken)
+                // As `handleOAuthCallback` does: return with the connection
+                // attempt the new token started finished.
+                if result.method == .oauth { await self.awaitPendingTokenConnect() }
+                return result
             }
         )
+        // The sign-in rules read `links.appBaseURL` at call time.
+        authController.appBaseURLProvider = { [weak self] in self?.links.appBaseURL }
         // logout(waitForDisconnect:) tears down networking via this hook.
         authController.onLogoutDisconnect = { [weak self] in await self?.disconnect() }
         // Every logout — wipe or not — closes the signed-out user's documents
@@ -5753,6 +6755,7 @@ public final class JsBaoClient: @unchecked Sendable {
 
     private func setupStorage() {
         Task {
+            if let hold = storageSetupHoldForTest { await hold() }
             let provider: StorageProvider
             let authProvider: StorageProvider
             switch options.storageConfig {
@@ -5800,6 +6803,7 @@ public final class JsBaoClient: @unchecked Sendable {
             await offlineStore.setStorageProvider(provider)
             await offlineStore.setAuthStorageProvider(authProvider)
             await kvCache.setStorageProvider(provider)
+            if let hold = storageBindHoldForTest { await hold() }
 
             // Bootstrap auth
             if options.token != nil {
@@ -5823,11 +6827,20 @@ public final class JsBaoClient: @unchecked Sendable {
             // load that user's local metadata.
             await bindCurrentUserScopedStorage()
 
+            // Every db3 the signed-in user's store holds is bound before
+            // storage is ready: resident ones answer reads at once.
+            await bindStoredDb3s()
+
             // Restore analytics queue
             await analyticsQueue.restoreBuffer()
 
-            // #3436 — the local rows are loaded, so the question "is every
-            // document this client knows ordinary?" can be answered. Answered
+            // Write the uploads queued before the provider bound and restore
+            // the signed-in user's stored ones, before readiness is signalled:
+            // `waitForStorageReady()` returning implies the queue is restored.
+            await blobManager.storageDidBecomeReady()
+
+            // The local rows are loaded, so the question "is every document
+            // this client knows ordinary?" can be answered. Answered
             // HERE, before the auto-connect below, so the answer reaches the
             // first task rather than the second.
             await ensureReceiveLimitForKnownDocuments()
@@ -5857,14 +6870,14 @@ public final class JsBaoClient: @unchecked Sendable {
 
             // Auto-connect if networking is allowed.
             if options.autoNetwork && networkingAllowed() {
-                try? await connect()
+                try? await connect(origin: .automatic)
             }
         }
     }
 
     /// Snapshot the current auth user into the user-scoped managers and load
     /// that user's local metadata. Shared by `setupStorage()` (initial bind)
-    /// and `rebindUserScopedStorage()` (post-sign-in rebind, #1780).
+    /// and `rebindUserScopedStorage()` (post-sign-in rebind).
     private func bindCurrentUserScopedStorage() async {
         await kvCache.setUserId(authController.getUserId())
         if let userId = authController.getUserId() {
@@ -5872,11 +6885,14 @@ public final class JsBaoClient: @unchecked Sendable {
             try? await offlineStore.ensureMetadataDb(appId: options.appId, userId: userId)
             await documentManager.loadLocalMetadata()
         }
+        // The record-log store is one per app file: reset it when it belongs
+        // to another user than the one signed in.
+        await checkRecordLogOwnerAtSignIn()
         releaseHeldOutboundClassifications()
     }
 
     /// Release the outbound batches held while a document's local-only
-    /// classification was unknown (#2691).
+    /// classification was unknown.
     ///
     /// A document opened before the storage provider was bound has no answer to
     /// `isLocalOnly` worth sending on, so its flush holds. This is the other
@@ -5895,7 +6911,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// made during the open (from a `DocumentOpenedEvent` handler, or by a
     /// caller the already-open fast path handed the document to) is forwarded
     /// the instant the observer exists, which is before the stored row has been
-    /// read (#3200). The open calls this once it has the answer.
+    /// read. The open calls this once it has the answer.
     func releaseHeldOutboundClassification(_ documentId: String) {
         let hasQueued = lock.withLock { !(pendingUpdates[documentId]?.isEmpty ?? true) }
         guard hasQueued else { return }
@@ -5904,37 +6920,52 @@ public final class JsBaoClient: @unchecked Sendable {
 
     /// Re-scope the user-owned managers to the currently authenticated user,
     /// clearing the previously-bound user's in-memory metadata first. When the
-    /// user is unchanged this only reloads local metadata a logout dropped
-    /// (#2874), and is otherwise a no-op.
+    /// user is unchanged this only reloads local metadata a logout dropped,
+    /// and is otherwise a no-op.
     ///
     /// `setupStorage()` binds document/metadata storage to whoever init
     /// restored. A later sign-in (`otpVerify`) updates only `AuthController`,
     /// so without this the client would keep serving the restored user's local
     /// document state under the new identity — the returned client would
-    /// authenticate as B while retaining A's local documents (#1780). Call
+    /// authenticate as B while retaining A's local documents. Call
     /// after a sign-in that may land a different user than init restored, once
     /// `waitForStorageReady()` confirms the initial bind has finished.
+    /// - Stability: production
     public func rebindUserScopedStorage() async {
         let newUserId = authController.getUserId() ?? ""
-        if documentManager.userId == newUserId {
-            // Same user, but a logout in this process dropped in-memory
-            // user-scoped state the store still holds (#2874): reload it here,
-            // or their pending creates would stay uncommitted until the app
-            // relaunched. `loadLocalMetadata()` is additive and idempotent, so
-            // re-running it for an unchanged user is safe.
-            if documentManager.needsLocalMetadataReload {
+        // Another user: the previous user's db3s are unbound before anything
+        // of the new identity is applied (their subscriptions end), and a db3
+        // open or bind waits until the new user's storage is in place.
+        guard documentManager.userId == newUserId else {
+            let db3Release = beginDb3IdentityRelease()
+            forgetDb3Identity()
+            await _db3Lifecycle.releaseAll(unbind: true)
+            // The record-log store is reset when another user than its owner signs in.
+            await checkRecordLogOwnerAtSignIn()
+            await documentManager.resetInMemoryUserState(userId: newUserId)
+            await kvCache.setUserId(authController.getUserId())
+            if !newUserId.isEmpty {
+                try? await offlineStore.ensureMetadataDb(appId: options.appId, userId: newUserId)
                 await documentManager.loadLocalMetadata()
-                releaseHeldOutboundClassifications()
             }
+            releaseHeldOutboundClassifications()
+            db3IdentityRelease.end(db3Release)
+            await bindStoredDb3s()
             return
         }
-        await documentManager.resetInMemoryUserState(userId: newUserId)
-        await kvCache.setUserId(authController.getUserId())
-        if !newUserId.isEmpty {
-            try? await offlineStore.ensureMetadataDb(appId: options.appId, userId: newUserId)
+        // The same user keeps the record-log store, with its unsent writes.
+        await checkRecordLogOwnerAtSignIn()
+        // Same user, but a logout in this process dropped in-memory
+        // user-scoped state the store still holds (#2874): reload it here,
+        // or their pending creates would stay uncommitted until the app
+        // relaunched. `loadLocalMetadata()` is additive and idempotent, so
+        // re-running it for an unchanged user is safe.
+        if documentManager.needsLocalMetadataReload {
             await documentManager.loadLocalMetadata()
+            releaseHeldOutboundClassifications()
         }
-        releaseHeldOutboundClassifications()
+        // A logout unbound this user's db3s: bind them again.
+        await bindStoredDb3s()
     }
 
     /// Wait until storage initialization has fully completed — token restored
@@ -5946,7 +6977,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// not just token auth-ready (`markAuthReady()` fires mid-task, before the
     /// user-scoped bind). It is also genuinely bounded: the wait is
     /// cancellation-aware, so a slow or stuck startup refresh cannot stall the
-    /// caller past `timeout` (#1780 codex P1/P2).
+    /// caller past `timeout`.
+    /// - Stability: production
     @discardableResult
     public func waitForStorageReady(timeout: TimeInterval = 10) async -> Bool {
         await withTaskGroup(of: Bool.self) { group in
@@ -6010,11 +7042,21 @@ public final class JsBaoClient: @unchecked Sendable {
     /// `handleUpdate` updateUrl branch. Returns nil on any failure; callers
     /// treat that like a dropped frame (a later syncStep1 retry or reconnect
     /// re-requests the state).
-    private func downloadRemoteUpdate(from urlString: String, documentId: String) async -> Data? {
+    ///
+    /// Traced at `debug` on both ends with the byte count: a handshake's
+    /// `syncStep2` under the `[open]` tag, because it is what a waiting open is
+    /// waiting for, and a broadcast `update` under `[sync]`.
+    private func downloadRemoteUpdate(
+        from urlString: String, documentId: String, frame: String
+    ) async -> Data? {
+        let tag = frame == "syncStep2" ? "[open]" : "[sync]"
         guard let url = URL(string: urlString) else {
             logger.warn("Invalid updateUrl for doc:", documentId, urlString)
             return nil
         }
+        let startedAt = Date()
+        let elapsedMs = { Int(Date().timeIntervalSince(startedAt) * 1000) }
+        logger.debug(tag, "download start", documentId, "for", frame)
         do {
             let (data, response) = try await NetworkSession.data(from: url)
             guard let http = response as? HTTPURLResponse else {
@@ -6036,16 +7078,30 @@ public final class JsBaoClient: @unchecked Sendable {
                                 "bytes:", data.count)
                     return nil
                 }
-                logger.debug("Downloaded compressed update for doc:", documentId,
-                             "bytes:", inflated.count)
+                logger.debug(tag, "download end", documentId, "for", frame,
+                             "bytes:", inflated.count, "compressed:", data.count,
+                             "ms:", elapsedMs())
                 return inflated
             }
-            logger.debug("Downloaded remote update for doc:", documentId, "bytes:", data.count)
+            logger.debug(tag, "download end", documentId, "for", frame,
+                         "bytes:", data.count, "ms:", elapsedMs())
             return data
         } catch {
             logger.warn("Failed to download update for doc:", documentId, error.localizedDescription)
             return nil
         }
+    }
+
+    /// Apply a frame's server state, traced at `debug` with its size and how
+    /// long the apply took.
+    private func applyRemoteUpdate(_ documentId: String, data: Data, frame: String) {
+        let startedAt = Date()
+        documentManager.handleRemoteUpdate(documentId: documentId, updateData: data)
+        logger.debug(
+            frame == "syncStep2" ? "[open]" : "[sync]", "apply", documentId, "for", frame,
+            "bytes:", data.count,
+            "ms:", Int(Date().timeIntervalSince(startedAt) * 1000)
+        )
     }
 
     /// What a server `error` frame's `detail` reaches the caller as.
@@ -6070,7 +7126,7 @@ public final class JsBaoClient: @unchecked Sendable {
         return .object(fields)
     }
 
-    /// One format named on a refusal frame's typed detail (#3764).
+    /// One format named on a refusal frame's typed detail.
     ///
     /// Read strictly, the way the room reads a declaration: only the number 2 is
     /// the large format, and anything else — an absent field, a string, a
@@ -6089,7 +7145,7 @@ public final class JsBaoClient: @unchecked Sendable {
         awaitingOpens.fail(documentId: documentId, error: error)
     }
 
-    /// Whether the platform has refused this document on this connection (#3764).
+    /// Whether the platform has refused this document on this connection.
     func isFormatRefused(_ documentId: String) -> Bool {
         lock.withLock { formatRefusedDocuments[documentId] != nil }
     }
@@ -6099,7 +7155,7 @@ public final class JsBaoClient: @unchecked Sendable {
         lock.withLock { formatRefusedDocuments[documentId] }
     }
 
-    /// Drop a format refusal, naming why it no longer applies (#3764).
+    /// Drop a format refusal, naming why it no longer applies.
     ///
     /// The mark is per open cycle, not per client: a document this app has
     /// closed no longer holds the belief that was refused, and an eviction has
@@ -6121,7 +7177,7 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Refuse ONE document because the platform and this client disagree about
-    /// its format — #3764, decision D7.
+    /// its format — decision D7.
     ///
     /// A document-scoped teardown, not a waiter failer: an open waiting on the
     /// network is failed, and a document already open with nothing waiting is
@@ -6146,6 +7202,61 @@ public final class JsBaoClient: @unchecked Sendable {
             ]
         )
 
+        let tornDown = await tearDownRefusedDocument(
+            documentId, error: error,
+            reason: "the platform serves it as format \(actual) and this client opened it as \(declared)"
+        )
+        guard tornDown else { return }
+
+        eventEmitter.emit(ConnectionErrorEvent(
+            message: message,
+            documentId: documentId,
+            messageType: "syncStep1",
+            detail: .object([
+                "code": .string(JsBaoErrorCode.documentFormatMismatch.rawValue),
+                "declared": .number(Double(declared)),
+                "actual": .number(Double(actual)),
+            ])
+        ))
+        eventEmitter.emit(DocumentFormatMismatchEvent(
+            documentId: documentId,
+            declared: declared,
+            actual: actual,
+            error: error
+        ))
+    }
+
+    /// Refuse ONE document because the platform no longer serves its format:
+    /// a large document (`documentFormat: 2`). The same document-scoped
+    /// teardown as a format disagreement — an open waiting on it fails, a
+    /// document already open is closed under the app, nothing more is sent
+    /// for it on this connection, and its local store is left as it was.
+    func refuseUnsupportedDocumentFormat(
+        _ documentId: String,
+        error: JsBaoError,
+        messageType: String? = nil,
+        detail: JSONValue? = nil
+    ) async {
+        let tornDown = await tearDownRefusedDocument(
+            documentId, error: error, reason: "its format is no longer served"
+        )
+        guard tornDown else { return }
+        eventEmitter.emit(ConnectionErrorEvent(
+            message: error.message,
+            documentId: documentId,
+            messageType: messageType,
+            detail: detail ?? .object([
+                "code": .string(JsBaoErrorCode.documentFormatUnsupported.rawValue),
+            ])
+        ))
+    }
+
+    /// The teardown both refusals share. Answers whether this call tore the
+    /// document down; `false` — the document was not held, or was already
+    /// refused — means only a waiting open was failed.
+    private func tearDownRefusedDocument(
+        _ documentId: String, error: JsBaoError, reason: String
+    ) async -> Bool {
         // The refusal is CLAIMED before any waiting open is released. Failing the
         // wait resumes the open's task, and its abort path removes the document
         // it had registered — concurrently, since nothing here is actor-isolated.
@@ -6170,13 +7281,10 @@ public final class JsBaoClient: @unchecked Sendable {
                 "[#3764] format refusal not acted on (not held, or already refused):",
                 documentId
             )
-            return
+            return false
         }
 
-        logger.error(
-            "[#3764] Document format disagreement: the platform serves",
-            documentId, "as format", actual, "and this client opened it as", declared
-        )
+        logger.error("[#3764] Document refused:", documentId, "—", reason)
 
         // Nothing may keep re-syncing a document the room refuses.
         clearSyncWatchdog(documentId)
@@ -6185,7 +7293,6 @@ public final class JsBaoClient: @unchecked Sendable {
         // this client, and the durable pending log is what carries those writes
         // to the open that agrees.
         discardQueuedOutboundUpdates(documentId: documentId)
-        format2State.coordinator?.unbind(documentId: documentId)
         disconnectFromSharedModels(documentId: documentId)
         // A document opened with `retainLocal: false` evicts at close, and
         // `CloseDocumentOptions()` does not stop it: that setting says "do not
@@ -6205,23 +7312,7 @@ public final class JsBaoClient: @unchecked Sendable {
         // already run, so the open's own abort finds nothing left to remove and
         // cannot race it.
         failAwaitingOpen(documentId, error: error)
-
-        eventEmitter.emit(ConnectionErrorEvent(
-            message: message,
-            documentId: documentId,
-            messageType: "syncStep1",
-            detail: .object([
-                "code": .string(JsBaoErrorCode.documentFormatMismatch.rawValue),
-                "declared": .number(Double(declared)),
-                "actual": .number(Double(actual)),
-            ])
-        ))
-        eventEmitter.emit(DocumentFormatMismatchEvent(
-            documentId: documentId,
-            declared: declared,
-            actual: actual,
-            error: error
-        ))
+        return true
     }
 
     func handleWebSocketMessage(_ text: String) async {
@@ -6289,6 +7380,32 @@ public final class JsBaoClient: @unchecked Sendable {
                         + "opened it as format \(declared)."
             )
 
+        case "error" where json["code"] as? String
+                == JsBaoErrorCode.documentFormatUnsupported.rawValue && roomId != nil:
+            // The platform no longer serves this document's format (a large
+            // document). A document-scoped teardown, as for a mismatch: an open
+            // waiting on it fails with the typed error instead of timing out,
+            // nothing more is sent for it, and its local store is kept.
+            let documentId = roomId ?? ""
+            logger.warn("Document format unsupported:", documentId, json["message"] as? String ?? "")
+            await refuseUnsupportedDocumentFormat(
+                documentId,
+                error: documentFormatUnsupported(
+                    documentId: documentId, message: json["message"] as? String
+                ),
+                messageType: json["messageType"] as? String,
+                detail: errorFrameDetail(detail: json["detail"], code: json["code"] as? String)
+            )
+
+        case _ where Self.isRecordLogFrame(
+            type: action, messageType: json["messageType"] as? String, code: json["code"] as? String
+        ):
+            // A record-log (format-3) document's conversation: every `record.*`
+            // frame, and every error answering one, goes to its session.
+            if let frame = try? JSONValue.typedRow(from: json, subject: "A record frame") {
+                await routeRecordLogFrame(frame)
+            }
+
         case "error":
             // Server-side rejection of something this client sent (bad frame,
             // permission failure, invalid message). JS surfaces it as
@@ -6305,52 +7422,6 @@ public final class JsBaoClient: @unchecked Sendable {
                 messageType: json["messageType"] as? String,
                 detail: detail
             ))
-            // #3436 — an upgrade refusal is a permanent answer about this
-            // client build, not a fault on one frame. It is the room's last
-            // word before close 4426, so an open still waiting for this
-            // document's sync has to be failed here: nothing else will ever
-            // arrive for it.
-            if json["code"] as? String == JsBaoErrorCode.clientUpgradeRequired.rawValue,
-               let documentId = roomId {
-                logger.warn(
-                    "[format2] refused by the room: this client build cannot read",
-                    documentId
-                )
-                failAwaitingOpen(documentId, error: JsBaoError(
-                    code: .clientUpgradeRequired,
-                    message: json["message"] as? String
-                        ?? "This client is too old to read document \(documentId).",
-                    details: ["documentId": .string(documentId)]
-                ))
-            }
-
-        case "epoch.info":
-            // #3436 — the room's answer for a large document: which epoch it
-            // is on, what it has sealed, and what base it can offer. It is
-            // also where a client whose local row said nothing learns that
-            // this document is large at all.
-            await handleEpochInfoFrame(json)
-
-        case "update.ack":
-            // #3436 — the server's contiguous high-water mark for this
-            // client's sequences, and the only thing that prunes the durable
-            // pending-op log.
-            handleUpdateAckFrame(json)
-
-        case "epoch.seal", "epoch.resync":
-            // #3436, behavior 30 — the room rotated or replaced the epoch this
-            // client's overlay belongs to. Held and stopped: following the
-            // seal needs the sealed chain, which is #3437's. Reads keep
-            // answering and the pending log is kept. A `resync` at the epoch
-            // this client is already on is the one exception — it asks for
-            // self-contained state, which this answers with the whole overlay.
-            await handleEpochSealFrame(json)
-
-        case "snapshot.ready", "epoch.grants":
-            // #3436 — a new base finished building, or fresh grants arrived.
-            // Recorded for the next handshake and for a load in flight;
-            // neither moves anything on its own.
-            handleSnapshotInfoFrame(json)
 
         case "availability":
             // Document-availability push: carries the server's view of whether
@@ -6413,11 +7484,6 @@ public final class JsBaoClient: @unchecked Sendable {
                         documentId: roomId,
                         serverStateVectorBase64: stateVectorB64
                     ) else { return }
-                // #3436 — the answer is this document's local state under
-                // another name, so a held large document keeps it rather than
-                // sending it. Kept: the room asked, and it is owed an answer
-                // the moment the hold releases.
-                if client.holdKeeps(roomId, frame: responseMsg) { return }
                 try? await client.wsManager.send(responseMsg)
             }
 
@@ -6429,15 +7495,21 @@ public final class JsBaoClient: @unchecked Sendable {
             // it at the top of `handleUpdate` for the same reason.
             noteSyncStep2Received(roomId)
             if let update = json["update"] as? String {
-                documentManager.handleRemoteUpdate(documentId: roomId, updateBase64: update)
+                if let data = Data(base64Encoded: update) {
+                    applyRemoteUpdate(roomId, data: data, frame: "syncStep2")
+                } else {
+                    documentManager.handleRemoteUpdate(documentId: roomId, updateBase64: update)
+                }
             } else if let updateUrl = json["updateUrl"] as? String {
                 // Payloads over the server's MAX_UPDATE_SIZE arrive as an R2
                 // URL instead of an inline update (JS parity: handleUpdate's
                 // updateUrl branch). Await the download here — the message
                 // pump processes frames sequentially, so the trailing
                 // syncComplete isn't handled until the full state is applied.
-                if let data = await downloadRemoteUpdate(from: updateUrl, documentId: roomId) {
-                    documentManager.handleRemoteUpdate(documentId: roomId, updateData: data)
+                if let data = await downloadRemoteUpdate(
+                    from: updateUrl, documentId: roomId, frame: "syncStep2"
+                ) {
+                    applyRemoteUpdate(roomId, data: data, frame: "syncStep2")
                 } else {
                     // The frame was received but its state never reached the
                     // document, so the syncComplete that ends this cycle must
@@ -6466,17 +7538,14 @@ public final class JsBaoClient: @unchecked Sendable {
             // leave the document in sync. JS resolves it identically
             // (`data.synced === false ? false : true`) — #2666.
             let syncedVerdict = (json["synced"] as? Bool) != false
-            // #3436 — a handshake that completed carrying no `epoch.info` is
-            // the room's answer "this is an ordinary document". Recording it
-            // is what lets this client keep Foundation's receive limit for
-            // this document in every later session.
-            if syncedVerdict { noteHandshakeWithoutEpochInfo(roomId) }
+            // A Yjs handshake that completed is the room's answer "this is an
+            // ordinary document". Recording it is what lets this client keep
+            // Foundation's receive limit for this document in every later
+            // session.
+            if syncedVerdict, !isRecordLogDocument(roomId) {
+                documentManager.noteDocumentFormat(roomId, 1)
+            }
             documentManager.handleSyncComplete(documentId: roomId, synced: syncedVerdict)
-            // #3437, behavior 20 — the joined epoch's content is in, so a
-            // judgement a move deferred can run: the writes it held back are
-            // weighed against the sealed overlays the catch-up applied, the
-            // survivors are stated and the withhold released.
-            if syncedVerdict { await completeDeferredReplayIfOwed(roomId) }
             reconcileUnsyncedAfterSync(documentId: roomId, synced: syncedVerdict)
             // The document converged after the app was told its sync was
             // failing, so the app hears that it can drop the warning (#3390).
@@ -6531,8 +7600,10 @@ public final class JsBaoClient: @unchecked Sendable {
             } else if let updateUrl = json["updateUrl"] as? String {
                 // Large broadcast updates (a peer's >MAX_UPDATE_SIZE upload)
                 // are relayed as an R2 URL, same as oversized syncStep2.
-                if let data = await downloadRemoteUpdate(from: updateUrl, documentId: roomId) {
-                    documentManager.handleRemoteUpdate(documentId: roomId, updateData: data)
+                if let data = await downloadRemoteUpdate(
+                    from: updateUrl, documentId: roomId, frame: "update"
+                ) {
+                    applyRemoteUpdate(roomId, data: data, frame: "update")
                 } else {
                     return
                 }
@@ -6607,57 +7678,6 @@ public final class JsBaoClient: @unchecked Sendable {
                   let perm = DocumentPermission(rawValue: permStr) else { return }
             documentManager.setPermission(roomId, permission: perm)
 
-        case "workflowStatus":
-            // workflowStatus messages are user-scoped, not document-scoped —
-            // the server's WorkflowStatusPayload has no `documentId` /
-            // `roomId`. The previous handler `guard let roomId` dropped
-            // every message before it could be delivered. Decode the full
-            // payload (matching JS) and route to the apply flow if needed.
-            let event = WorkflowStatusEvent(
-                workflowKey: json["workflowKey"] as? String ?? "",
-                workflowId: json["workflowId"] as? String ?? "",
-                runKey: json["runKey"] as? String ?? "",
-                runId: json["runId"] as? String ?? "",
-                status: json["status"] as? String ?? "",
-                output: json["output"] is NSNull ? nil : json["output"],
-                error: json["error"] as? String,
-                errorCode: json["errorCode"] as? String,
-                skipReason: json["skipReason"] as? String,
-                contextDocId: json["contextDocId"] as? String,
-                needsApply: json["needsApply"] as? Bool ?? false,
-                meta: (json["meta"] as? [String: Any]).flatMap { try? JSONValue.typedRow(from: $0, subject: "workflowStatus meta") },
-                startedByUserId: json["startedByUserId"] as? String
-            )
-            eventEmitter.emit(event)
-            // If the workflow needs client-side apply and a handler is
-            // registered via `define(...)`, run the claim → apply → confirm
-            // flow. Terminal states are delivered to callers purely through
-            // the `.workflowStatus` event above — `workflows.waitFor` (#1975)
-            // subscribes to it (and reconciles on reconnect) rather than
-            // relying on a client-side terminal dispatch.
-            if event.needsApply {
-                Task { [weak self] in
-                    await self?.workflows.handleApplyEvent(event)
-                }
-            }
-
-        case "workflowStarted":
-            // Server-pushed start notification. This is the JS source of
-            // truth for `workflowStarted` (see `handleWorkflowStartedMessage`
-            // in `src/client/JsBaoClient.ts`, which emits the full frame).
-            // Read every field JS carries directly off the inbound frame;
-            // optional fields stay nil when the frame omits them.
-            let startedEvent = WorkflowStartedEvent(
-                workflowKey: json["workflowKey"] as? String ?? "",
-                runId: json["runId"] as? String ?? "",
-                workflowId: json["workflowId"] as? String,
-                runKey: json["runKey"] as? String,
-                instanceId: json["instanceId"] as? String,
-                contextDocId: json["contextDocId"] as? String,
-                meta: (json["meta"] as? [String: Any]).flatMap { try? JSONValue.typedRow(from: $0, subject: "workflowStarted meta") }
-            )
-            eventEmitter.emit(startedEvent)
-
         case "notification":
             // Server-pushed live mirror of a durable in-app notification
             // (#779 / #1601). JS emits a fully-typed `NotificationEvent`
@@ -6676,6 +7696,34 @@ public final class JsBaoClient: @unchecked Sendable {
                 createdAt: json["createdAt"] as? String ?? ""
             )
             eventEmitter.emit(notificationEvent)
+
+        case "document:access-request-created", "db3:access-request-created":
+            // An access request on a document this user owns (#5519); a db3
+            // request also sends the `db3:` frame, with the same fields. JS
+            // emits the frame under its own name; the typed struct mirrors it.
+            // A frame missing a required field is dropped, not half-emitted.
+            guard let event = try? JSONCoding.decode(DocumentAccessRequestCreatedEvent.self, from: json) else {
+                logger.warn("Dropping \(action) frame: a required field is missing")
+                break
+            }
+            if action == "db3:access-request-created" {
+                eventEmitter.emit(Db3AccessRequestCreatedEvent(event))
+            } else {
+                eventEmitter.emit(event)
+            }
+
+        case "document:access-request-resolved", "db3:access-request-resolved":
+            // An access request was approved or denied (#5519): sent to the
+            // requester and to every owner. Decoded and dropped as above.
+            guard let event = try? JSONCoding.decode(DocumentAccessRequestResolvedEvent.self, from: json) else {
+                logger.warn("Dropping \(action) frame: a required field is missing")
+                break
+            }
+            if action == "db3:access-request-resolved" {
+                eventEmitter.emit(Db3AccessRequestResolvedEvent(event))
+            } else {
+                eventEmitter.emit(event)
+            }
 
         case "meUpdated":
             // The me record carries app-defined custom fields, so the payload is
@@ -6717,6 +7765,9 @@ public final class JsBaoClient: @unchecked Sendable {
                 metadata = typed
             }
             let changedFields = json["changedFields"] as? [String]
+            // #5888 — the user lost their access to it: the last frame heard
+            // wins, so a grant heard before no longer stands.
+            if actionStr == "deleted" { _db3Lifecycle?.accessRevoked(docId) }
             await documentManager.applyDocumentMetadataUpdate(
                 documentId: docId,
                 metadata: metadata,
@@ -6724,12 +7775,6 @@ public final class JsBaoClient: @unchecked Sendable {
                 action: actionStr,
                 source: "server"
             )
-
-        case "db.change":
-            // Route to the matching databases.subscribe callback. Frames with
-            // no matching registration (arrived before register / after unsub)
-            // are debug-logged and dropped inside dispatch.
-            databases.subscriptionRegistry?.dispatch(json)
 
         case "auth_required", "auth_failed":
             // The server is telling us this connection's token is expiring or
@@ -6766,13 +7811,6 @@ public final class JsBaoClient: @unchecked Sendable {
             // background rotation the guard exists to catch.
             authController.applyServerPushedToken(pushed)
 
-        case "db.subscribed", "db.unsubscribed":
-            // Server-side ack. No client action — subscribe() returns a
-            // synchronous unsubscribe handle.
-            logger.debug("[db-sub] ack received", action,
-                         json["databaseId"] as? String ?? "",
-                         json["subscriptionKey"] as? String ?? "")
-
         case "channel.subscribed":
             // The server's ack for one channel: it carries the membership's
             // expiry, so store it on the held grant, then settle only that
@@ -6805,6 +7843,16 @@ public final class JsBaoClient: @unchecked Sendable {
                 functionKey: functionKey,
                 sentAt: json["sentAt"] as? String ?? ""
             ))
+
+        case "agentSession":
+            // A session the user owns or belongs to changed for them (JS
+            // `handleAgentSessionMessage`). Decoded whole; a frame that does
+            // not decode is logged and dropped, never emitted half-read.
+            guard let event = try? JSONCoding.decodeData(AgentSessionChangedEvent.self, from: Data(text.utf8)) else {
+                logger.warn("Dropping agentSession frame: it does not decode")
+                break
+            }
+            eventEmitter.emit(event)
 
         case "direct.message":
             // A function sent straight to this user or connection
@@ -6907,7 +7955,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// A no-op when no socket is open: the next connect carries the token in
     /// its handshake anyway, so there is nothing to queue.
     private func reauthenticateSocket(with token: String, previous: String?) async {
-        guard await wsManager.isSocketOpenAsync else { return }
+        guard await wsManager.isTransportOpenAsync else { return }
 
         // Both users have to be readable for this to be a *known* change of
         // identity. An unreadable claim on either side falls through to the
@@ -6924,7 +7972,7 @@ public final class JsBaoClient: @unchecked Sendable {
         guard let data = try? JSONSerialization.data(withJSONObject: frame),
               let text = String(data: data, encoding: .utf8) else { return }
         do {
-            try await wsManager.send(text)
+            try await wsManager.sendOnOpenSocket(text)
             logger.debug("Pushed refreshed token to the server")
         } catch {
             // The socket died between the check and the send. The reconnect
@@ -6937,8 +7985,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// The user a token identifies, or nil when it carries no usable claim.
     /// The derivation is `AuthController`'s, so "same user?" here answers the
     /// same way `getUserId()` does — including the canonical nested
-    /// `payload.user.userId` claim the server issues (#2657, audit item A11).
-    private static func userId(ofToken token: String) -> String? {
+    /// `payload.user.userId` claim the server issues (audit item A11).
+    static func userId(ofToken token: String) -> String? {
         AuthController.extractUserId(from: AuthController.parseJwtPayload(token: token))
     }
 
@@ -7015,8 +8063,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// What a flush owner's peek at its document's queue found.
     private enum OutboundFlushPeek {
         /// The queued updates to send - merged into ONE wire frame (JS
-        /// parity: `flushLocalUpdates` sends `Y.mergeUpdates(queued)`; #2584),
-        /// the whole queue whatever it weighs (#3559).
+        /// parity: `flushLocalUpdates` sends `Y.mergeUpdates(queued)`),
+        /// the whole queue whatever it weighs.
         case next([[UInt8]])
         /// Nothing queued — try to release ownership and clear the flag.
         case drained
@@ -7077,6 +8125,14 @@ public final class JsBaoClient: @unchecked Sendable {
             logger.debug("[outbound] ignoring zero-length update", documentId)
             return
         }
+        // A record-log (format-3) document carries no Yjs traffic: the room
+        // answers a Yjs frame for one with DOCUMENT_FORMAT_MISMATCH, which tears
+        // the document down. Its records travel as entries; a write into its
+        // Y.Doc is not one, and is dropped here.
+        if isRecordLogDocument(documentId) {
+            logger.debug("[outbound] not sending a Yjs update for record-log document", documentId)
+            return
+        }
         if documentManager.isReadOnly(documentId) {
             // The server would reject it, so don't spend a frame on it. The
             // edit stays in the local Y.Doc; JS marks nothing here either —
@@ -7135,13 +8191,6 @@ public final class JsBaoClient: @unchecked Sendable {
         }
         applyUnsyncedFlag(documentId, true, seq: markSeq)
 
-        // #3436 — note which of this client's local sequences this update
-        // covers, HERE and not where the frame is built: the queue merges a
-        // debounce window into one frame, so the frame that carries this
-        // window is the only frame those sequences will ever have. A no-op for
-        // an ordinary document.
-        noteLocalUpdateForLargeDocument(documentId)
-
         lock.withLock {
             var updates = pendingUpdates[documentId] ?? []
             updates.append(update)
@@ -7175,14 +8224,12 @@ public final class JsBaoClient: @unchecked Sendable {
     /// Everything queued while the transport was down goes out before any
     /// syncStep1 — including for `manual` documents, which the connect sweep
     /// deliberately skips and whose queue would otherwise drain only after a
-    /// `syncComplete` that may never come (#2664, C21; JS
+    /// `syncComplete` that may never come (C21; JS
     /// `flushAllLocalUpdates("ws-open")`).
     ///
-    /// It is a named path rather than a loop inside the connect handler
-    /// because a large document's hold has to cover it too (#3436): this runs
-    /// before any handshake frame exists, so it is the earliest door local
-    /// state can leave by. The per-document drain refuses a held document; the
-    /// batch stays queued for the release.
+    /// It runs before any handshake frame exists, so it is the earliest door
+    /// local state can leave by. The per-document drain refuses a document the
+    /// platform has refused; the batch is dropped there.
     func flushAllLocalUpdates(_ reason: String) async {
         let queuedDocIds = lock.withLock { Array(pendingUpdates.keys) }
         guard !queuedDocIds.isEmpty else { return }
@@ -7193,7 +8240,7 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Run outbound work for one document OFF the socket's receive loop, in
-    /// the order it was handed over (#3559).
+    /// the order it was handed over.
     ///
     /// `handleWebSocketMessage` is awaited by that loop, which takes one
     /// complete frame before it asks for the next — the same rule
@@ -7242,7 +8289,7 @@ public final class JsBaoClient: @unchecked Sendable {
         }
     }
 
-    /// Drain a document's queued updates to the socket (#2105).
+    /// Drain a document's queued updates to the socket.
     ///
     /// Two rules make the clear guard correct by construction:
     ///
@@ -7355,29 +8402,7 @@ public final class JsBaoClient: @unchecked Sendable {
                         "[#3764] dropping queued updates for a refused document", documentId
                     )
                     discardQueuedOutboundUpdates(documentId: documentId)
-                    format2State.coordinator?.forgetQueuedUpdates(documentId: documentId)
                     continue
-                }
-
-                // #3436 — a large document whose `epoch.info` has not been
-                // answered, or which is stopped pending a reload, may not put
-                // local state on the wire: the server would take it as the
-                // truth of an epoch this client has not been told it is on.
-                // Held, not dropped — the batch stays queued and the release
-                // flushes it, exactly as the classification hold below does.
-                if let reason = format2State.coordinator?.hold.reason(documentId) {
-                    logger.debug(
-                        "[format2] holding queued updates for", documentId, "—", reason
-                    )
-                    let retryAfterRequest: Bool = lock.withLock {
-                        guard outboundFlushOwner[documentId] == token else { return false }
-                        if outboundReflushRequested.remove(documentId) != nil { return true }
-                        outboundFlushOwner.removeValue(forKey: documentId)
-                        return false
-                    }
-                    if retryAfterRequest { continue }
-                    onOutboundFlushedForTest?(documentId)
-                    return
                 }
 
                 if documentManager.isLocalOnly(documentId) {
@@ -7392,11 +8417,6 @@ public final class JsBaoClient: @unchecked Sendable {
                     // ownership and decides the unsynced clear.
                     logger.debug("[outbound] dropping queued updates for local-only document", documentId)
                     lock.withLock { _ = pendingUpdates.removeValue(forKey: documentId) }
-                    // #3436 — the ack ledger holds one place per queued update
-                    // so a claim can count them; dropping the queue without
-                    // dropping its places would leave the two out of step, and
-                    // the next claim would count somebody else's updates.
-                    format2State.coordinator?.forgetQueuedUpdates(documentId: documentId)
                     continue
                 }
 
@@ -7448,11 +8468,6 @@ public final class JsBaoClient: @unchecked Sendable {
                 // (JS parity: `Y.mergeUpdates`; see `mergeUpdates` for why this
                 // matters to a cold server room - #2584).
                 let merged = documentManager.mergeUpdates(batch)
-                // #3436 — the frame claims the local sequences of the updates it
-                // MERGES, not of everything queued: a write can commit between
-                // this batch being taken and the frame being stamped, and a
-                // claim over that one would have the server acknowledge a write
-                // whose bytes are still in this queue.
                 let sent = await documentManager.sendLocalUpdate(
                     documentId: documentId, update: merged,
                     mergedUpdateCount: batch.count
@@ -7537,7 +8552,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// exchange — which re-delivers the local diff to the server — but that
     /// path never cleared the flag, so `documents.evict`/`evictAll` kept
     /// rejecting the doc without `force` even after the server had caught up
-    /// (issue #1979 codex review).
+    /// (a Codex review finding).
     ///
     /// So once a sync completes, clear the flag — but only when no fresh edit
     /// is still queued for send. A non-empty `pendingUpdates` means a real
@@ -7549,7 +8564,7 @@ public final class JsBaoClient: @unchecked Sendable {
     /// flush — literally the same guard, `unsyncedClearDecisionLocked` — so the
     /// two decision sites can't drift apart.
     ///
-    /// Then flushes anything still queued (#2105). Updates whose send failed
+    /// Then flushes anything still queued. Updates whose send failed
     /// now stay in `pendingUpdates` instead of being dropped, so without this
     /// trigger the queue would stay non-empty forever, the guard above would
     /// never clear, and the flag would stick after a resync — the #1979 bug in
@@ -7561,8 +8576,8 @@ public final class JsBaoClient: @unchecked Sendable {
     /// itself — it records the request in `outboundReflushRequested` and the
     /// owner makes another pass. The owner may be parked in the very send whose
     /// failure this retry exists to repair, and a failed send releases ownership
-    /// without retrying, so a dropped request would strand the batch (PR #2396
-    /// review).
+    /// without retrying, so a dropped request would strand the batch (a
+    /// review finding).
     func reconcileUnsyncedAfterSync(documentId: String, synced: Bool = true) {
         // Only a SUCCESSFUL round-trip may clear the unsynced-local-writes
         // flag. `documents.evict` consults that flag before dropping a
@@ -7628,10 +8643,13 @@ extension JsBaoClient: WebSocketManagerDelegate {
         if let token = authController.getToken() {
             queryItems.append(URLQueryItem(name: "token", value: token))
         }
-        components.queryItems = queryItems
 
         var headers = options.wsHeaders
         headers["X-Global-Admin-App-Id"] = options.globalAdminAppId
+        // The socket reports the version and platform as URL parameters, as a
+        // browser socket must.
+        queryItems.append(contentsOf: versionHeaders.queryItems)
+        components.queryItems = queryItems
 
         let url = components.url ?? URL(string: options.wsUrl)!
         return (url, headers)
@@ -7639,6 +8657,7 @@ extension JsBaoClient: WebSocketManagerDelegate {
 
     func webSocketManagerOnStatusChange(_ status: ConnectionStatus) {
         eventEmitter.emit(StatusChangedEvent(status: status))
+        _db3Lifecycle.connectionChanged()
         if status == .connected {
             lock.withLock {
                 lastOnlineAt = Date()
@@ -7657,23 +8676,17 @@ extension JsBaoClient: WebSocketManagerDelegate {
         documentManager.markAllOpenDocumentsUnsynced()
     }
 
+    /// The socket opened: the handshake's token was accepted, so a close from
+    /// here on is not a refusal of it. The client is still connecting
+    /// until the server's `ready`.
+    func webSocketManagerOnSocketOpened() {
+        wsAuthRecovery.noteConnected()
+    }
+
+    /// The server's `ready` arrived: the user's events reach this
+    /// client from now on, so the open-time work runs now.
     func webSocketManagerOnConnected() {
         logger.log("WebSocket connected")
-        // #3436, decision 3436-SO-02 — every large document is held again the
-        // moment a socket comes up, BEFORE anything below can put local state
-        // on it. The bind's hold covers a document's first open; it releases on
-        // that open's `epoch.info` and never comes back, so a client that
-        // joined, went away, was edited offline and reconnected would flush
-        // those edits in `flushAllLocalUpdates("ws-open")` — against an epoch
-        // the room may have rotated or replaced since, which is the escape the
-        // hold exists for. Held, not dropped: this connection's `epoch.info`
-        // releases them, in order.
-        //
-        // Synchronous, and first: the flush is scheduled further down this same
-        // method, so a hold taken after it would be taken after the writes it
-        // was for had already gone out.
-        holdLargeDocumentsForNewConnection()
-        wsAuthRecovery.noteConnected()
         // A fresh socket gets a fresh claim: whatever a stalled document spent
         // on the previous connection says nothing about this one (#3390).
         lock.withLock { syncStallReconnectOnThisConnection = false }
@@ -7689,6 +8702,13 @@ extension JsBaoClient: WebSocketManagerDelegate {
         // document sweep, as in JS, so a listener is back on its channels as
         // early as the socket allows; the sends are dispatched, not awaited.
         resubscribeChannelsOnConnect()
+        // An index list owed by a failed read is read again (#5101).
+        db3IndexRefresher?.socketOpened()
+        // Once the app has asked, each reconnect refetches the version policy
+        // after a random wait.
+        appVersionController.socketReconnected()
+        // The bound db3s' vector models are fetched, trained or uploaded as they want (#5230).
+        runDb3VectorModels()
         // Re-subscribe to all open documents — except the ones JS's connect
         // sweep skips too (`JsBaoClient.ts` `[CONNECT] Evaluating sync`):
         //
@@ -7730,12 +8750,9 @@ extension JsBaoClient: WebSocketManagerDelegate {
             // document deleted (or revoked) while this client was away leaves
             // the device even for an app that only ever calls the subset
             // listings (#2852). Rate-limited inside `DocumentsAPI`.
-            await documents.reconcileScopeAtConnect()
+            await _documents.reconcileScopeAtConnect()
             // Flush analytics
             await analyticsQueue.flush()
-            // Re-issue db.subscribe for every live database subscription —
-            // the server-side connection mapping is dropped on disconnect.
-            databases.resubscribeAll()
         }
     }
 
@@ -7751,6 +8768,11 @@ extension JsBaoClient: WebSocketManagerDelegate {
 
     func webSocketManagerOnClose(code: Int?, reason: String?) {
         logger.log("WebSocket closed:", code ?? 0, reason ?? "")
+        // The server refused this client as outdated. Recorded before the
+        // transport asks whether to reconnect, which it does right after this.
+        if code == WsAuthRecovery.updateRequiredCloseCode {
+            appVersionController.noteRefusal()
+        }
         // No syncComplete is coming for any in-flight cycle on a dead
         // transport; release every claim so the reconnect path's
         // `startNetworkSync` sweep isn't refused (JS parity: ws-close calls
@@ -7776,6 +8798,8 @@ extension JsBaoClient: WebSocketManagerDelegate {
         // disconnect emits its own at initiation. Emitting again delivered two
         // per close (#2663).
         eventEmitter.emit(ConnectionCloseEvent(code: code, reason: reason))
+        // Every record-log session drops what was in flight on this socket.
+        recordLogDisconnected()
         // A 4401 close, or any close before the socket ever opened, means the
         // access token was rejected: refresh it and reconnect, rather than
         // retrying the same expired token until the app is relaunched (#2637).
@@ -7835,6 +8859,10 @@ extension JsBaoClient: WebSocketManagerDelegate {
 
     func webSocketManagerOnDisconnectInitiated() {
         logger.debug("WebSocket disconnect initiated")
+        // Every record-log session drops what was in flight on the socket that
+        // is going away, here and not only on the close callback: a disconnect
+        // that resolves on its timeout never delivers that callback.
+        recordLogDisconnected()
         // Report the disconnect as it starts rather than up to the 500ms close
         // timeout later, and stop claiming the open documents are synced
         // (JS parity: `handleDisconnectInitiated`, #2663).
@@ -7869,17 +8897,6 @@ extension JsBaoClient: WebSocketManagerDelegate {
     }
 
     func webSocketManagerShouldReconnect(code: Int?, reason: String?) -> Bool {
-        // #3436 — the one close code that is a permanent answer rather than a
-        // fault. The room sends 4426 after `CLIENT_UPGRADE_REQUIRED` because
-        // this client BUILD cannot read the document; reconnecting produces
-        // the identical refusal, for ever, as fast as the backoff allows.
-        // Every other code below is a condition that can change.
-        if code == Format2Transport.upgradeRequiredCloseCode {
-            logger.warn(
-                "[format2] not reconnecting: the room refused this client build (4426)"
-            )
-            return false
-        }
         // No close-code allowlist, matching the JS client's `shouldReconnect`
         // (#2660). The codes this used to suppress on were the wrong ones: the
         // server sends 4401 for an expired token, sends 4001 only alongside
@@ -7889,13 +8906,34 @@ extension JsBaoClient: WebSocketManagerDelegate {
         // it was there to prevent. A token that is genuinely dead is refreshed
         // by the auth paths — the `auth_required` / `auth_failed` handling
         // above, and the handshake recovery — not by giving up on the socket.
-        return networkingAllowed()
+        // The one exception is a refusal of this client as outdated, which
+        // holds every automatic connect until a policy fetch releases it.
+        return networkingAllowed() && !appVersionController.isRefused
+    }
+
+    func webSocketManagerAutomaticConnectHeld() -> Bool {
+        appVersionController.isRefused
+    }
+}
+
+// MARK: - Version policy release
+
+extension JsBaoClient {
+    /// A policy fetch released a refusal: reconnect when the app still wants
+    /// a connection, networking is allowed and the socket is down.
+    func reconnectAfterVersionRelease() {
+        Task { [weak self] in
+            guard let self, !self.lock.withLock({ self.isDestroyed }) else { return }
+            guard await self.wsManager.desiredConnection, self.networkingAllowed(),
+                  !self.wsManager.isConnected, !self.wsManager.isConnecting else { return }
+            try? await self.wsManager.connect()
+        }
     }
 }
 
 // MARK: - WsAuthRecoveryHost
 
-/// What the WebSocket auth recovery acts on (#2637). The policy itself holds
+/// What the WebSocket auth recovery acts on. The policy itself holds
 /// the attempt budget and the decision; this is the part that touches the
 /// client's auth, transport and event surfaces.
 extension JsBaoClient: WsAuthRecoveryHost {
@@ -7946,7 +8984,10 @@ extension JsBaoClient: WsAuthRecoveryHost {
 
 /// Scoped helper for operations on a single document.
 public final class DocumentContext: @unchecked Sendable {
-    public let documentId: String
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
+    public var documentId: String { _documentId }
+    private let _documentId: String
     private weak var client: JsBaoClient?
     private let blobManager: BlobManager
     private let transport: any Transport
@@ -7958,12 +8999,14 @@ public final class DocumentContext: @unchecked Sendable {
         blobManager: BlobManager,
         transport: any Transport
     ) {
-        self.documentId = documentId
+        self._documentId = documentId
         self.client = client
         self.blobManager = blobManager
         self.transport = transport
     }
 
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func open(options: OpenDocumentOptions = OpenDocumentOptions()) async throws -> YDocument {
         guard let client = client else { throw JsBaoError(code: .unavailable) }
         return try await client.openDocument(documentId, options: options)
@@ -7975,13 +9018,15 @@ public final class DocumentContext: @unchecked Sendable {
     /// The result matters because the eviction is conditional: an
     /// `options.evictLocal` close keeps the local data, and reports
     /// `evicted: false`, while the server is still missing this client's
-    /// writes (#961, #2668). Returning `Void` here made a skipped eviction
-    /// unobservable through the handle (#3589) — `client.closeDocument` and
+    /// writes. Returning `Void` here made a skipped eviction
+    /// unobservable through the handle — `client.closeDocument` and
     /// `DocumentsAPI.close` both propagate the verdict, and this is the third
     /// Swift path to the same call.
     ///
     /// With the client gone there is nothing to close and nothing was
     /// evicted, which is the nil handling `DocumentsAPI.close` already uses.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     @discardableResult
     public func close(
         options: CloseDocumentOptions = CloseDocumentOptions()
@@ -7991,14 +9036,20 @@ public final class DocumentContext: @unchecked Sendable {
     }
 
     /// The open `YDocument`, or `nil` when the document is not open.
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public var doc: YDocument? {
         client?.getDoc(documentId)
     }
 
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func isSynced() -> Bool {
         client?.isSynced(documentId) ?? false
     }
 
+    /// - Stability: production
+    @available(*, deprecated, message: "The documents family is deprecated: build on db3 (client.db3). It keeps answering until a later removal project. (api-surface-stability)")
     public func blobs() -> DocumentBlobContext {
         DocumentBlobContext(
             documentId: documentId,
@@ -8061,4 +9112,21 @@ private struct ChannelSubscribeFrame: Encodable, Sendable {
 private struct ChannelUnsubscribeFrame: Encodable, Sendable {
     let type = "channel.unsubscribe"
     let channel: String
+}
+
+// MARK: - Resource-held db3s
+
+extension JsBaoClient {
+    /// Note that `id` names a db3 a resource holds (an agent session's),
+    /// before it is subscribed, so its subscribe asks the documents
+    /// API nothing: its format is 3 (a db3), so no format lookup is made, and
+    /// its open takes `reader`, the permission every caller who may open it
+    /// holds, instead of reading the document's info. The session's `get`
+    /// has already refused a caller who may not read it, and the room's open
+    /// answers the rest.
+    func noteResourceHeldDb3(_ id: String) {
+        recordLogState.noteResolvedFormat(id, RecordLogTransport.documentFormat)
+        documentManager.noteDocumentFormat(id, RecordLogTransport.documentFormat)
+        documentManager.noteResourceHeld(id)
+    }
 }

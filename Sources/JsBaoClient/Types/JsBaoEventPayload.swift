@@ -18,8 +18,8 @@ import Foundation
 /// be observed under a key it is never delivered on — the mistake that made a
 /// mis-annotated `events.on` handler silently never fire.
 ///
-/// Every event the client emits has exactly one conforming payload type. Since
-/// #2367 there are no exceptions — the never-emitted `auth` /
+/// Every event the client emits has exactly one conforming payload type.
+/// There are no exceptions — the never-emitted `auth` /
 /// `blobsUploadQueued` cases and the Swift-only `remoteUpdate` case were
 /// removed along with the rest of the deprecated surface.
 public protocol JsBaoEventPayload: Sendable {
@@ -206,7 +206,7 @@ public struct OfflineAuthRevokedEvent: JsBaoEventPayload {
 /// Payload for `.blobsQueueDrained`. Fires when the blob upload queue has no
 /// remaining work. Carries no fields.
 ///
-/// Field-level divergence from JS (#2241): the JS client's payload carries a
+/// Field-level divergence from JS: the JS client's payload carries a
 /// `timestamp` (epoch milliseconds) that the Swift emit sites do not produce.
 /// The Swift struct stays field-free until the Swift queue has a timestamp to
 /// report.
@@ -291,36 +291,20 @@ extension DocumentSyncStateChangedEvent: JsBaoEventPayload {
     // and use the stream for subsequent changes.
 }
 
-extension DocumentSnapshotLoadEvent: JsBaoEventPayload {
-    public static var eventKey: JsBaoEvent { .documentSnapshotLoad }
-    // Deliberately not replayable, for the reason
-    // `DocumentSyncStateChangedEvent` is not: retention is one slot per event
-    // key and this payload is scoped to a DOCUMENT, so a replay would hand
-    // back whichever document last loaded a base.
-}
-
 extension DocumentWriteRefusedEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .documentWriteRefused }
-    // Deliberately not replayable, for the reason `DocumentSnapshotLoadEvent`
-    // is not: retention is one slot per event key and this payload is scoped
-    // to a DOCUMENT and a RECORD, so a replay would hand back whichever write
+    // Deliberately not replayable, for the reason
+    // `DocumentSyncStateChangedEvent` is not: retention is one slot per event
+    // key and this payload is scoped to a DOCUMENT and a RECORD, so a replay would hand back whichever write
     // was refused last, frequently not the one the consumer cares about.
 }
 
 extension DocumentFormatMismatchEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .documentFormatMismatch }
-    // Deliberately not replayable, for the reason `DocumentSnapshotLoadEvent`
-    // is not: retention is one slot per event key and this payload is scoped to
-    // a DOCUMENT, so a replay would hand back whichever document was last
-    // refused.
-}
-
-extension DocumentOfflineWritesResolvedEvent: JsBaoEventPayload {
-    public static var eventKey: JsBaoEvent { .documentOfflineWritesResolved }
-    // Deliberately not replayable, for the reason `DocumentSnapshotLoadEvent`
-    // is not: retention is one slot per event key and this payload is scoped
-    // to a DOCUMENT and one replay of it, so a replay would hand back
-    // whichever document last resolved its offline writes.
+    // Deliberately not replayable, for the reason
+    // `DocumentSyncStateChangedEvent` is not: retention is one slot per event
+    // key and this payload is scoped to a DOCUMENT, so a replay would hand
+    // back whichever document was last refused.
 }
 
 extension SyncEvent: JsBaoEventPayload {
@@ -364,14 +348,6 @@ extension NotificationEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .notification }
 }
 
-extension WorkflowStatusEvent: JsBaoEventPayload {
-    public static var eventKey: JsBaoEvent { .workflowStatus }
-}
-
-extension WorkflowStartedEvent: JsBaoEventPayload {
-    public static var eventKey: JsBaoEvent { .workflowStarted }
-}
-
 extension ChannelMessageEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .channelMessage }
 }
@@ -382,6 +358,10 @@ extension ChannelSubscribeFailedEvent: JsBaoEventPayload {
 
 extension DirectMessageEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .directMessage }
+}
+
+extension AgentSessionChangedEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .agentSessionChanged }
 }
 
 extension BlobUploadProgressEvent: JsBaoEventPayload {
@@ -410,6 +390,14 @@ extension CacheUpdatedEvent: JsBaoEventPayload {
 
 extension CacheUpdateFailedEvent: JsBaoEventPayload {
     public static var eventKey: JsBaoEvent { .cacheUpdateFailed }
+}
+
+extension DocumentAccessRequestCreatedEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .documentAccessRequestCreated }
+}
+
+extension DocumentAccessRequestResolvedEvent: JsBaoEventPayload {
+    public static var eventKey: JsBaoEvent { .documentAccessRequestResolved }
 }
 
 // MARK: - The conformance table
@@ -446,10 +434,8 @@ let allJsBaoEventPayloadTypes: [any JsBaoEventPayload.Type] = [
     PendingCreateFailedEvent.self,
     DocumentMetadataChangedEvent.self,
     DocumentSyncStateChangedEvent.self,
-    DocumentSnapshotLoadEvent.self,
     DocumentWriteRefusedEvent.self,
     DocumentFormatMismatchEvent.self,
-    DocumentOfflineWritesResolvedEvent.self,
     SyncEvent.self,
     SyncPerfEvent.self,
     AwarenessEvent.self,
@@ -461,11 +447,10 @@ let allJsBaoEventPayloadTypes: [any JsBaoEventPayload.Type] = [
     MeUpdatedEvent.self,
     MeUpdateFailedEvent.self,
     NotificationEvent.self,
-    WorkflowStatusEvent.self,
-    WorkflowStartedEvent.self,
     ChannelMessageEvent.self,
     ChannelSubscribeFailedEvent.self,
     DirectMessageEvent.self,
+    AgentSessionChangedEvent.self,
     BlobUploadProgressEvent.self,
     BlobUploadCompletedEvent.self,
     BlobUploadFailedEvent.self,
@@ -474,6 +459,19 @@ let allJsBaoEventPayloadTypes: [any JsBaoEventPayload.Type] = [
     BlobsQueueDrainedEvent.self,
     CacheUpdatedEvent.self,
     CacheUpdateFailedEvent.self,
+    Db3StateEvent.self,
+    Db3ReadyEvent.self,
+    Db3RowsEvent.self,
+    Db3WriteRefusedEvent.self,
+    Db3EvictedEvent.self,
+    Db3GoneEvent.self,
+    Db3ErrorEvent.self,
+    Db3CreatedEvent.self,
+    Db3CreateFailedEvent.self,
+    DocumentAccessRequestCreatedEvent.self,
+    DocumentAccessRequestResolvedEvent.self,
+    Db3AccessRequestCreatedEvent.self,
+    Db3AccessRequestResolvedEvent.self,
 ]
 
 /// The event keys that have no payload type, and why.

@@ -31,19 +31,48 @@ public struct UserProfile: Decodable, Sendable, Equatable {
     public let avatarUrl: String?
     public let appRole: String
     public let appId: String
+    /// The user's own properties, as the app's `user-properties.toml` lets a
+    /// client read its own row: every field whose `client` is not `none`,
+    /// with the schema's defaults applied. `[:]` when the app declares none,
+    /// and for a profile cached before the field existed.
+    public let properties: [String: JSONValue]
+
+    private enum CodingKeys: String, CodingKey {
+        case userId, email, name, avatarUrl, appRole, appId, properties
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        userId = try c.decode(String.self, forKey: .userId)
+        email = try c.decode(String.self, forKey: .email)
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+        avatarUrl = try c.decodeIfPresent(String.self, forKey: .avatarUrl)
+        appRole = try c.decode(String.self, forKey: .appRole)
+        appId = try c.decode(String.self, forKey: .appId)
+        properties = try c.decodeIfPresent([String: JSONValue].self, forKey: .properties) ?? [:]
+    }
 }
 
 /// Parameters for `me.update(params:)`. Mirrors JS `UpdateMeParams`.
 ///
 /// `avatarUrl` is clearable: pass `.value(url)` to set, `.clear` to remove the
 /// current avatar (JS `avatarUrl: null`), or omit (`nil`) to leave it unchanged.
+///
+/// `properties` sets the caller's own property values by name; `.null`
+/// clears a field so its default shows again, and a stringset is replaced
+/// whole. Only fields whose `client` is `self-write` or `self-write-members`
+/// can be written: any other throws `HttpError` with status 403 and
+/// `serverCode` `USER_PROPERTY_NOT_CLIENT_WRITABLE`, and nothing in the
+/// update is written.
 public struct UpdateMeParams: Encodable, Sendable {
     public var name: String?
     public var avatarUrl: Updatable<String>?
+    public var properties: [String: JSONValue]?
 
-    public init(name: String? = nil, avatarUrl: Updatable<String>? = nil) {
+    public init(name: String? = nil, avatarUrl: Updatable<String>? = nil, properties: [String: JSONValue]? = nil) {
         self.name = name
         self.avatarUrl = avatarUrl
+        self.properties = properties
     }
 }
 
@@ -78,7 +107,7 @@ public enum AvatarContentType: String, Sendable, Equatable, CaseIterable {
 /// - `localOnly` — return only docs with local data on this device, ignoring
 ///   the server entirely.
 /// - `serverTimeout` — bound on a server fetch, a `TimeInterval` in
-///   **seconds** (default `10`; renamed from `serverTimeoutMs: Int` in #2367,
+///   **seconds** (default `10`; renamed from `serverTimeoutMs: Int`,
 ///   which was 10000 milliseconds). Exceeding it throws
 ///   `JsBaoError(code: .listTimeout)`; `0` means unbounded, matching how the
 ///   client's cache reads the same option. The wire field is still `timeoutMs`.
@@ -93,7 +122,7 @@ public enum AvatarContentType: String, Sendable, Equatable, CaseIterable {
 /// - `forward` — chronological order (oldest first); sent as `forward=true`.
 ///
 /// `limit` / `cursor` are ignored on any local path (the local cache isn't
-/// paginated) and the returned `cursor` is `nil` there.
+/// paginated) and the returned `nextCursor` is `nil` there.
 ///
 /// `cursor`/`limit`/`tag` stay as positional params on `ownedDocuments(...)`
 /// (they already existed); this struct carries only the additive fields.
@@ -105,9 +134,10 @@ public struct MeOwnedDocumentsOptions: Sendable, Equatable {
     public var waitForLoad: WaitForLoadMode?
     public var forward: Bool?
 
-    /// `returnPage` was deprecated in #2360 and removed in #2367 — a runtime
+    /// `returnPage` was deprecated and removed — a runtime
     /// flag can't change a return type in Swift. Call
-    /// `me.ownedDocumentsPage(...)` for the `{ items, cursor }` page.
+    /// `me.ownedDocumentsPage(...)` for the `{ items, hasMore, nextCursor? }`
+    /// page.
     ///
     /// Note for anyone comparing option values: removing its private storage
     /// changed the synthesized `Equatable` — two options differing only in
@@ -143,8 +173,8 @@ public struct SharedDocument: Decodable, Sendable, Equatable {
     public let document: DocumentInfo
     /// Who granted access (the actor) — always present on shared rows.
     public let grantedBy: String
-    /// Always `"permission"`: the row is a direct, non-owner grant. #2951
-    /// removed the pending legacy invitation rows this list used to merge in.
+    /// Always `"permission"`: the row is a direct, non-owner grant — the
+    /// pending legacy invitation rows this list used to merge in were removed.
     public let source: String?
 
     private enum CodingKeys: String, CodingKey {
@@ -160,43 +190,32 @@ public struct SharedDocument: Decodable, Sendable, Equatable {
 }
 
 /// A page of shared documents. Mirrors JS `SharedDocumentListResult`
-/// (`{ items, cursor? }`, raw-JSON cursor). Decodes from either an `items`
-/// or legacy `documents` envelope key.
+/// (`{ items, hasMore, nextCursor? }`, raw-JSON cursor).
 public struct SharedDocumentListResult: Decodable, Sendable, Equatable {
     public let items: [SharedDocument]
-    /// Continuation token for the next page (#1316).
+    /// Continuation token for the next page.
     public let nextCursor: String?
-    /// True when a next page exists (#1316).
+    /// True when a next page exists.
     public let hasMore: Bool
-    /// Deprecated alias of `nextCursor` kept for one deprecation window
-    /// (#1316, #1982). Computed from `nextCursor` so the type's own
-    /// initializers never reference the deprecated declaration.
-    @available(*, deprecated, message: "Use nextCursor.")
-    public var cursor: String? { nextCursor }
 
     private enum CodingKeys: String, CodingKey {
-        case items, documents, cursor, nextCursor, hasMore
+        case items, nextCursor, hasMore
     }
 
     public init(
         items: [SharedDocument],
-        cursor: String? = nil,
         nextCursor: String? = nil,
         hasMore: Bool? = nil
     ) {
         self.items = items
-        let next = nextCursor ?? cursor
-        self.nextCursor = next
-        self.hasMore = hasMore ?? (next != nil)
+        self.nextCursor = nextCursor
+        self.hasMore = hasMore ?? (nextCursor != nil)
     }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
-        items = try c.decodeIfPresent([SharedDocument].self, forKey: .items)
-            ?? c.decodeIfPresent([SharedDocument].self, forKey: .documents) ?? []
-        // #1316: prefer `nextCursor`; `cursor` is the deprecated alias.
+        items = try c.decodeIfPresent([SharedDocument].self, forKey: .items) ?? []
         let next = try c.decodeIfPresent(String.self, forKey: .nextCursor)
-            ?? c.decodeIfPresent(String.self, forKey: .cursor)
         nextCursor = next
         hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (next != nil)
     }

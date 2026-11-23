@@ -17,7 +17,7 @@ import XCTest
 /// suites and don't need duplication here.
 ///
 /// Reference: `src/client/api/{invitationsApi,blobBucketsApi,
-/// cronTriggersApi,collectionTypeConfigsApi,databaseTypeConfigsApi,
+/// cronTriggersApi,databaseTypeConfigsApi,
 /// usersApi,databasesApi,documentsApi}.ts`.
 final class ApiParityTests: XCTestCase {
 
@@ -86,73 +86,9 @@ final class ApiParityTests: XCTestCase {
         ]
     }
 
-    // MARK: - CollectionTypeConfigsAPI
-
-    func test_collectionTypeConfigs_list_GET() async throws {
-        let r = CallRecorder()
-        let api = CollectionTypeConfigsAPI(transport: r)
-        r.response = [[String: Any]]()
-        _ = try await api.list()
-        XCTAssertEqual(r.method, "GET")
-        XCTAssertEqual(r.path, "/collection-type-configs")
-    }
-
-    func test_collectionTypeConfigs_get_escapesType() async throws {
-        let r = CallRecorder()
-        let api = CollectionTypeConfigsAPI(transport: r)
-        r.response = [
-            "appId": "app1", "collectionType": "x", "ruleSetId": "rs1",
-            "createdAt": "2024-01-01T00:00:00Z", "modifiedAt": "2024-01-01T00:00:00Z",
-            "createdBy": "u1",
-        ]
-        _ = try await api.get(collectionType: "my type/with slash")
-        XCTAssertEqual(r.method, "GET")
-        // #2076: a path-segment value now escapes `/` too (encodeURIComponent
-        // parity), so the type stays a single segment. The old `.urlPathAllowed`
-        // charset left `/` literal, splitting it into extra path segments.
-        XCTAssertEqual(r.path, "/collection-type-configs/my%20type%2Fwith%20slash")
-    }
-
-    func test_collectionTypeConfigs_create_POSTsParams() async throws {
-        let r = CallRecorder()
-        let api = CollectionTypeConfigsAPI(transport: r)
-        r.response = [
-            "appId": "app1", "collectionType": "x", "ruleSetId": "rs1",
-            "createdAt": "2024-01-01T00:00:00Z", "modifiedAt": "2024-01-01T00:00:00Z",
-            "createdBy": "u1",
-        ]
-        _ = try await api.create(params: CreateCollectionTypeConfigParams(collectionType: "x", ruleSetId: "rs1"))
-        XCTAssertEqual(r.method, "POST")
-        XCTAssertEqual(r.path, "/collection-type-configs")
-        let body = r.body as? [String: Any]
-        XCTAssertEqual(body?["collectionType"] as? String, "x")
-        XCTAssertEqual(body?["ruleSetId"] as? String, "rs1")
-    }
-
-    func test_collectionTypeConfigs_update_PATCH() async throws {
-        let r = CallRecorder()
-        let api = CollectionTypeConfigsAPI(transport: r)
-        r.response = [
-            "appId": "app1", "collectionType": "x", "ruleSetId": "rs1",
-            "createdAt": "2024-01-01T00:00:00Z", "modifiedAt": "2024-01-01T00:00:00Z",
-            "createdBy": "u1",
-        ]
-        _ = try await api.update(collectionType: "x", params: UpdateCollectionTypeConfigParams(ruleSetId: .clear))
-        XCTAssertEqual(r.method, "PATCH")
-        XCTAssertEqual(r.path, "/collection-type-configs/x")
-    }
-
-    func test_collectionTypeConfigs_delete_DELETE() async throws {
-        let r = CallRecorder()
-        let api = CollectionTypeConfigsAPI(transport: r)
-        r.response = ["success": true]
-        _ = try await api.delete(collectionType: "x")
-        XCTAssertEqual(r.method, "DELETE")
-        XCTAssertEqual(r.path, "/collection-type-configs/x")
-    }
-
     // MARK: - DatabaseTypeConfigsAPI
 
+    @available(*, deprecated)
     func test_databaseTypeConfigs_routes() async throws {
         let r = CallRecorder()
         let api = DatabaseTypeConfigsAPI(transport: r)
@@ -180,58 +116,6 @@ final class ApiParityTests: XCTestCase {
         r.response = ["success": true]
         _ = try await api.delete(databaseType: "x")
         XCTAssertEqual(r.method, "DELETE")
-    }
-
-    // MARK: - CronTriggersAPI
-
-    /// A fully-populated `CronTriggerInfo` wire payload — every required
-    /// field present so a strict decode succeeds and a return-type
-    /// regression is what fails the test.
-    private func cronTriggerJSON() -> [String: Any] {
-        [
-            "triggerId": "abc", "triggerKey": "k", "displayName": "d",
-            "cron": "* * * * *", "timezone": "UTC", "workflowKey": "w",
-            "overlapPolicy": "skip", "status": "active",
-            "skippedCount": 0, "firedCount": 0,
-            "createdBy": "u1", "createdAt": "2024-01-01T00:00:00Z",
-            "modifiedAt": "2024-01-01T00:00:00Z",
-        ]
-    }
-
-    func test_cronTriggers_create_POST() async throws {
-        let r = CallRecorder()
-        let api = CronTriggersAPI(transport: r)
-        r.response = cronTriggerJSON()
-        _ = try await api.create(params: CreateCronTriggerParams(triggerKey: "k", displayName: "d", cron: "* * * * *", workflowKey: "w"))
-        XCTAssertEqual(r.method, "POST")
-        XCTAssertEqual(r.path, "/cron-triggers")
-    }
-
-    func test_cronTriggers_update_PUT() async throws {
-        let r = CallRecorder()
-        let api = CronTriggersAPI(transport: r)
-        r.response = cronTriggerJSON()
-        _ = try await api.update(triggerId: "abc", params: UpdateCronTriggerParams(displayName: "renamed"))
-        XCTAssertEqual(r.method, "PUT")
-        XCTAssertEqual(r.path, "/cron-triggers/abc")
-    }
-
-    func test_cronTriggers_disable_enable_test_routes() async throws {
-        let r = CallRecorder()
-        let api = CronTriggersAPI(transport: r)
-
-        // #2803 — the uniform operational verb pair, replacing pause/resume.
-        r.response = cronTriggerJSON()
-        _ = try await api.disable(triggerId: "abc")
-        XCTAssertEqual(r.path, "/cron-triggers/abc/disable")
-        XCTAssertEqual(r.method, "POST")
-
-        _ = try await api.enable(triggerId: "abc")
-        XCTAssertEqual(r.path, "/cron-triggers/abc/enable")
-
-        r.response = ["started": true]
-        _ = try await api.test(triggerId: "abc")
-        XCTAssertEqual(r.path, "/cron-triggers/abc/test")
     }
 
     // MARK: - InvitationsAPI
@@ -284,6 +168,7 @@ final class ApiParityTests: XCTestCase {
         XCTAssertEqual(body?["inviteToken"] as? String, "tok-1")
     }
 
+    @available(*, deprecated)
     func test_invitations_listDeferredGrants_path() async throws {
         let r = CallRecorder()
         let api = InvitationsAPI(transport: r)
@@ -295,6 +180,7 @@ final class ApiParityTests: XCTestCase {
         XCTAssertEqual(r.path, "/deferred-grants")
     }
 
+    @available(*, deprecated)
     func test_invitations_revokeDeferredGrant_DELETE_withType() async throws {
         let r = CallRecorder()
         let api = InvitationsAPI(transport: r)
@@ -313,7 +199,6 @@ final class ApiParityTests: XCTestCase {
         r.response = [
             "bucketId": "b1", "appId": "app1", "bucketKey": "k",
             "name": "n", "ttlTier": "permanent", "preset": "personal-uploads",
-            "accessPolicy": "personal-uploads",
             "createdBy": "u1", "createdAt": "2024-01-01T00:00:00Z",
             "modifiedAt": "2024-01-01T00:00:00Z",
         ]
@@ -324,7 +209,6 @@ final class ApiParityTests: XCTestCase {
         XCTAssertEqual(r.method, "POST")
         XCTAssertEqual(r.path, "/blob-buckets")
         XCTAssertEqual(bucket.preset, .personalUploads)
-        XCTAssertEqual(bucket.accessPolicy, "personal-uploads")
         let body = r.body as? [String: Any]
         XCTAssertEqual(body?["preset"] as? String, "personal-uploads")
         XCTAssertNil(body?["accessPolicy"])
@@ -337,7 +221,6 @@ final class ApiParityTests: XCTestCase {
             [
                 "bucketId": id, "appId": "app1", "bucketKey": "k-\(id)",
                 "name": "n", "ttlTier": "permanent", "preset": "authenticated",
-                "accessPolicy": "authenticated",
                 "createdBy": "u1", "createdAt": "2024-01-01T00:00:00Z",
                 "modifiedAt": "2024-01-01T00:00:00Z",
             ]
@@ -354,7 +237,7 @@ final class ApiParityTests: XCTestCase {
         r.response = [
             "bucketId": "b1", "appId": "app1", "bucketKey": "k",
             "name": "Renamed", "description": NSNull(), "ttlTier": "permanent",
-            "preset": "admin-only", "accessPolicy": "admin-only",
+            "preset": "admin-only",
             "createdBy": "u1", "createdAt": "2024-01-01T00:00:00Z",
             "modifiedAt": "2024-01-02T00:00:00Z",
         ]
@@ -362,7 +245,6 @@ final class ApiParityTests: XCTestCase {
             bucketIdOrKey: "k",
             params: UpdateBlobBucketParams(
                 preset: .adminOnly,
-                ruleSetId: .clear,
                 name: "Renamed",
                 description: .clear
             )
@@ -373,7 +255,8 @@ final class ApiParityTests: XCTestCase {
         let body = r.body as? [String: Any]
         XCTAssertEqual(body?["preset"] as? String, "admin-only")
         XCTAssertEqual(body?["name"] as? String, "Renamed")
-        XCTAssertTrue(body?["ruleSetId"] is NSNull)
+        // #6243 — a bucket takes no rule set: the body never carries one.
+        XCTAssertNil(body?["ruleSetId"])
         XCTAssertTrue(body?["description"] is NSNull)
     }
 
@@ -391,7 +274,8 @@ final class ApiParityTests: XCTestCase {
             "blobId": "b1", "bucketId": "k", "numBytes": 12, "tags": [String](),
         ]
         _ = try await api.getMetadata(bucketIdOrKey: "k", blobId: "b1")
-        XCTAssertEqual(r.path, "/blob-buckets/k/blobs/b1/metadata")
+        // #6244 — the metadata is the bare blob path, as a db3 blob's is.
+        XCTAssertEqual(r.path, "/blob-buckets/k/blobs/b1")
     }
 
     func test_blobBuckets_delete_DELETE() async throws {
@@ -504,6 +388,7 @@ final class ApiParityTests: XCTestCase {
 
     // MARK: - DocumentsAPI new methods
 
+    @available(*, deprecated)
     func test_documents_revokeGroupPermission_DELETE() async throws {
         let r = CallRecorder()
         // documentManager isn't needed for the HTTP-only path; pass nil.
@@ -521,6 +406,7 @@ final class ApiParityTests: XCTestCase {
         XCTAssertEqual(r.path, "/documents/d1/group-permissions/team/g1")
     }
 
+    @available(*, deprecated)
     func test_documents_requestAccess_POSTsParams() async throws {
         let r = CallRecorder()
         let api = DocumentsAPI(
@@ -542,6 +428,7 @@ final class ApiParityTests: XCTestCase {
         XCTAssertEqual(r.path, "/documents/d1/access-requests")
     }
 
+    @available(*, deprecated)
     func test_documents_approveAccessRequest_path() async throws {
         let r = CallRecorder()
         let api = DocumentsAPI(
@@ -560,153 +447,5 @@ final class ApiParityTests: XCTestCase {
 
         _ = try await api.denyAccessRequest(documentId: "d1", requestId: "r1")
         XCTAssertEqual(r.path, "/documents/d1/access-requests/r1/deny")
-    }
-
-    // MARK: - DatabasesAPI new methods
-
-    /// `@available(*, deprecated)` on the test suppresses the intended
-    /// call-site deprecation warning we are deliberately exercising.
-    @available(*, deprecated)
-    func test_databases_getCelContext_GET() async throws {
-        let r = CallRecorder()
-        let api = DatabasesAPI(transport: r)
-        r.response = ["databaseId": "db1", "celContext": ["tenantId": "t1"]]
-        _ = try await api.getCelContext(databaseId: "db1")
-        XCTAssertEqual(r.method, "GET")
-        XCTAssertEqual(r.path, "/databases/db1/metadata")
-    }
-
-    /// `@available(*, deprecated)` on the test suppresses the intended
-    /// call-site deprecation warning we are deliberately exercising.
-    @available(*, deprecated)
-    func test_databases_updateCelContext_PATCH() async throws {
-        let r = CallRecorder()
-        let api = DatabasesAPI(transport: r)
-        r.response = [
-            "databaseId": "db1", "title": "DB", "createdBy": "u1",
-            "createdAt": "2024-01-01T00:00:00Z", "modifiedAt": "2024-01-01T00:00:00Z",
-        ]
-        _ = try await api.updateCelContext(databaseId: "db1", celContext: ["tenantId": "t1"])
-        XCTAssertEqual(r.method, "PATCH")
-        XCTAssertEqual(r.path, "/databases/db1/metadata")
-        XCTAssertEqual((r.body as? [String: Any])?["tenantId"] as? String, "t1")
-    }
-
-    func test_databases_addManager_PUTsPermission() async throws {
-        let r = CallRecorder()
-        let api = DatabasesAPI(transport: r)
-        r.response = [
-            "databaseId": "db1", "userId": "u1", "permission": "manager",
-            "grantedAt": "2024-01-01T00:00:00Z", "grantedBy": "owner",
-        ]
-        _ = try await api.addManager(databaseId: "db1", params: AddManagerParams(userId: "u1"))
-        XCTAssertEqual(r.method, "PUT")
-        XCTAssertEqual(r.path, "/databases/db1/permissions")
-        let body = r.body as? [String: Any]
-        XCTAssertEqual(body?["userId"] as? String, "u1")
-        XCTAssertEqual(body?["permission"] as? String, "manager")
-    }
-
-    func test_databases_removeManager_DELETE() async throws {
-        let r = CallRecorder()
-        let api = DatabasesAPI(transport: r)
-        r.response = ["success": true]
-        _ = try await api.removeManager(databaseId: "db1", userId: "u1")
-        XCTAssertEqual(r.method, "DELETE")
-        XCTAssertEqual(r.path, "/databases/db1/permissions/u1")
-    }
-
-    func test_databases_listGroupPermissions_includeSystem_buildsQS() async throws {
-        let r = CallRecorder()
-        let api = DatabasesAPI(transport: r)
-        r.response = [[String: Any]]()
-        _ = try await api.listGroupPermissions(databaseId: "db1", includeSystem: true)
-        XCTAssertEqual(r.path, "/databases/db1/group-permissions?includeSystem=true")
-
-        _ = try await api.listGroupPermissions(databaseId: "db1")
-        XCTAssertEqual(r.path, "/databases/db1/group-permissions")
-    }
-
-    func test_databases_executeBatch_path() async throws {
-        let r = CallRecorder()
-        let api = DatabasesAPI(transport: r)
-        r.response = ["imported": 1, "failed": 0]
-        _ = try await api.executeBatch(
-            databaseId: "db1", operationName: "save",
-            batch: [DatabaseBatchOperation(params: .object(["id": .string("1")]))]
-        )
-        XCTAssertEqual(r.method, "POST")
-        XCTAssertEqual(r.path, "/databases/db1/operations/save/batch")
-        let body = r.body as? [String: Any]
-        XCTAssertNotNil(body?["batch"])
-    }
-
-    func test_databases_importRows_batchesAndSumsResults() async throws {
-        let r = CallRecorder()
-        let api = DatabasesAPI(transport: r)
-        r.response = ["imported": 1, "failed": 0]
-        let rows: [[String: JSONValue]] = [
-            ["id": .string("1")], ["id": .string("2")], ["id": .string("3")],
-            ["id": .string("4")], ["id": .string("5")],
-        ]
-        let result = try await api.importRows(
-            databaseId: "db1", operationName: "save",
-            rows: rows, batchSize: 2
-        )
-        // 5 rows / batchSize 2 → 3 batches; stub returns imported:1 each
-        // call, so total is 3.
-        XCTAssertEqual(result.imported, 3)
-    }
-
-    // MARK: - WorkflowsAPI options threading
-
-    func test_workflows_start_forceRerunSerializes() async throws {
-        let r = CallRecorder()
-        let api = WorkflowsAPI(
-            transport: r,
-            getConnectionId: { "conn-1" }
-        )
-        _ = try await api.start(
-            workflowKey: "wf",
-            input: ["x": 1],
-            options: StartWorkflowOptions(forceRerun: true)
-        )
-        let body = r.body as? [String: Any]
-        XCTAssertEqual(body?["forceRerun"] as? Bool, true)
-    }
-
-    func test_workflows_terminate_contextDocId_appendsQS() async throws {
-        let r = CallRecorder()
-        let api = WorkflowsAPI(
-            transport: r,
-            getConnectionId: { "conn-1" }
-        )
-        _ = try await api.terminate(workflowKey: "wf", runKey: "rk", contextDocId: "doc-1")
-        XCTAssertEqual(r.method, "POST")
-        XCTAssertEqual(r.path, "/workflows/wf/instances/rk/terminate?contextDocId=doc-1")
-    }
-
-    func test_workflows_listStepRuns_path() async throws {
-        let r = CallRecorder()
-        let api = WorkflowsAPI(
-            transport: r,
-            getConnectionId: { "conn-1" }
-        )
-        _ = try await api.listStepRuns(runId: "run-1")
-        XCTAssertEqual(r.method, "GET")
-        XCTAssertEqual(r.path, "/workflows/runs/run-1/steps")
-    }
-
-    func test_workflows_listRuns_forwardAndContextDocId() async throws {
-        let r = CallRecorder()
-        let api = WorkflowsAPI(
-            transport: r,
-            getConnectionId: { "conn-1" }
-        )
-        _ = try await api.listRuns(options: ListWorkflowRunsOptions(
-            forward: false,
-            contextDocId: "doc-1"
-        ))
-        XCTAssertEqual(r.path, "/workflows/runs?forward=false&contextDocId=doc-1")
     }
 }

@@ -211,6 +211,48 @@ final class TransportSpineTests: XCTestCase {
         XCTAssertEqual(response.text, "plain")
     }
 
+    /// The rest of the classification table, pinned as parity: none of these
+    /// answers changed when the `Any` graph left the conversion (#4005).
+    func testRequestRawOnWhitespaceOnlyJsonBodyCarriesTheText() async throws {
+        // Non-empty text that does not parse falls back to the text, the same
+        // branch a malformed body takes; only a zero-byte body is `nil`.
+        let transport = ScriptedTransport(json: "  ")
+        let response = try await transport.requestRaw(method: .get, path: "/thing")
+        XCTAssertEqual(response.data, .string("  "))
+        XCTAssertEqual(response.text, "  ")
+    }
+
+    func testRequestRawOnZeroByteJsonBodyIsNil() async throws {
+        let transport = ScriptedTransport(body: Data())
+        let response = try await transport.requestRaw(method: .get, path: "/thing")
+        XCTAssertNil(response.data)
+        XCTAssertEqual(response.text, "")
+    }
+
+    func testRequestRawOnMalformedJsonBodyCarriesTheText() async throws {
+        let transport = ScriptedTransport(json: "{not json")
+        let response = try await transport.requestRaw(method: .get, path: "/thing")
+        XCTAssertEqual(response.data, .string("{not json"))
+    }
+
+    func testRequestRawOnNonUtf8NonJsonBodyIsNil() async throws {
+        let bytes = Data([0xFF, 0xFE])
+        XCTAssertNil(String(data: bytes, encoding: .utf8), "fixture must not be valid UTF-8")
+        let transport = ScriptedTransport(contentType: "application/octet-stream", body: bytes)
+        let response = try await transport.requestRaw(method: .get, path: "/thing")
+        XCTAssertNil(response.data)
+        XCTAssertNil(response.text)
+    }
+
+    func testRequestRawOnTopLevelJsonFragmentDecodesIt() async throws {
+        let number = try await ScriptedTransport(json: "123").requestRaw(method: .get, path: "/n")
+        XCTAssertEqual(number.data, .number(123))
+        let null = try await ScriptedTransport(json: "null").requestRaw(method: .get, path: "/n")
+        XCTAssertEqual(null.data, .null)
+        let flag = try await ScriptedTransport(json: "true").requestRaw(method: .get, path: "/n")
+        XCTAssertEqual(flag.data, .bool(true))
+    }
+
     // MARK: - requestData raw bytes (behavior 8)
 
     func testRequestDataReturnsBytesByteForByteIncludingInvalidUtf8() async throws {
@@ -280,81 +322,18 @@ final class TransportSpineTests: XCTestCase {
     // MARK: - Pre-encoded bodies (exactness past 2^53)
 
     /// `request(bodyData:)` sends the caller's bytes verbatim, which is how
-    /// `workflows.start` keeps an `Int64` exact — routing the same value
+    /// `functions.start` keeps an `Int64` exact — routing the same value
     /// through `JSONValue` would round it to the nearest `Double`.
     func testPreEncodedBodyIsSentByteForByte() async throws {
         let transport = ScriptedTransport(json: #"{"name":"ok"}"#)
         let exact = Data(#"{"rootInput":{"id":9007199254740993}}"#.utf8)
 
         let result: Payload = try await transport.request(
-            method: .post, path: "/workflows/k/start", bodyData: exact
+            method: .post, path: "/functions/k/start", bodyData: exact
         )
 
         XCTAssertEqual(result, Payload(name: "ok"))
         XCTAssertEqual(try XCTUnwrap(transport.lastCall).body, exact)
-    }
-
-    /// The workflow `meta` fidelity table in `swift-client/CHANGELOG.md` and
-    /// the migration guide is a claim about bytes, so it is asserted here
-    /// rather than only described there.
-    ///
-    /// A `meta` taken positionally reaches `JSONSerialization` without passing
-    /// through `JSONValue`, so an `Int64` past 2^53 survives.
-    /// `StartWorkflowOptions.meta` is `[String: JSONValue]`, whose single
-    /// `.number(Double)` case rounds it. #2367's re-review found the generic
-    /// `start` on the wrong side of that line: it declared `meta: [String:
-    /// Any]` like `origin/main` but built a `StartWorkflowOptions` internally,
-    /// so the value was rounded with no signature change to warn anyone. This
-    /// pins both halves — the exactness that was restored, and the one lossy
-    /// form the docs tell readers to avoid for large integer IDs.
-    func testWorkflowMetaFidelityMatchesTheDocumentedTable() async throws {
-        let exact = "9007199254740993"
-        let started = #"{"runId":"r","runKey":"k","status":"queued"}"#
-
-        // 2^53+1: the smallest integer a `Double` cannot hold, which is the
-        // whole point of the lossy half of this test. Written as a `Double`
-        // literal the compiler warns that it "becomes 9007199254740992" — the
-        // rounding is deliberate here, so the conversion is made explicit and
-        // pinned instead of being spelled as a literal that warns (#3314).
-        let lossyId = Double(Int64(9_007_199_254_740_993))
-        XCTAssertEqual(
-            String(format: "%.0f", lossyId), "9007199254740992",
-            "a `Double` rounds 2^53+1 down; if it stops doing so, this test's premise is gone"
-        )
-
-        let positional = ScriptedTransport(json: started)
-        _ = try await WorkflowsAPI(transport: positional).start(
-            workflowKey: "k",
-            input: ["a": 1] as [String: Int],
-            meta: ["id": Int64(9_007_199_254_740_993)]
-        )
-        let positionalBody = String(
-            decoding: try XCTUnwrap(XCTUnwrap(positional.lastCall).body), as: UTF8.self
-        )
-        XCTAssertTrue(
-            positionalBody.contains(exact),
-            "a positional `meta` must reach the wire exactly; got \(positionalBody)"
-        )
-
-        let viaOptions = ScriptedTransport(json: started)
-        _ = try await WorkflowsAPI(transport: viaOptions).start(
-            StartWorkflowOptions(
-                workflowKey: "k",
-                input: ["a": .number(1)],
-                meta: ["id": .number(lossyId)]
-            )
-        )
-        let optionsBody = String(
-            decoding: try XCTUnwrap(XCTUnwrap(viaOptions.lastCall).body), as: UTF8.self
-        )
-        XCTAssertFalse(
-            optionsBody.contains(exact),
-            """
-            `StartWorkflowOptions.meta` is documented as the lossy form. If it \
-            is exact now, `JSONValue` gained an integer case — update the \
-            fidelity table in the CHANGELOG and the migration guide.
-            """
-        )
     }
 
     // MARK: - Converted call sites (behavior 3 grep assertion)
@@ -471,24 +450,19 @@ final class TransportSpineTests: XCTestCase {
     }
 
     /// Every API class converted to the typed spine (B1's `CollectionsAPI`,
-    /// all of B2, and B3's `DoDb` / `MeAPI`) carries no untyped dictionary,
-    /// no `JSONSerialization`, and no call into the deprecated closure.
+    /// all of B2, and B3's `MeAPI`) carries no untyped dictionary, no
+    /// `JSONSerialization`, and no call into the deprecated closure. (B3's
+    /// `DoDb` left with `client.databases`, #3189.)
     func testConvertedApiSourceHasNoUntypedDictionariesOrJsonSerialization() throws {
         let converted = [
             "BlobBucketsAPI.swift",
             "CollectionsAPI.swift",
-            "CollectionTypeConfigsAPI.swift",
-            "CronTriggersAPI.swift",
             "DatabaseTypeConfigsAPI.swift",
             "DocumentsAPI.swift",
-            "DoDb.swift",
             "GroupsAPI.swift",
-            "GroupTypeConfigsAPI.swift",
-            "IntegrationsAPI.swift",
             "InvitationsAPI.swift",
             "MeAPI.swift",
             "NotificationsAPI.swift",
-            "PromptsAPI.swift",
             "RuleSetsAPI.swift",
             "SessionAPI.swift",
             "UsersAPI.swift",
@@ -537,35 +511,11 @@ final class TransportSpineTests: XCTestCase {
             // dictionaries, so changing these is a public-signature break
             // deferred to a later phase.
             "API/AuthAPI.swift": (6, 0, 0),
-            // The two WebSocket control frames (`db.subscribe` /
-            // `db.unsubscribe`) and the `JSONSerialization` that encodes them.
-            // #2367 typed the public `params` to `[String: JSONValue]`, so what
-            // is left is the wire-encoding boundary itself, not public surface.
-            // The review of this PR took it 2 -> 3: `sendSubscribeFrame`'s
-            // lowering is a `do`/`catch` that logs the encode failure rather
-            // than a `try?` that silently sent an empty `params` bag, which
-            // needs the declaration and the cast on separate lines.
-            "API/DatabasesAPI.swift": (3, 2, 0),
-            // Public `rootInput` / `meta` signatures. The two
-            // `JSONSerialization` uses are deliberate: `start`/`runSync`
-            // compose the opaque caller payload straight to request bytes,
-            // because routing it through `JSONValue` would collapse an
-            // `Int64` to `Double` and lose exactness past 2^53. #2367
-            // deliberately left this one surface untyped for that reason and
-            // recorded it in the CHANGELOG as the batch's one known remaining
-            // break; it took the count 11 -> 10 by typing
-            // `StartWorkflowOptions`.
-            // The re-review of this PR took it 10 -> 11: the three public
-            // `start` forms now funnel through one private `startRequest` body
-            // composer, whose `input: [String: Any]` parameter is the added
-            // line. That is what lets the generic `start<Input: Encodable>`
-            // hand its declared-`[String: Any]` `meta` straight to
-            // `JSONSerialization` instead of raising it into
-            // `StartWorkflowOptions` and back — a round trip that rounded an
-            // `Int64` past 2^53 on a signature that had not changed. The file
-            // set is net zero on this commit: `JsBaoClient.swift` gave one back
-            // (22 -> 21) below.
-            "API/WorkflowsAPI.swift": (11, 2, 0),
+            // `API/DatabasesAPI.swift` (3, 2, 0: the `db.subscribe` /
+            // `db.unsubscribe` frames it encoded) left with `client.databases`
+            // in #3189, so its entry is gone rather than zeroed.
+            // `API/WorkflowsAPI.swift` (7, 1, 0) left with `client.workflows`
+            // in #3190, so its entry is gone rather than zeroed.
             // #3278 opened this at eleven because there were no per-key types
             // to express an invocation with; #3344 generated them and closed
             // the four sites that existed only for their absence. The untyped
@@ -645,7 +595,21 @@ final class TransportSpineTests: XCTestCase {
             // sub-APIs left the client, and with them the two analytics-context
             // accessors and the helper whose one `as? [String: Any]` cast
             // lowered their events. Removed surface, not a new lowering.
-            "JsBaoClient.swift": (21, 7, 0),
+            // #4005 took the dictionary count 21 -> 20: the four
+            // `legacyJSONGraph` casts left with the untyped `HttpClient`
+            // surface, and `documentRow` / `documentRows` (three spellings)
+            // are the one lowering seam into `DocumentManager`'s rows until
+            // #2579 retypes them.
+            // #3190 took the dictionary count 20 -> 18: the `workflowStatus`
+            // and `workflowStarted` frame handlers left with
+            // `client.workflows`, and with them their two `meta` casts.
+            // Removed surface, not a new lowering.
+            // #5365 took it 18 -> 19: `commitPendingCreateNow`, the one
+            // implementation behind the deprecated `commitOfflineCreate` and
+            // `client.db3.commitCreate`, returns the same `[String: Any]` the
+            // deprecated public method always has. An internal seam, not new
+            // untyped surface.
+            "JsBaoClient.swift": (19, 7, 0),
             // The cache-key / query-string helpers on `CacheFacade` (see
             // `testCacheFacadeUsesTheTransport`) plus the one validity check
             // that guards the generic `fetchCached<T>` bridge. No HTTP
@@ -669,44 +633,6 @@ final class TransportSpineTests: XCTestCase {
             // function is handed — internal shape checks on a value that is
             // already untyped, not new untyped surface.
             "Internal/KvCache.swift": (5, 4, 0),
-            // #3436 — the three format-2 WebSocket frames the coordinator
-            // handles: `epoch.info` and `update.ack` inbound, and the outbound
-            // `update` frame it stamps `seq`/`seqFrom`/`ackedSeq` onto. This is
-            // the SAME currency every arm of `handleWebSocketMessage` already
-            // speaks (`json["x"] as? T` off a parsed frame), not a new untyped
-            // surface and not an HTTP response body — decoding these two into
-            // structs while every neighbouring frame stays a dictionary would
-            // be the second pattern principle 4 warns about. No response body
-            // is read here and nothing is lowered into an `Any` graph.
-            // #3436 phase B took it 2 -> 8: `epoch.seal`/`epoch.resync` and
-            // `snapshot.ready`/`epoch.grants` are two more inbound frames, the
-            // question "does this frame ask for a resync rather than a reload"
-            // is asked of a third, and reading a frame's `sealedEpochs` array,
-            // its `download` block and its `snapshot` block is three more
-            // casts off the same graph. What is NOT untyped is the state any
-            // of it leaves behind — the sealed chain becomes
-            // `[SealedEpochChainEntry]` and the snapshot block a
-            // `SnapshotOffer` — because that outlives the frame and the next
-            // handshake has to agree with it about its shape.
-            "LargeDocuments/Format2Coordinator.swift": (8, 0, 0),
-            // #3436 — the two inbound frames the client's large-document front
-            // door routes, `epoch.info` and `update.ack`. They are handed the
-            // dictionary `handleWebSocketMessage` already parsed, and pass it
-            // to the coordinator budgeted above: the same currency, carried one
-            // call further, not a new untyped surface. No response body is read
-            // here and nothing is lowered into an `Any` graph.
-            // #3436 phase B took it 2 -> 4: the two epoch frames the router
-            // gained, `epoch.seal`/`epoch.resync` and
-            // `snapshot.ready`/`epoch.grants`, handed on to the coordinator
-            // budgeted above. The grant the cold start refreshes with is read
-            // off the typed `SnapshotOffer`, not off a dictionary.
-            // The `JSONSerialization` count went 0 -> 1 with it: a load whose
-            // signature expired asks the room to re-mint it, which is one more
-            // OUTBOUND frame (`{type: "epoch.grants", documentId}`), encoded
-            // the way every other outbound frame in this client is. The
-            // dictionary it encodes is `[String: String]`, so it does not
-            // count against the untyped total.
-            "LargeDocuments/Format2Client.swift": (4, 1, 0),
         ]
         let sources = sourcesDirectory
 
@@ -913,20 +839,47 @@ final class TransportSpineTests: XCTestCase {
         }
     }
 
-    /// And the client does not call its own deprecated surface: the sites that
-    /// still need the loose JSON graph go through the private
-    /// `legacyJSONGraph` hop, which is why the build stays warning-free.
-    func testTheClientDoesNotCallItsOwnDeprecatedSurface() throws {
-        let code = Self.stripComments(try jsBaoClientSource).joined(separator: "\n")
+    /// And the client reads documents through the typed transport. Metadata
+    /// sync and the offline-create commit used to share a private
+    /// `legacyJSONGraph` hop onto `HttpClient`'s untyped `request`; #4005
+    /// removed both, so neither the hop nor a string-verb call on
+    /// `httpClient` may come back.
+    func testTheClientReadsDocumentsThroughTheTypedTransport() throws {
+        let lines = Self.stripComments(try jsBaoClientSource)
+        let code = lines.joined(separator: "\n")
 
         XCTAssertFalse(
             code.contains("await makeRequest(") || code.contains("await self.makeRequest("),
-            "JsBaoClient should route internal calls through legacyJSONGraph, not the deprecated makeRequest"
+            "JsBaoClient must not call the removed makeRequest"
         )
-        XCTAssertTrue(
-            code.contains("private func legacyJSONGraph("),
-            "the single internal untyped hop should still be the private legacyJSONGraph"
+        XCTAssertEqual(count("legacyJSONGraph(", in: lines), 0, "the untyped hop was removed by #4005")
+        XCTAssertEqual(
+            count("httpClient.request(method: \"", in: lines), 0,
+            "a string-verb request goes through the untyped HttpClient surface #4005 removed"
         )
+        XCTAssertEqual(
+            count("httpClient.requestRaw(method: \"", in: lines), 0,
+            "a string-verb requestRaw goes through the untyped HttpClient surface #4005 removed"
+        )
+    }
+
+    /// `requestRaw` builds its `JSONValue?` straight from the bytes. It used
+    /// to classify into a `JSONSerialization` graph first and re-decode that
+    /// (#4005).
+    func testTransportResponseClassifiesWithoutAnAnyGraph() throws {
+        let lines = try codeLines(of: sourcesDirectory.appendingPathComponent("Types/Transport.swift"))
+        XCTAssertEqual(count("legacyParsedJSON", in: lines), 0)
+        XCTAssertEqual(count("Any?", in: lines), 0)
+    }
+
+    /// `HttpClient` is public because it is the production `Transport`, so
+    /// anything it declares is module API. Its untyped `request` /
+    /// `requestRaw` and the helpers behind them were removed by #4005; no
+    /// code line may spell `Any` again.
+    func testHttpClientPublicSurfaceCarriesNoAny() throws {
+        let lines = try codeLines(of: sourcesDirectory.appendingPathComponent("Internal/HttpClient.swift"))
+        XCTAssertFalse(lines.isEmpty, "HttpClient.swift was not found")
+        XCTAssertEqual(count("Any", in: lines), 0)
     }
 
     /// `JsBaoNetworkError` (#2367) is only worth its name if `URLError` can no

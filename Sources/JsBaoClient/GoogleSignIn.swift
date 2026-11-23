@@ -163,7 +163,7 @@ enum GoogleSignInHelpers {
 extension JsBaoClient {
     /// Native Google sign-in: presents `ASWebAuthenticationSession`, handles
     /// the redirect callback, exchanges the authorization code, and lands the
-    /// session — mirroring the JS client's one-call sign-in (#928).
+    /// session — mirroring the JS client's one-call sign-in.
     ///
     /// ```swift
     /// let result = try await client.signInWithGoogle(presentationAnchor: window)
@@ -182,8 +182,8 @@ extension JsBaoClient {
     ///   - waitlist: Optional waitlist enrollment threaded through the state
     ///     bag (parity with JS `startOAuthFlow(continueUrl, { waitlist })`).
     ///   - inviteToken: Optional invite token threaded through the state bag
-    ///     (parity with JS `startOAuthFlow(continueUrl, { inviteToken })`,
-    ///     #466) so an invite-gated OAuth signup can complete natively.
+    ///     (parity with JS `startOAuthFlow(continueUrl, { inviteToken })`)
+    ///     so an invite-gated OAuth signup can complete natively.
     ///   - prefersEphemeralWebBrowserSession: Opt in to an ephemeral browser
     ///     session (no shared cookies; the user always types credentials).
     /// - Returns: `GoogleSignInResult` with the signed-in `userId` and the
@@ -224,7 +224,7 @@ extension JsBaoClient {
             )
         }
 
-        // 2. Build the authorize URL (GET /oauth-config + client-side URL
+        // 2. Build the authorize URL (GET settings/sign-in + client-side URL
         //    construction, same as the JS client).
         let authUrl = try await startOAuthFlow(
             redirectUri: resolvedRedirectUri,

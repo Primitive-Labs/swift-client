@@ -13,6 +13,9 @@ public enum PrimitiveFieldType: String, Codable, Sendable, Equatable, Hashable, 
     case id
     case stringset
     case json
+    /// A db3 vector field: `dims` numbers of an `element` type,
+    /// stored as base64 text (`VectorCodec`) and read as `[Float]`.
+    case vector
 }
 
 /// A single field value as understood by the runtime schema layer.
@@ -29,6 +32,9 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
     case id(String)
     case stringset(Set<String>)
     case json(Data)
+    /// A vector field's numbers. A save to a db3 encodes them with the
+    /// field's encoding; a read answers them decoded.
+    case vector([Float])
 
     public var fieldType: PrimitiveFieldType {
         switch self {
@@ -39,6 +45,7 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
         case .id:        return .id
         case .stringset: return .stringset
         case .json:      return .json
+        case .vector:    return .vector
         }
     }
 
@@ -89,6 +96,11 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
         return nil
     }
 
+    public var asVector: [Float]? {
+        if case let .vector(v) = self { return v }
+        return nil
+    }
+
     // MARK: - Yrs FFI encoding
 
     /// Encode into the JSON string expected by the Yniffi `YrsMap.insert`
@@ -117,6 +129,11 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
             // — this mirrors js-bao's "JSON-encoded string field" convention.
             let text = String(data: d, encoding: .utf8) ?? ""
             return PrimitiveValue.jsonEncodeString(text)
+        case let .vector(numbers):
+            // A vector reaches a record-log document as its encoded text; the
+            // nested-map path carries no vectors (a format-1 save is refused).
+            guard numbers.allSatisfy(\.isFinite) else { return nil }
+            return "[" + numbers.map { PrimitiveValue.jsNumberString(Double($0)) }.joined(separator: ",") + "]"
         case .stringset:
             return nil
         }
@@ -160,6 +177,11 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
         case .json:
             guard let s = decodeJsonString(yrsString) else { return nil }
             return .json(Data(s.utf8))
+        case .vector:
+            // A record-log read answers a vector field decoded, as a JSON
+            // array of its numbers; anything else is no vector.
+            guard let items = JSONValue(jsonText: yrsString)?.floatArrayValue else { return nil }
+            return .vector(items)
         case .stringset:
             return nil
         }
@@ -183,16 +205,20 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
         return f
     }()
 
-    /// JSON-encode a string: surround with `"` and escape inner chars.
-    /// Minimal RFC 8259 coverage — `\` `"` `\n` `\r` `\t` — matching
-    /// what js-bao's JSON.stringify emits for the common-case strings
-    /// js-bao uses in `_meta_*`.
+    /// JSON-encode a string: surround with `"` and escape inner chars,
+    /// byte-for-byte as JS `JSON.stringify` does — `\"` `\\` `\b` `\f`
+    /// `\n` `\r` `\t`, and lowercase `\u00XX` for every other control
+    /// character. It must match exactly: `UniqueIndex.buildKey` builds a
+    /// compound unique key from it, and the server and the JS client look
+    /// that key up as `JSON.stringify` spells it.
     static func jsonEncodeString(_ s: String) -> String {
         var out = "\""
         for ch in s.unicodeScalars {
             switch ch {
             case "\"":  out += "\\\""
             case "\\":  out += "\\\\"
+            case "\u{08}": out += "\\b"
+            case "\u{0C}": out += "\\f"
             case "\n":  out += "\\n"
             case "\r":  out += "\\r"
             case "\t":  out += "\\t"
@@ -252,7 +278,7 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
     }
 
     /// Encode a `Double` the way JSON.stringify in JS does — byte-for-
-    /// byte identical to `Number.prototype.toString(10)` (#1117).
+    /// byte identical to `Number.prototype.toString(10)`.
     ///
     /// Returns `nil` for **non-finite** values (NaN, ±Infinity). Those
     /// don't have a valid JSON representation, and the yrs FFI parses
@@ -267,7 +293,7 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
     }
 
     /// `encodeNumber`, adjusted for the one place the JS string is not a
-    /// legal input: the yrs FFI (#3456).
+    /// legal input: the yrs FFI.
     ///
     /// `YrsMap.insert` / `tryUpdate` parse their `value` with
     /// `Any::from_json(...).unwrap()` (yniffi `lib/src/map.rs`), and a
@@ -318,7 +344,7 @@ public enum PrimitiveValue: Equatable, Hashable, Sendable {
     /// would stop them colliding with the entries a JS client writes.
     ///
     /// - Returns: the literal, or `nil` for a value that must not be
-    ///   written — a non-finite number (skipped on write, #1117) or, past
+    ///   written — a non-finite number (skipped on write) or, past
     ///   `2^64`, one of the rare doubles this parser cannot be made to
     ///   reproduce. `DynamicModel` rejects the latter with a
     ///   field-naming error before it mutates anything.

@@ -17,39 +17,28 @@ final class GroupsTests: XCTestCase {
     }
 
     // MARK: - Create Group
+    //
+    // A session cannot create a group (the server answers 403
+    // FUNCTION_ROUTE_FUNCTION_ONLY, #4735), so these suites create through
+    // the admin API (`TestContext.createGroup`, #4737) and read the group back
+    // from the app owner's session by `groupId` alone.
 
     func testCreateGroup() async throws {
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }
 
-        let groupId = "test-group-\(UUID().uuidString.prefix(8))"
-        let result = try await client.groups.create(params: CreateGroupParams(
-            groupType: "team",
-            groupId: groupId,
-            name: "Swift Test Group"
-        ))
+        // A create names no id: the server mints a ULID and returns it (#4917).
+        let result = try await ctx.createGroup(app: testApp, name: "Swift Test Group")
 
-        XCTAssertEqual(result.groupId, groupId, "Created group should echo back its id")
         XCTAssertEqual(result.name, "Swift Test Group")
-    }
-
-    func testCreateGroupWithoutGroupIdGetsServerAssignedId() async throws {
-        // Issue #1353 — `groupId` is optional; the server assigns a ULID.
-        let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
-        defer { Task { await client.destroy() } }
-
-        let result = try await client.groups.create(params: CreateGroupParams(
-            groupType: "team",
-            name: "Swift Auto-ID Group"
-        ))
-
-        XCTAssertEqual(result.name, "Swift Auto-ID Group")
         // ULID: 26 chars, Crockford base32.
         XCTAssertEqual(result.groupId.count, 26, "Server-assigned groupId should be a ULID")
 
         // The group is fetchable via the returned ID.
-        let fetched = try await client.groups.get(groupType: "team", groupId: result.groupId)
+        let fetched = try await client.groups.get(groupId: result.groupId)
         XCTAssertEqual(fetched.groupId, result.groupId)
+        XCTAssertEqual(fetched.name, "Swift Test Group")
+        XCTAssertEqual(fetched.custodian, "user:\(testApp.ownerUserId)")
     }
 
     // MARK: - Add/Remove Member
@@ -59,26 +48,20 @@ final class GroupsTests: XCTestCase {
         defer { Task { await client.destroy() } }
 
         // Create a group
-        let groupId = "member-group-\(UUID().uuidString.prefix(8))"
-        let _ = try await client.groups.create(params: CreateGroupParams(
-            groupType: "team",
-            groupId: groupId,
-            name: "Member Test Group"
-        ))
+        let groupId = try await ctx.createGroup(app: testApp, name: "Member Test Group").groupId
 
         // Create a second user to add
         let user2 = try await ctx.createTestUser(appId: testApp.appId, role: "member")
 
         // Add member
         let addResult = try await client.groups.addMember(
-            groupType: "team",
             groupId: groupId,
             params: .userId(user2.userId)
         )
         XCTAssertFalse(addResult.status.isEmpty, "Expected a status from addMember")
 
         // List members to verify
-        let membersResult = try await client.groups.listMembers(groupType: "team", groupId: groupId)
+        let membersResult = try await client.groups.listMembers(groupId: groupId)
         let hasMember = membersResult.items.contains { member in
             member.userId == user2.userId
         }
@@ -86,7 +69,6 @@ final class GroupsTests: XCTestCase {
 
         // Remove member
         let removeResult = try await client.groups.removeMember(
-            groupType: "team",
             groupId: groupId,
             userId: user2.userId
         )
@@ -110,32 +92,21 @@ final class GroupsTests: XCTestCase {
         let client = createTestClient(appId: testApp.appId, token: testApp.ownerJWT)
         defer { Task { await client.destroy() } }
 
-        let groupId = "page-group-\(UUID().uuidString.prefix(8))"
-        _ = try await client.groups.create(params: CreateGroupParams(
-            groupType: "team",
-            groupId: groupId,
-            name: "Pagination Test Group"
-        ))
+        let groupId = try await ctx.createGroup(app: testApp, name: "Pagination Test Group").groupId
 
         // Two members, so a page size of 1 leaves a genuine second page:
-        // the app owner plus one freshly created user.
+        // the app owner (the custodian, who holds the owner row from create)
+        // plus one freshly created user.
         let user2 = try await ctx.createTestUser(appId: testApp.appId, role: "member")
         _ = try await client.groups.addMember(
-            groupType: "team",
-            groupId: groupId,
-            params: .userId(testApp.ownerUserId)
-        )
-        _ = try await client.groups.addMember(
-            groupType: "team",
             groupId: groupId,
             params: .userId(user2.userId)
         )
 
-        let allMembers = try await client.groups.listMembers(groupType: "team", groupId: groupId)
+        let allMembers = try await client.groups.listMembers(groupId: groupId)
         XCTAssertEqual(allMembers.items.count, 2, "Group should have two members before paginating")
 
         let page1 = try await client.groups.listMembers(
-            groupType: "team",
             groupId: groupId,
             options: PaginationOptions(limit: 1)
         )
@@ -156,7 +127,6 @@ final class GroupsTests: XCTestCase {
         )
 
         let page2 = try await client.groups.listMembers(
-            groupType: "team",
             groupId: groupId,
             options: PaginationOptions(limit: 1, cursor: cursor)
         )

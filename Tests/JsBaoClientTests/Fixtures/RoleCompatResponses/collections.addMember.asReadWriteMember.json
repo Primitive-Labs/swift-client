@@ -1,0 +1,19 @@
+{
+  "name": "collections.addMember.asReadWriteMember",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "POST",
+  "path": "/app/<appId>/api/collections/<ulid>/members",
+  "caller": "writer",
+  "request": {
+    "email": "<email>",
+    "permission": "reader"
+  },
+  "status": 403,
+  "body": {
+    "error": "Forbidden",
+    "status": 403,
+    "timestamp": "<iso>",
+    "code": "ACCESS_DENIED"
+  }
+}

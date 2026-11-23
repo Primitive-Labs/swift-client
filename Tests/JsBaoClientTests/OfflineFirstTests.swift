@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-offline-first.test.ts
 /// Tests offline-first document creation and sync.
+@available(*, deprecated)
 final class OfflineFirstTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!
@@ -205,6 +206,7 @@ final class OfflineFirstTests: XCTestCase {
     /// pending-create entry — the same `{ documentId, title?, createdAt }`
     /// shape `listPendingCreates()` lists — or nil when the document has
     /// no uncommitted local create.
+    @available(*, deprecated)
     func testGetPendingCreateReturnsEntry() async throws {
         let client = createTestClient(
             appId: testApp.appId,

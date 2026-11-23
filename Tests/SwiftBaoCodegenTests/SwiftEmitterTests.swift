@@ -71,7 +71,7 @@ final class SwiftEmitterTests: XCTestCase {
         XCTAssertTrue(body.contains("static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> PagedQueryResult<NoteRecord>"))
         XCTAssertTrue(body.contains("static func queryPaged(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil, include: [Include]) throws -> PagedQueryResult<NoteRecord>"),
                       "paginated include facade must be emitted")
-        XCTAssertTrue(body.contains("static func count(_ filter: DocumentFilter? = nil) throws -> Int"))
+        XCTAssertTrue(body.contains("static func count(_ filter: DocumentFilter? = nil, options: QueryOptions? = nil) throws -> Int"))
         // find/findAll are synchronous throws + decode-loud (#1156): all facade
         // reads share one sync convention (the shared store never suspends), and
         // a row that exists but fails typed decode still throws

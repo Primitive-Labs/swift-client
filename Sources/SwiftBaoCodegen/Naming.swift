@@ -110,6 +110,10 @@ enum Naming {
     /// `on_hold`). Returns `(caseName, rawValue)` pairs in input order.
     static func enumCaseNames(for values: [String]) -> [(name: String, raw: String)] {
         var used: [String: Int] = [:]
+        // Every identifier emitted so far, suffixed ones included: a value
+        // that sanitizes to `slug_2` must not reuse the `slug_2` an earlier
+        // collision on `slug` produced, nor the reverse (#5895).
+        var emitted: Set<String> = []
         var out: [(String, String)] = []
         for v in values {
             // `enumCaseIdentifier` may return a backtick-escaped keyword
@@ -118,10 +122,15 @@ enum Naming {
             // the escaped form would produce "`default`_2" (the digit outside
             // the backticks), which is not a legal Swift identifier.
             let bare = enumCaseIdentifier(v).replacingOccurrences(of: "`", with: "")
-            let count = used[bare, default: 0]
+            var count = used[bare, default: 0]
+            var candidate = count == 0 ? bare : "\(bare)_\(count + 1)"
+            while emitted.contains(candidate) {
+                count += 1
+                candidate = "\(bare)_\(count + 1)"
+            }
             used[bare] = count + 1
-            let name = escapeIfReserved(count == 0 ? bare : "\(bare)_\(count + 1)")
-            out.append((name, v))
+            emitted.insert(candidate)
+            out.append((escapeIfReserved(candidate), v))
         }
         return out
     }

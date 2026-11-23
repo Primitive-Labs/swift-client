@@ -1,0 +1,18 @@
+{
+  "name": "groups.update.unknown",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "PATCH",
+  "path": "/app/<appId>/api/groups/team/no-such-group",
+  "caller": "owner",
+  "request": {
+    "name": "Nobody"
+  },
+  "status": 404,
+  "body": {
+    "error": "Group not found",
+    "status": 404,
+    "timestamp": "<iso>",
+    "code": "NOT_FOUND"
+  }
+}

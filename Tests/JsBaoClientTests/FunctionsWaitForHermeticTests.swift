@@ -6,7 +6,7 @@ import XCTest
 ///
 /// Unlike `workflows.waitFor`, which settles on the terminal `workflowStatus`
 /// frame, a function run broadcasts nothing over the socket, so this one
-/// POLLS `GET /workflows/runs/{runId}/status` with a backing-off interval
+/// POLLS `GET /functions/runs/{runId}/status` with a backing-off interval
 /// (0.4 s doubling to 5 s), exactly as the JS `FunctionsAPI.waitFor` does.
 /// Server-free: the status route is a scripted transport whose answers change
 /// per poll, and the poll timestamps are what the schedule is asserted on.
@@ -108,7 +108,7 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
         XCTAssertEqual(result.status, "completed")
         XCTAssertEqual(result.output?["doubled"]?.numberValue, 42)
         XCTAssertEqual(transport.polls.count, 3, "three polls: queued, running, completed")
-        XCTAssertEqual(Set(transport.paths), ["/workflows/runs/r1/status"])
+        XCTAssertEqual(Set(transport.paths), ["/functions/runs/r1/status"])
         XCTAssertEqual(clock.sleeps, [0.4, 0.8], "no sleep after the terminal poll")
     }
 
@@ -183,7 +183,7 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
             _ = try await api.waitFor(runId: "r1", options: FunctionWaitOptions(timeout: 1))
             XCTFail("a run that never settles must time out")
         } catch let error as JsBaoError {
-            XCTAssertEqual(error.code, .workflowWaitTimeout)
+            XCTAssertEqual(error.code, .functionWaitTimeout)
             XCTAssertTrue(error.message.contains("1000ms"), error.message)
         }
         XCTAssertEqual(clock.sleeps.count, 2)
@@ -201,7 +201,7 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
             _ = try await api.waitFor(runId: "r1", options: FunctionWaitOptions(timeout: 30))
             XCTFail("must time out")
         } catch let error as JsBaoError {
-            XCTAssertEqual(error.code, .workflowWaitTimeout)
+            XCTAssertEqual(error.code, .functionWaitTimeout)
         }
         let expected: [TimeInterval] = [0.4, 0.8, 1.6, 3.2, 5, 5, 5, 5, 4]
         XCTAssertEqual(clock.sleeps.count, expected.count, "\(clock.sleeps)")
@@ -283,8 +283,8 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
 
     /// The run row already reads terminal while the status block still reports
     /// the execution in flight (the server withholds `completed` until the
-    /// output is published). The wait re-checks on the 1 s timer
-    /// `workflows.waitFor` uses and, after its bounded 30 re-checks, settles
+    /// output is published). The wait re-checks on a 1 s timer and, after its
+    /// bounded 30 re-checks, settles
     /// from the record instead of polling on.
     func testWaitForSettlesFromTheRunRecordAfterTheBoundedFinalizationRecheck() async throws {
         let transport = ScriptedStatusTransport(
@@ -294,12 +294,12 @@ final class FunctionsWaitForHermeticTests: XCTestCase {
         let result = try await api.waitFor(runId: "r1", options: FunctionWaitOptions(timeout: 120))
         XCTAssertEqual(result.status, "completed")
         // The first poll saw the window, then the bounded re-checks, then the record won.
-        XCTAssertEqual(transport.polls.count, 1 + WorkflowsAPI.finalizeMaxRechecks)
-        XCTAssertEqual(WorkflowsAPI.finalizeMaxRechecks, 30)
+        XCTAssertEqual(transport.polls.count, 1 + FunctionsAPI.finalizeMaxRechecks)
+        XCTAssertEqual(FunctionsAPI.finalizeMaxRechecks, 30)
         XCTAssertEqual(
             clock.sleeps,
-            Array(repeating: TimeInterval(WorkflowsAPI.finalizeRecheckIntervalMs) / 1000, count: 30),
-            "the re-check runs on the workflow wait's 1 s timer, not the poll backoff"
+            Array(repeating: TimeInterval(FunctionsAPI.finalizeRecheckIntervalMs) / 1000, count: 30),
+            "the re-check runs on its 1 s timer, not the poll backoff"
         )
     }
 

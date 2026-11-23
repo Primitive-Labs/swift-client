@@ -47,19 +47,119 @@ public struct QueryTranslator {
         fieldTypes: [String: String]? = nil,
         tableName: String? = nil
     ) throws -> (String, [Any]) {
+        try translate(
+            filter, stringsetFields: stringsetFields, stringFields: stringFields,
+            fieldTypes: fieldTypes, tableName: tableName, viewTable: nil
+        )
+    }
+
+    /// Translate a filter over a format-3 document's `record_log_view` (the
+    /// view mode): the statement the room runs for the same filter, so a field
+    /// nobody declared answers too. A field is read from the record's JSON
+    /// (`json_extract(_data, '$.<field>')`, `id` as `_id` and `type` as
+    /// `_type`) and the stored JSON type decides a comparison: `["n": 5]`
+    /// matches a stored 5 and not a stored `"5"`. String-set membership
+    /// (`$contains`, `$all`, `$size`) reads the array the record holds with
+    /// `json_each`, so it matches nothing on a field that holds no array, and a
+    /// substring operator on an array matches its members. An array value is
+    /// `$in`. A field name that is not an identifier, or an operator the
+    /// grammar lacks, throws `JsBaoError(.invalidArgument)` before any SQL is
+    /// built. js-bao's `JsonQueryTranslator` with `stringSets: "json_each"`.
+    ///
+    /// `memberIndexTable` names the device table a field's members are kept in
+    /// (a member index placed on the device), or `nil` for a
+    /// field with none: `$contains` on such a field is a rowid probe of the
+    /// table, binding the member alone as the `_data` statement does.
+    ///
+    /// `textIndex` is the text index a top-level `$search` reads: it
+    /// keeps the rows whose rowid the index matches, binding the MATCH text
+    /// (``RecordLogTextSearch``). A `$search` inside `$and` or `$or` throws
+    /// `JsBaoError(.invalidArgument)`; one with no `textIndex` throws
+    /// `JsBaoError(.queryIndexNotOnDevice)` naming `model`.
+    ///
+    /// `vectorIndex` is the vector index a top-level `$near` reads: it
+    /// keeps the `$near`'s rows (`rowid IN` its nearest rows), binding the
+    /// query vector. A `$near` with no `vectorIndex`, or inside `$and` or
+    /// `$or`, throws as ``RecordLogViewReader/nearIndex(_:_:)`` refuses it.
+    static func translateView(
+        _ filter: DocumentFilter, table: String = "record_log_view", memberIndexTable: ((String) -> String?)? = nil,
+        textIndex: ViewTextIndex? = nil, vectorIndex: RecordLogNearSearch.Read? = nil, model: String? = nil
+    ) throws -> (String, [Any]) {
+        try translate(
+            filter, stringsetFields: [], stringFields: nil, fieldTypes: nil, tableName: nil, viewTable: table,
+            memberIndexTable: memberIndexTable,
+            search: ViewSearch(index: textIndex, vector: vectorIndex, model: model ?? "the model", nested: false)
+        )
+    }
+
+    /// The text index a view read's `$search` reads: its FTS5 table,
+    /// its fields in index order (column `f<i>` keeps field `i`) and a
+    /// positive weight per field, in the same order.
+    struct ViewTextIndex: Equatable, Sendable {
+        var table: String
+        var fields: [String]
+        var weights: [Double]
+    }
+
+    /// How a view translation answers a `$search` key: the index it reads,
+    /// the model a refusal names, and whether the filter is a branch of
+    /// `$and` or `$or`.
+    private struct ViewSearch {
+        var index: ViewTextIndex?
+        /// The vector index a `$near` reads.
+        var vector: RecordLogNearSearch.Read? = nil
+        var model: String
+        var nested: Bool
+    }
+
+    /// `translate`, reading fields from `viewTable`'s `_data` when it is set.
+    private static func translate(
+        _ filter: DocumentFilter,
+        stringsetFields: Set<String>,
+        stringFields: Set<String>?,
+        fieldTypes: [String: String]?,
+        tableName: String?,
+        viewTable: String?,
+        memberIndexTable: ((String) -> String?)? = nil,
+        search: ViewSearch? = nil
+    ) throws -> (String, [Any]) {
         var conditions: [String] = []
         var params: [Any] = []
+        var branch = search
+        branch?.nested = true
 
         for (key, value) in filter {
-            if key == "$and", let arr = subFilters(value) {
-                let sub = try arr.map { try translate($0, stringsetFields: stringsetFields, stringFields: stringFields, fieldTypes: fieldTypes, tableName: tableName) }
+            if key == RecordLogTextSearch.key, let viewTable, let search {
+                // A text search keeps the rows its index matches (#5223).
+                if search.nested {
+                    throw JsBaoError(
+                        code: .invalidArgument,
+                        message: "$search is allowed only at the top level of a filter: it combines with the rest of the filter by AND"
+                    )
+                }
+                guard let index = search.index else { throw RecordLogTextSearch.notOnDevice(model: search.model) }
+                let match = try RecordLogTextSearch.match(try RecordLogTextSearch.parse(value), indexFields: index.fields)
+                let fts = quoted(index.table)
+                conditions.append("\(viewTable).rowid IN (SELECT rowid FROM \(fts) WHERE \(fts) MATCH ?)")
+                params.append(match)
+            } else if key == RecordLogNearSearch.key, viewTable != nil, let search {
+                // A count, a filter and an aggregate keep the `$near`'s rows (#5230).
+                if search.nested { throw RecordLogNearSearch.nested() }
+                guard let read = search.vector else {
+                    throw RecordLogNearSearch.notOnDevice(model: search.model, field: value["field"]?.stringValue ?? "")
+                }
+                let rows = try RecordLogViewReader.nearRows(read, memberIndexTable: memberIndexTable, model: search.model)
+                conditions.append("record_log_view.rowid IN (SELECT rowid FROM (\(rows.sql)))")
+                params.append(contentsOf: rows.params.map { $0 as Any })
+            } else if key == "$and", let arr = subFilters(value) {
+                let sub = try arr.map { try translate($0, stringsetFields: stringsetFields, stringFields: stringFields, fieldTypes: fieldTypes, tableName: tableName, viewTable: viewTable, memberIndexTable: memberIndexTable, search: branch) }
                 let joined = sub.map { "(\($0.0))" }.joined(separator: " AND ")
                 if !joined.isEmpty {
                     conditions.append("(\(joined))")
                     for s in sub { params.append(contentsOf: s.1) }
                 }
             } else if key == "$or", let arr = subFilters(value) {
-                let sub = try arr.map { try translate($0, stringsetFields: stringsetFields, stringFields: stringFields, fieldTypes: fieldTypes, tableName: tableName) }
+                let sub = try arr.map { try translate($0, stringsetFields: stringsetFields, stringFields: stringFields, fieldTypes: fieldTypes, tableName: tableName, viewTable: viewTable, memberIndexTable: memberIndexTable, search: branch) }
                 let joined = sub.map { "(\($0.0))" }.joined(separator: " OR ")
                 if !joined.isEmpty {
                     conditions.append("(\(joined))")
@@ -92,11 +192,29 @@ public struct QueryTranslator {
                         stringsetFields: stringsetFields,
                         stringFields: stringFields,
                         fieldTypes: fieldTypes,
-                        tableName: tableName
+                        tableName: tableName,
+                        viewTable: viewTable,
+                        memberIndexTable: memberIndexTable
                     ) {
                         conditions.append(cond)
                         params.append(contentsOf: p)
                     }
+                }
+            } else if let viewTable {
+                // Simple equality over the record's JSON; an array is `$in`.
+                let field = try viewField(key)
+                if case let .array(items) = value {
+                    if let (cond, p) = try translateOperator(
+                        field: key, op: "$in", value: .array(items), viewTable: viewTable
+                    ) {
+                        conditions.append(cond)
+                        params.append(contentsOf: p)
+                    }
+                } else if value.isNull {
+                    conditions.append("\(field) IS NULL")
+                } else {
+                    conditions.append("\(field) = ?")
+                    params.append(sqlValue(value))
                 }
             } else {
                 // Simple equality: { "field": value }
@@ -127,9 +245,16 @@ public struct QueryTranslator {
         stringsetFields: Set<String> = [],
         stringFields: Set<String>? = nil,
         fieldTypes: [String: String]? = nil,
-        tableName: String? = nil
+        tableName: String? = nil,
+        viewTable: String? = nil,
+        memberIndexTable: ((String) -> String?)? = nil
     ) throws -> (String, [Any])? {
-        let col = quoted(field)
+        let col = try viewTable == nil ? quoted(field) : viewField(field)
+        if let viewTable, let condition = try viewOperator(
+            field: field, op: op, value: value, column: col, table: viewTable, memberIndexTable: memberIndexTable
+        ) {
+            return condition
+        }
 
         // Substring operators ($startsWith / $endsWith / $containsText)
         // share one validate-then-build path so the scalar and stringset
@@ -165,6 +290,18 @@ public struct QueryTranslator {
                 raw, mode: mode, field: field, op: op, fieldType: type
             ) else {
                 return nil
+            }
+            if let viewTable {
+                let like = "LIKE ? ESCAPE '\\' COLLATE NOCASE"
+                // `id` and `type` are the record's key and model columns, never in its JSON.
+                if viewSystemFields.contains(field) { return ("\(col) \(like)", [pattern]) }
+                // The record's own JSON: a stored array matches on a member,
+                // any other stored value on itself.
+                let path = try viewDataPath(field, table: viewTable)
+                return (
+                    "((json_type(\(path)) <> 'array' AND \(col) \(like)) OR \(viewSetMember(path, "_set.value \(like)")))",
+                    [pattern, pattern]
+                )
             }
             if stringsetFields.contains(field) {
                 return stringsetSubstringSQL(
@@ -309,15 +446,24 @@ public struct QueryTranslator {
     ///     INNER JOIN the member junction and group by member `value`;
     ///   - **stringset membership** (`.stringSetMembership`) → LEFT JOIN
     ///     the junction on a specific value and group by a `true`/`false`
-    ///     CASE on whether the member is present.
+    ///     CASE on whether the member is present;
+    ///   - **date period** (`.datePeriod`) → group by the bucket expression
+    ///     `periodBucketSQL` emits over the field's stored text.
     ///
-    /// Output stays flat `[[String: JSONValue]]` rows (Swift's idiom) rather
-    /// than js-bao's nested map. `scopedToDocIds`, when set, scopes the
-    /// query to those documents — woven into the WHERE here (not spliced by
+    /// Every group level is selected under its positional alias (`_g<i>`, `i`
+    /// its index in `groupBy`) and every operation under its own (`_o<i>`, `i`
+    /// its index in `operations`), so no group column shares a name with an
+    /// operation, whatever its `resultKey`; `aggregationRows` turns the SQL
+    /// rows into js-bao's `["group": …, <op keys>]` rows. Two levels that
+    /// would share a key in `group`, or an operation whose `resultKey` is
+    /// `group`, are refused here, before any SQL is built
+    /// (`ambiguousGroupKeysMessage`, `reservedOperationKeyMessage`).
+    ///
+    /// `scopedToDocIds`, when set, scopes the query to those documents — woven into the WHERE here (not spliced by
     /// the caller) so its bind params land after any JOIN params. An empty
     /// list is a scope that admits nothing, not one that admits everything:
     /// it is what a model with no connected document of the kind being read
-    /// asks for (#3436).
+    /// asks for.
     public static func buildAggregation(
         tableName: String,
         options: AggregateOptions,
@@ -326,16 +472,26 @@ public struct QueryTranslator {
         fieldTypes: [String: String]? = nil,
         scopedToDocIds: [String]? = nil
     ) throws -> (String, [Any]) {
-        var regularFields: [String] = []
-        var facetFields: [String] = []
-        var memberships: [(field: String, contains: String)] = []
-        for clause in options.groupBy {
+        if let key = ambiguousGroupKey(options.groupBy) {
+            throw JsBaoError(code: .invalidArgument, message: ambiguousGroupKeysMessage(key))
+        }
+        if options.operations.contains(where: { $0.resultKey == groupRowKey }) {
+            throw JsBaoError(code: .invalidArgument, message: reservedOperationKeyMessage)
+        }
+
+        var regularFields: [(index: Int, name: String)] = []
+        var facetFields: [(index: Int, name: String)] = []
+        var memberships: [(index: Int, field: String, contains: String)] = []
+        var periods: [(index: Int, field: String, period: DatePeriod)] = []
+        for (index, clause) in options.groupBy.enumerated() {
             switch clause {
             case let .field(name):
-                if stringsetFields.contains(name) { facetFields.append(name) }
-                else { regularFields.append(name) }
+                if stringsetFields.contains(name) { facetFields.append((index, name)) }
+                else { regularFields.append((index, name)) }
             case let .stringSetMembership(field, contains):
-                memberships.append((field, contains))
+                memberships.append((index, field, contains))
+            case let .datePeriod(field, period):
+                periods.append((index, field, period))
             }
         }
 
@@ -351,10 +507,10 @@ public struct QueryTranslator {
         // every layer), so we DEGRADE here rather than crash the host app: a
         // pure single facet runs; a pure multi-facet returns no rows; anything
         // mixed drops the facet and proceeds as regular aggregation.
-        if regularFields.isEmpty && memberships.isEmpty && !facetFields.isEmpty {
+        if regularFields.isEmpty && memberships.isEmpty && periods.isEmpty && !facetFields.isEmpty {
             if facetFields.count == 1 {
                 return try buildFacetAggregation(
-                    tableName: tableName, facetField: facetFields[0],
+                    tableName: tableName, facet: facetFields[0],
                     options: options, stringsetFields: stringsetFields,
                     stringFields: stringFields, fieldTypes: fieldTypes,
                     scopedToDocIds: scopedToDocIds
@@ -364,7 +520,7 @@ public struct QueryTranslator {
             // a guaranteed-empty result instead of aborting the caller.
             log.warn(
                 "aggregate: grouping by multiple stringset facet fields is "
-                + "unsupported (\(facetFields)); returning no rows. Group by a "
+                + "unsupported (\(facetFields.map(\.name))); returning no rows. Group by a "
                 + "single facet field, or combine facets with regular / "
                 + "membership group-bys."
             )
@@ -377,7 +533,7 @@ public struct QueryTranslator {
         // rollup when both are empty) proceeds normally.
         return try buildRegularAggregation(
             tableName: tableName, regularFields: regularFields,
-            memberships: memberships, options: options,
+            memberships: memberships, periods: periods, options: options,
             stringsetFields: stringsetFields, stringFields: stringFields,
             fieldTypes: fieldTypes, scopedToDocIds: scopedToDocIds
         )
@@ -403,8 +559,9 @@ public struct QueryTranslator {
     /// membership group keys via correlated LEFT JOINs.
     private static func buildRegularAggregation(
         tableName: String,
-        regularFields: [String],
-        memberships: [(field: String, contains: String)],
+        regularFields: [(index: Int, name: String)],
+        memberships: [(index: Int, field: String, contains: String)],
+        periods: [(index: Int, field: String, period: DatePeriod)],
         options: AggregateOptions,
         stringsetFields: Set<String>,
         stringFields: Set<String>?,
@@ -417,22 +574,20 @@ public struct QueryTranslator {
         var groupByClauses: [String] = []
         var joinClauses: [String] = []
 
-        for field in regularFields {
-            selectClauses.append("\(t).\(quoted(field))")
-            groupByClauses.append("\(t).\(quoted(field))")
+        // The expression `sort` orders by when it names a group key.
+        var sortExpressions: [String: String] = [:]
+
+        for (index, field) in regularFields {
+            let column = "\(t).\(quoted(field))"
+            selectClauses.append("\(column) AS \(quoted(positionalGroupAlias(index)))")
+            groupByClauses.append(column)
+            sortExpressions[field] = column
         }
 
-        var usedAliases = Set<String>()
-        for membership in memberships {
-            var alias = membershipAlias(field: membership.field, contains: membership.contains)
-            var n = 1
-            while usedAliases.contains(alias) {
-                alias = membershipAlias(field: membership.field, contains: membership.contains) + "_\(n)"
-                n += 1
-            }
-            usedAliases.insert(alias)
-            let a = quoted(alias)
-            let junction = quoted("\(tableName)__\(membership.field)")
+        for (index, field, contains) in memberships {
+            let a = quoted(membershipJoinAlias(tableName: tableName, index: index))
+            let groupAlias = quoted(positionalGroupAlias(index))
+            let junction = quoted("\(tableName)__\(field)")
             // Correlate on parent_id AND _meta_doc_id (shared multi-doc
             // engine) and the specific member value — at most one match
             // per record, so COUNT(*) doesn't multiply.
@@ -441,10 +596,19 @@ public struct QueryTranslator {
                 + " AND \(a).\"_meta_doc_id\" = \(t).\"_meta_doc_id\""
                 + " AND \(a).\"value\" = ?"
             )
-            params.append(membership.contains)
+            params.append(contains)
             let caseExpr = "CASE WHEN \(a).\"parent_id\" IS NOT NULL THEN 'true' ELSE 'false' END"
-            selectClauses.append("\(caseExpr) AS \(a)")
+            selectClauses.append("\(caseExpr) AS \(groupAlias)")
             groupByClauses.append(caseExpr)
+            sortExpressions[aggregationGroupKey(.stringSetMembership(field: field, contains: contains))] = groupAlias
+        }
+
+        for (index, field, period) in periods {
+            let bucket = periodBucketSQL(column: "\(t).\(quoted(field))", period: period)
+            let groupAlias = quoted(positionalGroupAlias(index))
+            selectClauses.append("\(bucket) AS \(groupAlias)")
+            groupByClauses.append(bucket)
+            sortExpressions[aggregationGroupKey(.datePeriod(field: field, period: period))] = groupAlias
         }
 
         appendOperations(options.operations, table: t, into: &selectClauses)
@@ -474,7 +638,7 @@ public struct QueryTranslator {
         if !groupByClauses.isEmpty {
             sql += " GROUP BY \(groupByClauses.joined(separator: ", "))"
         }
-        sql += aggregateOrderLimit(options)
+        sql += aggregateOrderLimit(options, sortExpressions: sortExpressions)
         return (sql, params)
     }
 
@@ -482,7 +646,7 @@ public struct QueryTranslator {
     /// faceted field, with the count (and any ops) of records carrying it.
     private static func buildFacetAggregation(
         tableName: String,
-        facetField: String,
+        facet: (index: Int, name: String),
         options: AggregateOptions,
         stringsetFields: Set<String>,
         stringFields: Set<String>?,
@@ -490,9 +654,10 @@ public struct QueryTranslator {
         scopedToDocIds: [String]?
     ) throws -> (String, [Any]) {
         let t = quoted(tableName)
-        let junction = quoted("\(tableName)__\(facetField)")
+        let junction = quoted("\(tableName)__\(facet.name)")
+        let member = "\(junction).\"value\""
         var params: [Any] = []
-        var selectClauses: [String] = ["\(junction).\"value\" AS \(quoted(facetField))"]
+        var selectClauses: [String] = ["\(member) AS \(quoted(positionalGroupAlias(facet.index)))"]
         appendOperations(options.operations, table: t, into: &selectClauses)
         if options.operations.isEmpty { selectClauses.append("COUNT(*) AS \"count\"") }
 
@@ -517,49 +682,58 @@ public struct QueryTranslator {
         }
         if !whereParts.isEmpty { sql += " WHERE " + whereParts.joined(separator: " AND ") }
 
-        sql += " GROUP BY \(junction).\"value\""
-        sql += aggregateOrderLimit(options)
+        sql += " GROUP BY \(member)"
+        sql += aggregateOrderLimit(options, sortExpressions: [facet.name: member])
         return (sql, params)
     }
 
     /// Append `count`/`sum`/`avg`/`min`/`max` SELECT clauses, qualifying
-    /// each operand field with the main table `t`.
+    /// each operand field with the main table `t`. Each is selected under its
+    /// positional alias; `aggregationRows` puts it back under its `resultKey`.
     private static func appendOperations(
         _ operations: [AggregateOperation],
         table t: String,
         into clauses: inout [String]
     ) {
-        for op in operations {
+        for (index, op) in operations.enumerated() {
+            let alias = quoted(positionalOperationAlias(index))
             switch op.type {
             case .count:
-                clauses.append("COUNT(*) AS \(quoted(op.resultKey))")
+                clauses.append("COUNT(*) AS \(alias)")
             case .sum:
                 if let field = op.field {
-                    clauses.append("SUM(CAST(\(t).\(quoted(field)) AS REAL)) AS \(quoted(op.resultKey))")
+                    clauses.append("SUM(CAST(\(t).\(quoted(field)) AS REAL)) AS \(alias)")
                 }
             case .avg:
                 if let field = op.field {
-                    clauses.append("AVG(CAST(\(t).\(quoted(field)) AS REAL)) AS \(quoted(op.resultKey))")
+                    clauses.append("AVG(CAST(\(t).\(quoted(field)) AS REAL)) AS \(alias)")
                 }
             case .min:
                 if let field = op.field {
-                    clauses.append("MIN(\(t).\(quoted(field))) AS \(quoted(op.resultKey))")
+                    clauses.append("MIN(\(t).\(quoted(field))) AS \(alias)")
                 }
             case .max:
                 if let field = op.field {
-                    clauses.append("MAX(\(t).\(quoted(field))) AS \(quoted(op.resultKey))")
+                    clauses.append("MAX(\(t).\(quoted(field))) AS \(alias)")
                 }
             }
         }
     }
 
-    /// ORDER BY (by group-by field or an op's output alias — SQLite
-    /// resolves the identifier either way) + LIMIT.
-    private static func aggregateOrderLimit(_ options: AggregateOptions) -> String {
+    /// ORDER BY + LIMIT. `sort.field` names an operation's result key first
+    /// (as in js-bao, where a group field named `count` does not shadow the
+    /// count), then a group key, by the expression in `sortExpressions`.
+    private static func aggregateOrderLimit(
+        _ options: AggregateOptions,
+        sortExpressions: [String: String]
+    ) -> String {
         var sql = ""
         if let sort = options.sort {
             let dir = sort.direction == -1 ? "DESC" : "ASC"
-            sql += " ORDER BY \(quoted(sort.field)) \(dir)"
+            let expression = options.operations.firstIndex { $0.resultKey == sort.field }
+                .map { quoted(positionalOperationAlias($0)) }
+                ?? sortExpressions[sort.field] ?? quoted(sort.field)
+            sql += " ORDER BY \(expression) \(dir)"
         }
         if let limit = options.limit, limit >= 0 {
             sql += " LIMIT \(limit)"
@@ -567,14 +741,277 @@ public struct QueryTranslator {
         return sql
     }
 
-    /// Deterministic, SQL-safe alias for a membership group key. The
-    /// actual match value is bound as a parameter, so alias sanitization
-    /// only affects the output column name (`has_<field>_<contains>`).
-    private static func membershipAlias(field: String, contains: String) -> String {
-        func san(_ s: String) -> String {
-            String(s.map { ($0.isLetter || $0.isNumber) ? $0 : "_" })
+    // MARK: - Aggregate rows
+
+    /// The key a `groupBy` level takes in a row's `group`: the field name for
+    /// a plain field or a StringSet facet, `has_<field>_<contains>` for a
+    /// membership check, with `field` and `contains` written as given.
+    static func aggregationGroupKey(_ level: AggregateGroupBy) -> String {
+        switch level {
+        case let .field(name): return name
+        case let .stringSetMembership(field, contains): return "has_\(field)_\(contains)"
+        case let .datePeriod(field, period): return "\(field)_\(period.rawValue)"
         }
-        return "has_\(san(field))_\(san(contains))"
+    }
+
+    /// The expression bucketing `column` by `period`, read from the stored
+    /// text with no time-zone conversion: `YYYY-MM`, `YYYY-Qn` or `YYYY`, and
+    /// `NULL` for a missing value or text that does not begin `YYYY-MM`.
+    /// Digits are not range-checked. The same text js-bao's `periodBucketSql`
+    /// emits, so the two clients bucket the same stored strings alike.
+    static func periodBucketSQL(column: String, period: DatePeriod) -> String {
+        let bucket: String
+        switch period {
+        case .month:
+            bucket = "substr(\(column), 1, 7)"
+        case .quarter:
+            bucket = "substr(\(column), 1, 4) || '-Q' || ((CAST(substr(\(column), 6, 2) AS INTEGER) + 2) / 3)"
+        case .year:
+            bucket = "substr(\(column), 1, 4)"
+        }
+        return "CASE WHEN \(column) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]*' THEN \(bucket) ELSE NULL END"
+    }
+
+    /// Refuses a `.datePeriod` level whose field is not in `fields` or is not
+    /// a `.date` or `.string` field, with js-bao's messages, before any SQL.
+    static func validatePeriodLevels(
+        _ groupBy: [AggregateGroupBy], fields: [String: FieldDescriptor]
+    ) throws {
+        for case let .datePeriod(field, _) in groupBy {
+            guard let descriptor = fields[field] else {
+                throw JsBaoError(
+                    code: .invalidArgument,
+                    message: "Unknown field '\(field)' in period groupBy"
+                )
+            }
+            guard descriptor.type == .date || descriptor.type == .string else {
+                throw JsBaoError(
+                    code: .invalidArgument,
+                    message: "Field '\(field)' is not a date or string field but used in period groupBy"
+                )
+            }
+        }
+    }
+
+    /// The SQL alias the level at `index` of `groupBy` is selected under. It
+    /// never appears in a returned row.
+    static func positionalGroupAlias(_ index: Int) -> String { "_g\(index)" }
+
+    /// The SQL alias the operation at `index` of `operations` is selected
+    /// under. Disjoint from every group alias, so a custom `outputField` (even
+    /// `_g0`) cannot take a group column's name. It never appears in a
+    /// returned row.
+    static func positionalOperationAlias(_ index: Int) -> String { "_o\(index)" }
+
+    /// The alias the membership level at `index` joins its junction table
+    /// under. Built on the model's table name and longer than it, so it can
+    /// never name the main table (SQLite compares identifiers ignoring case),
+    /// and never a junction (`<table>__<field>`).
+    static func membershipJoinAlias(tableName: String, index: Int) -> String {
+        "\(tableName)_m\(index)"
+    }
+
+    /// The row key holding the group values, so no operation may take it.
+    static let groupRowKey = "group"
+
+    /// The refusal for an operation whose `resultKey` is the row's `group`.
+    static let reservedOperationKeyMessage =
+        "Aggregation operation result key 'group' is reserved for the row's group values"
+
+    /// The first group key more than one `groupBy` level would take, or nil.
+    static func ambiguousGroupKey(_ groupBy: [AggregateGroupBy]) -> String? {
+        var seen = Set<String>()
+        for level in groupBy {
+            let key = aggregationGroupKey(level)
+            if !seen.insert(key).inserted { return key }
+        }
+        return nil
+    }
+
+    /// The refusal for two `groupBy` levels that would share one row key —
+    /// js-bao's message, word for word.
+    static func ambiguousGroupKeysMessage(_ key: String) -> String {
+        "Ambiguous aggregation group keys: '\(key)' names more than one groupBy level"
+    }
+
+    /// The rows of a statement `buildAggregation` built, as js-bao answers
+    /// them: each level's value as stored under its key in `group` (`null`
+    /// for a missing value or a level the statement did not select), and every
+    /// operation's value beside it under its result key, `null` when SQL had
+    /// none to give.
+    static func aggregationRows(
+        _ sqlRows: [[String: JSONValue]],
+        options: AggregateOptions
+    ) -> [[String: JSONValue]] {
+        sqlRows.map { sqlRow in
+            var row = sqlRow
+            var group: [String: JSONValue] = [:]
+            for (index, level) in options.groupBy.enumerated() {
+                group[aggregationGroupKey(level)] =
+                    row.removeValue(forKey: positionalGroupAlias(index)) ?? .null
+            }
+            for (index, operation) in options.operations.enumerated() {
+                let value = row.removeValue(forKey: positionalOperationAlias(index))
+                if value != nil || row[operation.resultKey] == nil {
+                    row[operation.resultKey] = value ?? .null
+                }
+            }
+            row[groupRowKey] = .object(group)
+            return row
+        }
+    }
+
+    // MARK: - View mode
+
+    /// The operators whose view-mode SQL differs from the column mode's, or
+    /// that exist in the view mode only; `nil` for the shared ones. An
+    /// operator the grammar lacks throws rather than matching nothing.
+    private static func viewOperator(
+        field: String, op: String, value: JSONValue, column: String, table: String, memberIndexTable: ((String) -> String?)? = nil
+    ) throws -> (String, [Any])? {
+        switch op {
+        case "$eq" where value.isNull:
+            // The room binds the null, and `= NULL` matches nothing: `{ f: null }`
+            // is the spelling for absent or null (the null contract, rule 1).
+            return ("\(column) = ?", [NSNull()])
+        case "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$nin":
+            return nil
+        case "$in":
+            guard value.arrayValue != nil else {
+                throw viewOperatorError("$in operator requires an array value for field \(field)", field: field, op: op)
+            }
+            return nil
+        case "$exists":
+            guard let exists = value.boolValue else {
+                throw viewOperatorError("$exists operator requires a boolean value for field \(field)", field: field, op: op)
+            }
+            // A stored null exists; only a field the record lacks does not.
+            let probe = viewSystemFields.contains(field) ? column : "json_type(_data, \(viewPath(field)))"
+            return (exists ? "\(probe) IS NOT NULL" : "\(probe) IS NULL", [])
+        case "$contains":
+            guard let member = value.stringValue else {
+                throw viewOperatorError("$contains operator requires a string value for field \(field)", field: field, op: op)
+            }
+            // An opted-in field's members are read from its member index (#5156).
+            if !viewSystemFields.contains(field), !viewReadsUnset(field), let index = memberIndexTable?(field) {
+                return (viewMemberProbe(index, table: table), [member])
+            }
+            return (viewSetMember(try viewDataPath(field, table: table), "_set.value = ?"), [member])
+        case "$all":
+            guard let members = value.arrayValue, members.allSatisfy({ $0.stringValue != nil }) else {
+                throw viewOperatorError("$all operator requires an array of strings for field \(field)", field: field, op: op)
+            }
+            if members.isEmpty { return ("0", []) }
+            let path = try viewDataPath(field, table: table)
+            return (
+                "(json_type(\(path)) = 'array' AND NOT EXISTS (SELECT 1 FROM json_each(?) AS _wanted "
+                    + "WHERE _wanted.value NOT IN (SELECT value FROM json_each(\(path)))))",
+                [RecordLogJSON.text(.array(members))]
+            )
+        case "$size":
+            let comparisons = ["$eq": "=", "$ne": "!=", "$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<="]
+            let entries: [(String, JSONValue)] = value.numberValue != nil
+                ? [("$eq", value)]
+                : (value.objectValue ?? [:]).sorted { $0.key < $1.key }.map { ($0.key, $0.value) }
+            guard !entries.isEmpty,
+                  entries.allSatisfy({ comparisons[$0.0] != nil && ($0.1.numberValue?.isFinite ?? false) })
+            else {
+                throw viewOperatorError(
+                    "$size operator requires a number, or $eq/$ne/$gt/$gte/$lt/$lte with numbers, for field \(field)",
+                    field: field, op: op
+                )
+            }
+            let path = try viewDataPath(field, table: table)
+            let length = "json_array_length(\(path))"
+            let compared = entries.map { "\(length) \(comparisons[$0.0]!) ?" }.joined(separator: " AND ")
+            return ("(json_type(\(path)) = 'array' AND \(compared))", entries.map { sqlValue($0.1) })
+        case "$startsWith", "$endsWith", "$containsText":
+            return nil
+        default:
+            throw viewOperatorError("Unsupported operator: \(op) for field \(field)", field: field, op: op)
+        }
+    }
+
+    /// The fields a view row keeps in its own columns.
+    private static let viewSystemFields: Set<String> = ["id", "type"]
+
+    /// The fields a view statement reads as absent from records, whatever
+    /// `_data` holds (#6021): a db3's cleared and tombstoned fields. For a
+    /// field `documents` names, only rows of those db3s read it as unset;
+    /// any other field of `fields` is unset on every row.
+    struct ViewUnset: Sendable, Equatable {
+        var fields: Set<String>
+        var documents: [String: [String]] = [:]
+    }
+
+    /// The fields the view statements built in this scope read as unset;
+    /// `nil` (the default) leaves every statement as it was. Set by
+    /// ``RecordLogViewReader`` around one model's statements.
+    @TaskLocal static var viewUnset: ViewUnset?
+
+    /// The JSON path an unset field is read at: a leading `_` is a name no
+    /// record field may hold, so it never addresses a stored value.
+    private static let unsetPath = "$._unset"
+
+    /// Whether the scope's statements read `field` as unset on any row.
+    static func viewReadsUnset(_ field: String) -> Bool {
+        viewUnset?.fields.contains(field) ?? false
+    }
+
+    /// The JSON path of `field` in `_data` as SQL: the quoted path, or for an
+    /// unset field the unset path, picked per row by its document when only
+    /// some db3s clear it. `table` qualifies the document column.
+    static func viewPath(_ field: String, table: String? = nil) -> String {
+        guard let unset = viewUnset, unset.fields.contains(field) else { return "'$.\(field)'" }
+        guard let documents = unset.documents[field] else { return "'\(unsetPath)'" }
+        if documents.isEmpty { return "'$.\(field)'" }
+        let column = table.map { "\($0).doc_id" } ?? "doc_id"
+        let ids = documents.map { "'\($0.replacingOccurrences(of: "'", with: "''"))'" }.joined(separator: ", ")
+        return "(CASE WHEN \(column) IN (\(ids)) THEN '\(unsetPath)' ELSE '$.\(field)' END)"
+    }
+
+    /// A field as the view mode reads it: `id` and `type` from their columns,
+    /// any other identifier from the record's JSON. Also what a view query
+    /// sorts and pages on.
+    static func viewField(_ field: String) throws -> String {
+        if viewSystemFields.contains(field) { return quoted("_\(field)") }
+        try requireViewIdentifier(field)
+        return "json_extract(_data, \(viewPath(field)))"
+    }
+
+    /// `<table>._data, '$.<field>'`: the arguments that address a field's stored JSON.
+    private static func viewDataPath(_ field: String, table: String) throws -> String {
+        try requireViewIdentifier(field)
+        return "\(table)._data, \(viewPath(field, table: table))"
+    }
+
+    /// A record holds `?` in the set `index` keeps: a rowid probe of the member
+    /// index, driven by the member, never a correlated `EXISTS`.
+    static func viewMemberProbe(_ index: String, table: String = "record_log_view") -> String {
+        "\(table).rowid IN (SELECT rid FROM \(quoted(index)) WHERE value = ?)"
+    }
+
+    /// True only where the stored value is an array, and then when `members`
+    /// (a condition over its `json_each` rows, aliased `_set`) holds for one.
+    private static func viewSetMember(_ path: String, _ members: String) -> String {
+        "(json_type(\(path)) = 'array' AND EXISTS (SELECT 1 FROM json_each(\(path)) AS _set WHERE \(members)))"
+    }
+
+    /// A name goes into the statement as text, so it must be an identifier:
+    /// js-bao's `assertValidIdentifier` refusal, word for word (`context` is
+    /// `query field` or `query model`).
+    static func requireViewIdentifier(_ name: String, context: String = "query field") throws {
+        guard RecordLogSchema.isValidIdentifier(name) else {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "\(context): Identifier \"\(name)\" must match ^[A-Za-z_][A-Za-z0-9_]*$",
+                details: [context == "query model" ? "model" : "field": .string(name)]
+            )
+        }
+    }
+
+    private static func viewOperatorError(_ message: String, field: String, op: String) -> JsBaoError {
+        JsBaoError(code: .invalidArgument, message: message, details: ["field": .string(field), "operator": .string(op)])
     }
 
     // MARK: - Helpers
@@ -669,7 +1106,7 @@ public struct QueryTranslator {
     /// validation failure throws. Carries `field` / `operator` /
     /// `fieldType` in `details`, mirroring js-bao's `InvalidOperatorError`
     /// structured fields and reusing the `.invalidArgument` code the
-    /// projection precedent (#1118) chose for query-input errors.
+    /// projection precedent chose for query-input errors.
     private static func substringError(
         _ message: String, field: String, op: String, fieldType: String
     ) -> JsBaoError {

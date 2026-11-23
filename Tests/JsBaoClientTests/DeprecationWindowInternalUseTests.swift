@@ -108,6 +108,12 @@ final class DeprecationWindowInternalUseTests: XCTestCase {
         "logAnalyticsEvent(",
         // #1991 / #2367: the legacy closure transport.
         "ClosureTransport",
+        // #4005: the client's private hop onto `HttpClient`'s untyped surface.
+        "legacyJSONGraph",
+        // #4005: the `Any` body encoding and classification behind
+        // `HttpClient`'s untyped surface.
+        "encodeLegacyBody",
+        "legacyParsedJSON",
     ]
 
     func testRemovedDeprecatedSymbolsDoNotReappear() throws {

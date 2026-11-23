@@ -11,9 +11,9 @@ public enum HTTPMethod: String, Sendable {
     case patch = "PATCH"
     case delete = "DELETE"
 
-    /// Verbs that cannot carry a request body. Matches
-    /// `HttpClient.canHaveBody`, so the typed spine and the deprecated
-    /// `Any` spine drop bodies on exactly the same verbs.
+    /// Verbs that cannot carry a request body. Matches the GET/HEAD guard in
+    /// `HttpClient.buildURLRequest`, which drops a body on those verbs
+    /// whatever the caller encoded.
     public var allowsBody: Bool { self != .get && self != .head }
 }
 
@@ -83,6 +83,99 @@ public protocol Transport: Sendable {
     ) async throws -> TransportResponse
 }
 
+// MARK: - NetworkGatedTransport
+
+/// The `Transport` the client's API namespaces hold: before every request it
+/// asks the client whether networking is allowed, and when it is not it
+/// throws the client's `.offline` error without attempting the request.
+/// Mirrors the JS client's `makeRequest` gate (`offlineRequestError`).
+///
+/// The check is installed after construction (`setOfflineCheck`), because the
+/// namespaces are built in the client's `init` before `self` can be captured.
+/// Until then every request is let through.
+final class NetworkGatedTransport: Transport, @unchecked Sendable {
+    typealias OfflineCheck = @Sendable (_ method: HTTPMethod, _ path: String) -> JsBaoError?
+    /// The error to refuse a request with for what it names, or `nil`: the
+    /// path, and the body unless it is raw bytes. Asynchronous, so it may read
+    /// the device's store before the request goes out.
+    typealias RequestCheck = @Sendable (_ method: HTTPMethod, _ path: String, _ body: Data?) async -> JsBaoError?
+
+    private let base: any Transport
+    private let lock = NSLock()
+    private var offlineCheck: OfflineCheck?
+    private var requestCheck: RequestCheck?
+    /// Test seam: hears every request that goes out to the base transport,
+    /// after the checks. Internal; never set in production code.
+    private var sentForTest: (@Sendable (HTTPMethod, String, Data?) -> Void)?
+    /// Test seam: hears every answer the base transport gives, or its failure. Internal; never set in production code.
+    private var answeredForTest: (@Sendable (HTTPMethod, String, Result<TransportResponse, Error>) -> Void)?
+
+    /// Hear every request this transport sends from now on (a test's pass-through observer).
+    func observeSentForTest(_ observer: (@Sendable (HTTPMethod, String, Data?) -> Void)?) {
+        lock.withLock { sentForTest = observer }
+    }
+
+    /// Hear every answer the base transport gives from now on, its status, headers and body, or its failure (a test's pass-through observer).
+    func observeAnsweredForTest(_ observer: (@Sendable (HTTPMethod, String, Result<TransportResponse, Error>) -> Void)?) {
+        lock.withLock { answeredForTest = observer }
+    }
+
+    /// Install the check every request's path and JSON body are asked of
+    /// before anything else (a db3 that lives only on this device is
+    /// never named to the server).
+    func setRequestCheck(_ check: @escaping RequestCheck) {
+        lock.withLock { requestCheck = check }
+    }
+
+    init(base: any Transport) {
+        self.base = base
+    }
+
+    /// Install the check. It returns the error to throw when networking is
+    /// not allowed, and `nil` when the request may go out.
+    func setOfflineCheck(_ check: @escaping OfflineCheck) {
+        lock.withLock { offlineCheck = check }
+    }
+
+    /// Whether networking is allowed right now: the installed check passes.
+    /// `true` until a check is installed.
+    var networkingAllowed: Bool {
+        lock.withLock({ offlineCheck })?(.get, "") == nil
+    }
+
+    /// Throw the `.offline` error when networking is not allowed right now.
+    func requireNetworking(method: HTTPMethod, path: String) throws {
+        if let error = lock.withLock({ offlineCheck })?(method, path) {
+            throw error
+        }
+    }
+
+    func execute(
+        method: HTTPMethod,
+        path: String,
+        body: Data?,
+        options: RequestOptions?
+    ) async throws -> TransportResponse {
+        if let check = lock.withLock({ requestCheck }),
+           let error = await check(method, path, options?.rawBody == true ? nil : body) {
+            throw error
+        }
+        try requireNetworking(method: method, path: path)
+        lock.withLock({ sentForTest })?(method, path, body)
+        guard let answered = lock.withLock({ answeredForTest }) else {
+            return try await base.execute(method: method, path: path, body: body, options: options)
+        }
+        do {
+            let response = try await base.execute(method: method, path: path, body: body, options: options)
+            answered(method, path, .success(response))
+            return response
+        } catch {
+            answered(method, path, .failure(error))
+            throw error
+        }
+    }
+}
+
 // MARK: - The one private primitive
 
 private extension Transport {
@@ -91,7 +184,7 @@ private extension Transport {
     /// the error-body extraction exist in exactly one place.
     ///
     /// Non-2xx is surfaced as `HttpError` with `{serverCode, serverMessage}`
-    /// extracted by the existing `HttpError.parseBody` (#850) — the same
+    /// extracted by the existing `HttpError.parseBody` — the same
     /// mapping `HttpClient.request` has always applied.
     func executeValidated(
         method: HTTPMethod,
@@ -218,7 +311,7 @@ public extension Transport {
     ///
     /// For the handful of endpoints whose request body is an opaque,
     /// caller-supplied JSON graph the client is not allowed to interpret
-    /// (`workflows.start` / `runSync` `rootInput` and `meta`). Re-encoding
+    /// (`functions.start` `rootInput` and `meta`). Re-encoding
     /// such a graph through `JSONValue` would collapse every number to
     /// `Double` and silently lose exactness past 2^53, so the caller composes
     /// the bytes itself and they go out untouched.
@@ -304,8 +397,7 @@ public extension Transport {
 
     /// The full response — status, headers, parsed `JSONValue?`, text —
     /// **without** throwing on a non-2xx status, for callers that inspect the
-    /// status themselves (`IntegrationsAPI`, access validation). Same name and
-    /// meaning as the existing `HttpClient.requestRaw`.
+    /// status themselves (access validation).
     func requestRaw<Body: Encodable & Sendable>(
         method: HTTPMethod,
         path: String,
@@ -356,29 +448,25 @@ public extension Transport {
     }
 }
 
-// MARK: - TransportResponse → legacy views
+// MARK: - TransportResponse → HttpClientResponse
 
 extension TransportResponse {
-    /// The loosely-typed `JSONSerialization` graph the deprecated `Any` spine
-    /// speaks, produced by the **one** classification rule the client has
-    /// always used (previously `HttpClient.fetchParsed`):
+    /// The parsed body `HttpClientResponse.data` carries, by the one
+    /// classification rule the client has always used:
     ///
-    /// * non-JSON content type → the body's UTF-8 text
-    /// * JSON content type + empty body → `nil`
-    /// * JSON content type + malformed body → the text (lenient fallback)
-    /// * otherwise → the parsed graph (fragments allowed)
-    ///
-    /// Used by the deprecated `HttpClient.request` / `requestRaw` surface.
-    /// The typed `Transport` helpers never go through it.
-    var legacyParsedJSON: Any? {
+    /// * non-JSON content type → the body's UTF-8 text as `.string` (`nil`
+    ///   when the bytes are not UTF-8)
+    /// * JSON content type + zero-byte body → `nil`
+    /// * JSON content type + a body that does not parse (malformed, or
+    ///   whitespace only) → the text as `.string`
+    /// * otherwise → the decoded value, top-level fragments included
+    var parsedJSONValue: JSONValue? {
         let contentType = header("Content-Type") ?? ""
         let text = self.text
-        guard contentType.contains("application/json") else { return text }
-        guard let text = text, !text.isEmpty else { return nil }
-        if let parsed = try? JSONSerialization.jsonObject(with: body, options: .fragmentsAllowed) {
-            return parsed
-        }
-        return text
+        guard contentType.contains("application/json") else { return text.map { .string($0) } }
+        guard let text, !text.isEmpty else { return nil }
+        if let value = try? JSONCoding.decodeData(JSONValue.self, from: body) { return value }
+        return .string(text)
     }
 
     /// The single `TransportResponse` → `HttpClientResponse` conversion, so
@@ -388,7 +476,7 @@ extension TransportResponse {
             ok: ok,
             status: status,
             headers: headers,
-            data: legacyParsedJSON.flatMap { try? JSONCoding.decode(JSONValue.self, from: $0) },
+            data: parsedJSONValue,
             text: text
         )
     }

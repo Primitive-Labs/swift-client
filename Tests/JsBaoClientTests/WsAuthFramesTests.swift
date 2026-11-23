@@ -331,7 +331,7 @@ final class WsAuthFramesTests: XCTestCase {
         let apple = try ClientSourceText.slice(
             source,
             from: "func handleAppleCallback(",
-            to: "public func magicLinkRequest("
+            to: "public func magicLinkVerify("
         )
         XCTAssertFalse(
             apple.contains("forceReconnect"),

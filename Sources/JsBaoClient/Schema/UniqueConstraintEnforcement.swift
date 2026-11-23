@@ -77,6 +77,7 @@ internal enum UniqueIndex {
         case let .number(n):    return PrimitiveValue.encodeNumber(n) ?? "null"
         case let .stringset(s): return "[" + s.sorted().joined(separator: ",") + "]"
         case .json:             return ""  // no js-bao precedent; avoid key collisions
+        case .vector:           return ""  // a vector cannot be unique (#5225)
         }
     }
 
@@ -91,7 +92,7 @@ internal enum UniqueIndex {
         case let .stringset(s):
             let parts = s.sorted().map { PrimitiveValue.jsonEncodeString($0) }
             return "[" + parts.joined(separator: ",") + "]"
-        case .json:
+        case .json, .vector:
             return "null"
         }
     }

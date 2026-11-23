@@ -1,5 +1,5 @@
 import Foundation
-import SQLite3
+import JsBaoSQLite
 
 /// SQLite-backed query engine that mirrors Y.Map model data for fast queries.
 ///
@@ -9,7 +9,7 @@ import SQLite3
 ///
 /// This replaces the JS client's IndexedDB/sql.js approach with native SQLite.
 ///
-/// ## `@unchecked Sendable` — safety argument (#1992, Phase C)
+/// ## `@unchecked Sendable` — safety argument (Phase C)
 ///
 /// The engine is a class with mutable state and no compiler-visible isolation,
 /// so the conformance is unchecked. What makes it sound is that **every**
@@ -27,7 +27,7 @@ import SQLite3
 /// re-enters the engine through junction sub-queries and takes `lock` again.
 /// That is why those two methods lock a closure rather than the whole body.
 ///
-/// `final` since #1992: an `@unchecked Sendable` claim on an open class would
+/// `final`: an `@unchecked Sendable` claim on an open class would
 /// be inherited by subclasses that could add unsynchronized state, which would
 /// make the argument above unverifiable. Nothing in the package or its tests
 /// subclassed it.
@@ -37,7 +37,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     /// supplied (single-doc / legacy mode). Matches js-bao's
     /// `BaseModel.DEFAULT_LEGACY_DOC_ID` ("__legacy_default__") so the
     /// in-memory SQLite mirror's rows are tagged identically on both
-    /// clients (#1117). Mirror-only state — rebuilt per session, never
+    /// clients. Mirror-only state — rebuilt per session, never
     /// persisted or sent over the wire.
     public static let legacyDefaultDocId = "__legacy_default__"
 
@@ -49,8 +49,8 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         /// serialized by `lock`, rebuilt from the Y.Maps every session.
         case owned(OpaquePointer?)
         /// The storage provider's OWN connection, on its own serial queue —
-        /// the file-backed tables a large document's rows are projected into
-        /// (#3436, decision 3436-SO-05). Never a second handle on the same
+        /// the file-backed tables a record-log document's rows are projected
+        /// into. Never a second handle on the same
         /// file: that is the `SQLITE_BUSY` class `setupStorage`'s comment
         /// records. A statement issued while the record store holds a
         /// transaction is part of THAT transaction, which is what lets a
@@ -85,7 +85,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
 
     /// Test-only read of the row-write counter. Takes `lock` so a test
     /// sampling the counter while another thread writes is a synchronized
-    /// read rather than a torn one (#1992: the counter was previously a
+    /// read rather than a torn one (the counter was previously a
     /// `private(set)` property read with no synchronization at all, which the
     /// `@unchecked Sendable` safety argument could not have covered).
     internal var rowWriteCount: Int {
@@ -135,18 +135,17 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         }
     }
 
-    /// An engine over a storage provider's own connection (#3436).
+    /// An engine over a storage provider's own connection.
     ///
     /// The tables are the same tables, in the provider's database file rather
-    /// than in memory, so the rows survive the session — which is what makes
-    /// reopening a large document cheap — and every statement is serialized
-    /// with the record store's and the key-value store's on the provider's
-    /// queue. No PRAGMA is issued here: the connection belongs to the
-    /// provider, which has already configured it.
+    /// than in memory, so the rows survive the session, and every statement is
+    /// serialized with the key-value store's on the provider's queue. No PRAGMA
+    /// is issued here: the connection belongs to the provider, which has already
+    /// configured it. The client no longer uses it: a db3 is read from its view,
+    /// and a format-1 document from the in-memory engine.
     ///
     /// **Lock order.** A read takes `lock` and then enters the provider's
-    /// queue. Nothing that runs ON that queue may take `lock` — the projection
-    /// writes (`Format2QueryProjection`) deliberately do not, which is what
+    /// queue. Nothing that runs ON that queue may take `lock`, which is what
     /// keeps the two from closing a cycle.
     public convenience init(host: any Format2SqlHost) {
         self.init(host: host, logger: nil)
@@ -284,6 +283,9 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             }
             columns.append("\"\(field.name)\" \(sqlType)")
         }
+        // The stored values a row's columns do not carry as stored (#6304,
+        // `PrimitiveRecord.storedKindsKey`); NULL for almost every row.
+        columns.append("\"\(PrimitiveRecord.storedKindsKey)\" TEXT")
 
         if withDocIdColumn {
             columns.append("PRIMARY KEY (\"_meta_doc_id\", \"id\")")
@@ -385,6 +387,17 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         var rows: [[String: JSONValue]] = []
         reportingFailure("a raw query") { rows = try executeQuery(sql, params: params) }
         return rows
+    }
+
+    /// The stored-kinds column's value for `stored` (#6304,
+    /// `PrimitiveRecord.storedKindsKey`): its JSON text, which a row reads
+    /// back as the object.
+    static func storedKindsColumn(_ stored: [String: JSONValue]) -> JSONValue {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(JSONValue.object(stored)),
+              let text = String(data: data, encoding: .utf8) else { return .null }
+        return .string(text)
     }
 
     // MARK: - Data Sync
@@ -600,7 +613,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     ///
     /// `sortFields`, when given, names the fields cursors are minted from. Any
     /// of them an inclusion projection omits is additionally selected under the
-    /// internal `_cursor:` alias (#3228) so the cursor carries the row's real
+    /// internal `_cursor:` alias so the cursor carries the row's real
     /// value rather than a false null; `queryPaged` strips those columns from
     /// the rows it returns, so response shapes are unchanged. The fields that
     /// got that treatment come back alongside the column list, so the callers
@@ -655,6 +668,13 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
                 }
             }
         }
+        // The stored values a row's columns do not carry as stored (#6304) are
+        // selected in both modes, so a selected field reads as its record does;
+        // `storedKindsProjected` drops the entries of fields the projection
+        // leaves out.
+        if tableCols.contains(PrimitiveRecord.storedKindsKey) {
+            selected.insert(PrimitiveRecord.storedKindsKey)
+        }
         _ = stringsetFields // stringsets don't appear in SELECT either way
 
         // Deterministic column order for readable SQL.
@@ -673,6 +693,26 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             )
         }
         return (columns.joined(separator: ", "), aliased)
+    }
+
+    /// `row` with its stored-kinds entry (#6304, `PrimitiveRecord.storedKindsKey`)
+    /// kept only for the fields `projection` answers: those it lists under an
+    /// inclusion projection, all but those it lists under an exclusion one.
+    /// The key goes when no entry is left, as a row with none carries none.
+    static func storedKindsProjected(
+        _ row: [String: JSONValue],
+        projection: [String: Int]?
+    ) -> [String: JSONValue] {
+        guard let projection, !projection.isEmpty,
+              case .object(let stored)? = row[PrimitiveRecord.storedKindsKey] else { return row }
+        let include = projection.values.contains(1)
+        let kept = stored.filter { field, _ in
+            include ? projection[field] == 1 : projection[field] != 0
+        }
+        guard kept.count != stored.count else { return row }
+        var out = row
+        out[PrimitiveRecord.storedKindsKey] = kept.isEmpty ? nil : .object(kept)
+        return out
     }
 
     /// After a main-table SELECT, fill each row's stringset fields
@@ -865,6 +905,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             stringsetFields: stringsetFields,
             projection: options?.projection
         )
+        rows = rows.map { Self.storedKindsProjected($0, projection: options?.projection) }
         // The unpaginated read mints no cursors, so the internal sort-value
         // aliases (#3228) are of no use to it — strip them so its rows carry
         // exactly the columns the projection asked for, as before.
@@ -877,10 +918,10 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
 
     /// Paginated variant of `query`. Returns a `PaginatedResult` with
     /// next/prev cursors for forward/backward navigation. Mirrors
-    /// js-bao's `BaseModel.query` Promise<PaginatedResult>.
+    /// js-bao's `BaseModel.query` `Promise<PaginatedResult>`.
     ///
     /// Rows come back as `PrimitiveRow`, the shared row bag, so the page as a
-    /// whole is `Sendable` and can cross an isolation boundary (#1992). Read a
+    /// whole is `Sendable` and can cross an isolation boundary. Read a
     /// field with the same subscript the raw dictionary takes
     /// (`row["field"]?.stringValue`), or reach `row.raw` for the dictionary
     /// itself — the unpaginated `query` above returns those dictionaries
@@ -928,6 +969,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             stringsetFields: stringsetFields,
             projection: options?.projection
         )
+        rows = rows.map { Self.storedKindsProjected($0, projection: options?.projection) }
         let hasMore: Bool = {
             guard let limit else { return false }
             if rows.count > limit {
@@ -947,7 +989,8 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             direction: options?.direction ?? .forward,
             hasMore: hasMore,
             isFirstPage: isFirstPage,
-            aliasedSortFields: aliasedSortFields
+            aliasedSortFields: aliasedSortFields,
+            sortDirections: resolved.directions
         )
         rows = rows.map {
             CursorManager.stripSortValueAliases(
@@ -992,28 +1035,8 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
     /// (CursorManager.ts:184-197, 222-225). Ensures stable
     /// pagination on ties when sorting by a non-unique field.
     private func resolveSort(options: QueryOptions?) -> ResolvedSort {
-        var fields: [String]
-        var dirs: [Int]
-
-        if let ordered = options?.sortOrder, !ordered.isEmpty {
-            fields = ordered.map { $0.0 }
-            dirs = ordered.map { $0.1 == -1 ? -1 : 1 }
-        } else if let sort = options?.sort, !sort.isEmpty {
-            fields = sort.keys.sorted()
-            dirs = fields.map { sort[$0] == -1 ? -1 : 1 }
-        } else {
-            fields = []
-            dirs = []
-        }
-
-        // Append `id ASC` as an implicit tiebreaker if not already in
-        // the sort — makes pagination stable on non-unique sort keys.
-        if !fields.contains("id") {
-            fields.append("id")
-            dirs.append(1)
-        }
-
-        return ResolvedSort(fields: fields, directions: dirs)
+        let sort = (options ?? QueryOptions()).pagingSort
+        return ResolvedSort(fields: sort.fields, directions: sort.directions)
     }
 
     private func buildSelectSQL(
@@ -1161,23 +1184,24 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         return results.first?["COUNT(*)"]?.numberValue.map { Int($0) } ?? 0
     }
 
-    /// Execute an aggregation query. `scopedToDocId` restricts the
+    /// Execute an aggregation query, answering js-bao's rows (see
+    /// `AggregateOptions`). `scopedToDocId` restricts the
     /// underlying SELECT to rows from the named doc; omit to run
     /// across every doc that's written into this engine — that's
     /// how cross-doc aggregate works on a shared store.
     ///
     /// `documents` is the several-document form of the same scope, mirroring
     /// `count(documents:)` and `QueryOptions.documents`: an empty list matches
-    /// nothing. #3436 reads it for a model whose large documents are the ones
+    /// nothing. Read for a model whose record-log documents are the ones
     /// connected, where the scope is "these documents", not "this one".
     ///
-    /// The caller's own `options.documents` (#3760) is INTERSECTED with the
+    /// The caller's own `options.documents` is INTERSECTED with the
     /// parameter, which is the facade's idea of the scope, and the result is
     /// combined with `scopedToDocId` the same way — see {@link aggregateScope}.
     /// Preferring the caller's list over the facade's was the defect finding
     /// 3760-REVIEW-05 names: the facade's list is the routed scope, narrowed to
     /// the documents that are CONNECTED, and these query tables also hold the
-    /// rows of large documents that are closed (#3756 keeps them), so a request
+    /// rows of record-log documents that are closed (closing keeps them), so a request
     /// naming a closed document answered from it where `query` — which narrows
     /// the same request — answered nothing.
     public func aggregate(
@@ -1205,7 +1229,9 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
                 documents: Self.narrow(options.documents, to: documents)
             )
         )
-        return try executeQuery(sql, params: params)
+        return QueryTranslator.aggregationRows(
+            try executeQuery(sql, params: params), options: options
+        )
     }
 
     /// Two document scopes as one: neither may widen the other (finding
@@ -1327,7 +1353,11 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
                     row[name] = .number(sqlite3_column_double(stmt, i))
                 case SQLITE_TEXT:
                     if let cStr = sqlite3_column_text(stmt, i) {
-                        row[name] = .string(String(cString: cStr))
+                        let text = String(cString: cStr)
+                        // The stored-kinds column reads back as the object it was written from.
+                        row[name] = name == PrimitiveRecord.storedKindsKey
+                            ? (JSONValue(jsonText: text) ?? .string(text))
+                            : .string(text)
                     }
                 case SQLITE_NULL:
                     break // omit nulls

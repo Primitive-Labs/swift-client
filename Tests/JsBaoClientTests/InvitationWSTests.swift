@@ -3,6 +3,7 @@ import XCTest
 
 /// Port of tests/client/js-bao-client-invitation-ws.test.ts
 /// Tests the WebSocket event a share delivers to the recipient.
+@available(*, deprecated)
 final class InvitationWSTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

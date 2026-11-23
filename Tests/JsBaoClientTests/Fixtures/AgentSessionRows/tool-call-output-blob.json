@@ -1,0 +1,35 @@
+{
+  "model": "ToolCall",
+  "row": {
+    "id": "call_01K6CALL0000000000000000001",
+    "messageId": "01K6MESSAGE0000000000000000",
+    "seq": 2,
+    "turnId": "turn_1",
+    "callNumber": 2,
+    "toolName": "lookup",
+    "state": "output-available",
+    "input": "{\"topic\":\"rent\"}",
+    "outputBlobId": "01K6BLOB00000000000000000000",
+    "createdAt": "2026-09-28T12:00:00.000Z"
+  },
+  "expect": {
+    "id": "call_01K6CALL0000000000000000001",
+    "turnId": "turn_1",
+    "callNumber": 2,
+    "toolName": "lookup",
+    "state": "output-available",
+    "input": {
+      "topic": "rent"
+    },
+    "output": {
+      "$absent": true
+    },
+    "outputBlobId": "01K6BLOB00000000000000000000",
+    "artifact": {
+      "$absent": true
+    },
+    "artifactBlobId": {
+      "$absent": true
+    }
+  }
+}

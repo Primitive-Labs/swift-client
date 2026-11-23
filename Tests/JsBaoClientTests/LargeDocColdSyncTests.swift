@@ -13,6 +13,7 @@ import YSwift
 /// and later incremental deltas parked in Yjs pendingStructs forever. Clients
 /// that built the doc incrementally from small inline updates never hit this,
 /// which is why it only surfaced on fresh installs.
+@available(*, deprecated)
 final class LargeDocColdSyncTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

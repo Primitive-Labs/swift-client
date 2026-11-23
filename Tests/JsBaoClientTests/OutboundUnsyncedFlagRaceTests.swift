@@ -20,6 +20,7 @@ import Yniffi
 ///
 /// Server-free: the client is built with unreachable URLs and never connects; the
 /// outbound send is intercepted by replacing `DocumentManager.sendWebSocketMessage`.
+@available(*, deprecated)
 final class OutboundUnsyncedFlagRaceTests: XCTestCase {
 
     /// Collect update frames off a doc's observer (which fires on the writing
@@ -544,6 +545,7 @@ final class OutboundUnsyncedFlagRaceTests: XCTestCase {
     /// Behavior 7 — the user-visible symptom. `documents.evict` without `force`
     /// must refuse a document whose batch is drained but unsent, and accept it
     /// once the drain confirms.
+    @available(*, deprecated)
     func testEvictRefusesWhileABatchIsDrainedButUnsent() async throws {
         let client = makeZeroDebounceClient()
         let documentManager = client.documentManager

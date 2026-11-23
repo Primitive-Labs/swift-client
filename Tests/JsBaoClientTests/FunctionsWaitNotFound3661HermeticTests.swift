@@ -6,7 +6,7 @@ import XCTest
 /// The filing is against the JS client, and this surface is its mirror down to
 /// the poll schedule and the wording of every refusal, so it had the same
 /// defect: the wait ended on the FIRST 404, and `GET
-/// /workflows/runs/{runId}/status` answers 404 for two unrelated facts.
+/// /functions/runs/{runId}/status` answers 404 for two unrelated facts.
 ///
 ///  - the run id resolved to no row. The reads behind that are eventually
 ///    consistent, so a poll a second after a start can miss a committed row.
@@ -218,7 +218,7 @@ final class FunctionsWaitNotFound3661HermeticTests: XCTestCase {
                 .waitFor(runId: "r1", options: FunctionWaitOptions(timeout: 0.9))
             XCTFail("a slow run must time out")
         } catch let error as JsBaoError {
-            XCTAssertEqual(error.code, .workflowWaitTimeout)
+            XCTAssertEqual(error.code, .functionWaitTimeout)
         }
     }
 

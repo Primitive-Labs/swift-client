@@ -5,9 +5,11 @@ import Foundation
 ///
 /// The client never verifies the signature — it only base64url-decodes the
 /// payload segment — so a fixed `h.<payload>.s` shape is enough for any test
-/// that needs a token the controller will accept and apply.
-func makeTestJwt(userId: String, exp: Int = 9_999_999_999) -> String {
-    let payload: [String: Any] = ["userId": userId, "sub": userId, "exp": exp]
+/// that needs a token the controller will accept and apply. `rootDocId`, when
+/// given, is the claim `client.rootDocId` reads.
+func makeTestJwt(userId: String, exp: Int = 9_999_999_999, rootDocId: String? = nil) -> String {
+    var payload: [String: Any] = ["userId": userId, "sub": userId, "exp": exp]
+    if let rootDocId { payload["rootDocId"] = rootDocId }
     let data = try! JSONSerialization.data(withJSONObject: payload)
     let b64 = data.base64EncodedString()
         .replacingOccurrences(of: "+", with: "-")

@@ -25,6 +25,7 @@ import XCTest
 /// (`MEMBER_INVITATIONS_DISABLED` fires for a plain "member" caller), so every
 /// test that drives one uses the app owner's client and an owner-created
 /// document.
+@available(*, deprecated)
 final class InvitationTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!
@@ -288,7 +289,7 @@ final class InvitationTests: XCTestCase {
         let pending = try await appOwner.documents.listPendingInvitations(documentId: ownerDocId)
         let found = pending.first { $0.email == email }
         XCTAssertNotNil(found, "Expected to find a pending invitation for \(email)")
-        XCTAssertEqual(found?.permission, "reader")
+        XCTAssertEqual(found?.permission, .reader)
     }
 
     /// Ported from JS: "should create a document invitation" (verify response
@@ -321,7 +322,7 @@ final class InvitationTests: XCTestCase {
             }
         }
         let deferred = try XCTUnwrap(deferredGrant, "Expected a deferred grant for \(email)")
-        XCTAssertEqual(deferred.permission, "read-write")
+        XCTAssertEqual(deferred.permission, .readWrite)
         XCTAssertEqual(deferred.status, "pending_signup")
         XCTAssertFalse(deferred.invitationId.isEmpty)
     }
@@ -374,7 +375,7 @@ final class InvitationTests: XCTestCase {
 
         XCTAssertNotNil(invitation, "Should find the pending invitation")
         XCTAssertEqual(invitation?.email, email)
-        XCTAssertEqual(invitation?.permission, "read-write")
+        XCTAssertEqual(invitation?.permission, .readWrite)
     }
 
     /// Ported from JS: pending invitations with field verification. Every
@@ -400,7 +401,7 @@ final class InvitationTests: XCTestCase {
             pending.first { $0.email == email },
             "Expected a pending invitation for \(email)"
         )
-        XCTAssertEqual(entry.permission, "reader")
+        XCTAssertEqual(entry.permission, .reader)
         XCTAssertFalse(entry.invitationId.isEmpty)
         XCTAssertFalse(entry.createdAt.isEmpty)
         XCTAssertFalse(entry.expiresAt.isEmpty)

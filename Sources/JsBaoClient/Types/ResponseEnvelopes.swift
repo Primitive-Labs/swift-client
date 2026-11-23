@@ -5,10 +5,9 @@ import Foundation
 // Several endpoints answer with either a single-key envelope or a bare array,
 // and the typed API classes have to decode both. Written per call site that
 // was the same `Decodable` repeated with a different key and element type —
-// including two outright duplicates (`{ fields }`, served by both
-// `databases.describeModel` and the DO engine's `/describe`; and the document
-// list, served by both `documents.list` and `me.ownedDocuments`). They live
-// here once, so the probe order is the same everywhere too.
+// including an outright duplicate (the document list, served by both
+// `documents.list` and `me.ownedDocuments`). They live here once, so the probe
+// order is the same everywhere too.
 
 /// `{ items: [...] }`, with a bare `[Element]` accepted defensively.
 ///
@@ -31,32 +30,14 @@ struct ItemsEnvelope<Element: Decodable & Sendable>: Decodable, Sendable {
     }
 }
 
-/// `{ fields: [...] }` or a bare `[ModelFieldInfo]` — the model-describe
-/// shape.
-struct ModelFieldsEnvelope: Decodable, Sendable {
-    let fields: [ModelFieldInfo]
-
-    private enum CodingKeys: String, CodingKey { case fields }
-
-    init(from decoder: Decoder) throws {
-        if let container = try? decoder.container(keyedBy: CodingKeys.self),
-           container.contains(.fields) {
-            fields = try container.decode([ModelFieldInfo].self, forKey: .fields)
-            return
-        }
-        let container = try decoder.singleValueContainer()
-        fields = try container.decode([ModelFieldInfo].self)
-    }
-}
-
-/// A document list: the `{ items, cursor }` (legacy `{ documents }`) page, or
-/// a bare `[DocumentInfo]` array, which carries no cursor.
+/// A document list: the `{ items, hasMore, nextCursor? }` page, or a bare
+/// `[DocumentInfo]` array, which carries no continuation.
 ///
 /// The probe between the two shapes is shape tolerance, not malformed-body
 /// tolerance: bytes that are neither still throw out of the outer decode.
 struct DocumentListEnvelope: Decodable, Sendable {
     let items: [DocumentInfo]
-    let cursor: String?
+    let nextCursor: String?
     /// True when the body was the bare array rather than the keyed envelope.
     ///
     /// The two shapes are not equally informative: the envelope says whether
@@ -64,30 +45,29 @@ struct DocumentListEnvelope: Decodable, Sendable {
     /// the *whole* scope — `documents.list`'s reconciliation walk — must treat
     /// a bare array as "completeness unknown", because the unpaged
     /// `GET /documents` truncates at the server's default query limit and says
-    /// nothing about it (#2827).
+    /// nothing about it.
     let isBareArray: Bool
     /// The envelope's own answer to "are there more rows after these?" —
     /// `hasMore` when the body carried it, otherwise inferred from the presence
     /// of a continuation cursor (`DocumentListPage`'s rule). Always `false` for
     /// the bare array, which is why `isBareArray` has to be consulted too.
     let hasMore: Bool
-    /// True when the keyed envelope actually carried an `items` (or legacy
-    /// `documents`) key.
+    /// True when the keyed envelope actually carried an `items` key.
     ///
-    /// A JSON object without either decodes to an empty page, and an empty page
+    /// A JSON object without it decodes to an empty page, and an empty page
     /// read as the whole scope evicts every cached document — so a body that
     /// never mentioned the rows it is supposed to be listing must not be read
-    /// as one (#2827).
+    /// as one.
     let listsItems: Bool
 
     private enum CodingKeys: String, CodingKey {
-        case items, documents
+        case items
     }
 
     init(from decoder: Decoder) throws {
         if let array = try? [DocumentInfo](from: decoder) {
             items = array
-            cursor = nil
+            nextCursor = nil
             isBareArray = true
             hasMore = false
             listsItems = true
@@ -95,22 +75,22 @@ struct DocumentListEnvelope: Decodable, Sendable {
         }
         let page = try DocumentListPage(from: decoder)
         items = page.items
-        cursor = page.nextCursor
+        nextCursor = page.nextCursor
         isBareArray = false
         hasMore = page.hasMore
         let keys = try decoder.container(keyedBy: CodingKeys.self)
-        listsItems = keys.contains(.items) || keys.contains(.documents)
+        listsItems = keys.contains(.items)
     }
 }
 
-/// The `{ items, hasMore, nextCursor?, cursor? }` pagination envelope, with a
+/// The `{ items, hasMore, nextCursor? }` pagination envelope, with a
 /// bare `[Element]` accepted as the pre-pagination response an older server
-/// still sends (`GET /databases` before #1958).
+/// still sends.
 ///
 /// A bare array carries no continuation token, so it normalizes to a single
 /// page — `hasMore: false`, no cursor — which is what the JS client, the CLI,
 /// and web-admin all do with the same body. Without this the published client
-/// throws while a rolling upgrade is in flight (#2245).
+/// throws while a rolling upgrade is in flight.
 ///
 /// As with `DocumentListEnvelope`, the probe is shape tolerance, not
 /// malformed-body tolerance: the array is tried first because the keyed
@@ -125,7 +105,7 @@ struct PaginatedPageEnvelope<Element: Decodable & Sendable>: Decodable, Sendable
     /// filters added alongside pagination, and it ignores query parameters it
     /// does not know — so it answers a filtered request with its complete
     /// list. Callers that sent such a filter must apply it themselves on this
-    /// path; see `DatabasesAPI.listPage`'s `owner` handling.
+    /// path.
     let isLegacyArray: Bool
 
     init(from decoder: Decoder) throws {

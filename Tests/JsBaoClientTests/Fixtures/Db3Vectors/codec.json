@@ -1,0 +1,304 @@
+{
+  "source": "Expected bytes computed with Python's struct module ('<f' binary32, '<e' binary16, both round to nearest even), independently of the codecs under test. i8: scale = binary32(max|v| / 127), code = round half away from zero of v / scale; decoded = binary32(code * scale).",
+  "cases": [
+    {
+      "name": "f32 layout",
+      "element": "f32",
+      "dims": 3,
+      "values": [
+        1.0,
+        -2.0,
+        0.5
+      ],
+      "base64": "AACAPwAAAMAAAAA/",
+      "bytesHex": "0000803f000000c00000003f",
+      "decoded": [
+        1.0,
+        -2.0,
+        0.5
+      ]
+    },
+    {
+      "name": "f32 binary32 rounding",
+      "element": "f32",
+      "dims": 3,
+      "values": [
+        0.10000000149011612,
+        -0.25,
+        3.5
+      ],
+      "base64": "zczMPQAAgL4AAGBA",
+      "bytesHex": "cdcccc3d000080be00006040",
+      "decoded": [
+        0.10000000149011612,
+        -0.25,
+        3.5
+      ]
+    },
+    {
+      "name": "f32 one",
+      "element": "f32",
+      "dims": 1,
+      "values": [
+        42.125
+      ],
+      "base64": "AIAoQg==",
+      "bytesHex": "00802842",
+      "decoded": [
+        42.125
+      ]
+    },
+    {
+      "name": "f16 layout",
+      "element": "f16",
+      "dims": 3,
+      "values": [
+        1.0,
+        -2.0,
+        0.5
+      ],
+      "base64": "ADwAwAA4",
+      "bytesHex": "003c00c00038",
+      "decoded": [
+        1.0,
+        -2.0,
+        0.5
+      ]
+    },
+    {
+      "name": "f16 largest finite",
+      "element": "f16",
+      "dims": 2,
+      "values": [
+        65504.0,
+        -65504.0
+      ],
+      "base64": "/3v/+w==",
+      "bytesHex": "ff7bfffb",
+      "decoded": [
+        65504.0,
+        -65504.0
+      ]
+    },
+    {
+      "name": "f16 rounds just under the overflow",
+      "element": "f16",
+      "dims": 1,
+      "values": [
+        65519.0
+      ],
+      "base64": "/3s=",
+      "bytesHex": "ff7b",
+      "decoded": [
+        65504.0
+      ]
+    },
+    {
+      "name": "f16 ties to even down",
+      "element": "f16",
+      "dims": 1,
+      "values": [
+        1.00048828125
+      ],
+      "base64": "ADw=",
+      "bytesHex": "003c",
+      "decoded": [
+        1.0
+      ]
+    },
+    {
+      "name": "f16 ties to even up",
+      "element": "f16",
+      "dims": 1,
+      "values": [
+        1.00146484375
+      ],
+      "base64": "Ajw=",
+      "bytesHex": "023c",
+      "decoded": [
+        1.001953125
+      ]
+    },
+    {
+      "name": "f16 smallest subnormal",
+      "element": "f16",
+      "dims": 1,
+      "values": [
+        5.960464477539063e-08
+      ],
+      "base64": "AQA=",
+      "bytesHex": "0100",
+      "decoded": [
+        5.960464477539063e-08
+      ]
+    },
+    {
+      "name": "f16 subnormal rounds up",
+      "element": "f16",
+      "dims": 1,
+      "values": [
+        4.470348358154297e-08
+      ],
+      "base64": "AQA=",
+      "bytesHex": "0100",
+      "decoded": [
+        5.960464477539063e-08
+      ]
+    },
+    {
+      "name": "f16 below half the smallest subnormal",
+      "element": "f16",
+      "dims": 1,
+      "values": [
+        1.4901161193847656e-08
+      ],
+      "base64": "AAA=",
+      "bytesHex": "0000",
+      "decoded": [
+        0.0
+      ]
+    },
+    {
+      "name": "f16 binary16 rounding",
+      "element": "f16",
+      "dims": 3,
+      "values": [
+        0.10000000149011612,
+        -0.3330000042915344,
+        1000.7000122070312
+      ],
+      "base64": "Zi5UtdFj",
+      "bytesHex": "662e54b5d163",
+      "decoded": [
+        0.0999755859375,
+        -0.3330078125,
+        1000.5
+      ]
+    },
+    {
+      "name": "i8 layout",
+      "element": "i8",
+      "dims": 3,
+      "values": [
+        1.0,
+        -2.0,
+        0.5
+      ],
+      "base64": "BAKBPECBIA==",
+      "bytesHex": "0402813c408120",
+      "decoded": [
+        1.0078740119934082,
+        -2.0,
+        0.5039370059967041
+      ]
+    },
+    {
+      "name": "i8 all zero",
+      "element": "i8",
+      "dims": 2,
+      "values": [
+        0.0,
+        0.0
+      ],
+      "base64": "AAAAAAAA",
+      "bytesHex": "000000000000",
+      "decoded": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "name": "i8 negative zero",
+      "element": "i8",
+      "dims": 2,
+      "values": [
+        -0.0,
+        1.0
+      ],
+      "base64": "BAIBPAB/",
+      "bytesHex": "0402013c007f",
+      "decoded": [
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "name": "i8 largest magnitude",
+      "element": "i8",
+      "dims": 3,
+      "values": [
+        0.24899999797344208,
+        -0.10000000149011612,
+        0.0005000000237487257
+      ],
+      "base64": "6X0AO3/NAA==",
+      "bytesHex": "e97d003b7fcd00",
+      "decoded": [
+        0.24899998307228088,
+        -0.09999211877584457,
+        0.0
+      ]
+    },
+    {
+      "name": "i8 one",
+      "element": "i8",
+      "dims": 1,
+      "values": [
+        -3.75
+      ],
+      "base64": "yOPxPIE=",
+      "bytesHex": "c8e3f13c81",
+      "decoded": [
+        -3.75
+      ]
+    }
+  ],
+  "decodeOnly": {
+    "note": "Canonical bytes no encoder writes (encodeVector refuses non-finite numbers) that a decoder still reads: binary16 exponent 31 is an infinity (mantissa 0) or NaN. A decoded entry is a JSON number or the string \"Infinity\", \"-Infinity\" or \"NaN\".",
+    "cases": [
+      {
+        "name": "f16 positive infinity",
+        "element": "f16",
+        "dims": 1,
+        "base64": "AHw=",
+        "bytesHex": "007c",
+        "decoded": [
+          "Infinity"
+        ]
+      },
+      {
+        "name": "f16 negative infinity",
+        "element": "f16",
+        "dims": 1,
+        "base64": "APw=",
+        "bytesHex": "00fc",
+        "decoded": [
+          "-Infinity"
+        ]
+      },
+      {
+        "name": "f16 NaN",
+        "element": "f16",
+        "dims": 1,
+        "base64": "AH4=",
+        "bytesHex": "007e",
+        "decoded": [
+          "NaN"
+        ]
+      },
+      {
+        "name": "f16 specials beside finite values",
+        "element": "f16",
+        "dims": 4,
+        "base64": "ADwAfAD+AMA=",
+        "bytesHex": "003c007c00fe00c0",
+        "decoded": [
+          1.0,
+          "Infinity",
+          "NaN",
+          -2.0
+        ]
+      }
+    ]
+  }
+}

@@ -20,6 +20,7 @@ import XCTest
 ///
 /// Server-free: an in-process loopback WebSocket server stands in for the real
 /// server, and the disconnected cases simply never connect to it.
+@available(*, deprecated)
 final class DisconnectedSyncRetryTests: XCTestCase {
 
     private func newDocId() -> String { "disc-sync-\(UUID().uuidString.prefix(8))" }

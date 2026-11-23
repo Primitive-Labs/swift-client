@@ -87,6 +87,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
 
     // MARK: - Reads span every open doc; writes target one doc
 
+    @available(*, deprecated)
     func testQuerySpansAllOpenDocumentsAndDropsOnClose() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -136,6 +137,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
 
     // MARK: - save() is create-or-update (matches JS save())
 
+    @available(*, deprecated)
     func testSaveInsertsThenUpdatesInPlace() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -160,6 +162,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
 
     // MARK: - A document opened AFTER registration is auto-connected
 
+    @available(*, deprecated)
     func testDocumentOpenedAfterRegistrationIsConnected() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -176,6 +179,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
 
     // MARK: - Lazy registration: write/read before registerModels still works
 
+    @available(*, deprecated)
     func testLazyRegistrationConnectsAlreadyOpenDocuments() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -191,6 +195,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
 
     // MARK: - subscribe fires across documents
 
+    @available(*, deprecated)
     func testSubscribeFiresOnWritesInAnyDocument() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -213,6 +218,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
 
     // MARK: - queryOne returns the first match (or nil)
 
+    @available(*, deprecated)
     func testQueryOneReturnsFirstMatchOrNil() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -239,6 +245,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
     // its `_related` bag populated, reachable through the typed accessor —
     // equivalent to `query(filter, include:).first`.
 
+    @available(*, deprecated)
     func testQueryOneWithIncludeReturnsFirstMatchWithRelated() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -276,6 +283,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         XCTAssertEqual(post?.relatedAuthor?.id, firstOfQuery?.relatedAuthor?.id)
     }
 
+    @available(*, deprecated)
     func testQueryOneWithIncludeReturnsNilWhenNoMatch() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -296,6 +304,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
 
     // MARK: - findByUnique + save(in:upsertOn:) (unique-constraint facade)
 
+    @available(*, deprecated)
     func testFindByUniqueAndUpsertOnAcrossDocs() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -378,6 +387,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         _ = try raw.create(id: id, values: ["title": .string("ghost")])
     }
 
+    @available(*, deprecated)
     func testFindReturnsNilOnlyForNotFound() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -394,6 +404,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         XCTAssertEqual(ok?.title, "fine")
     }
 
+    @available(*, deprecated)
     func testFindThrowsDecodeErrorForDriftedRow() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -418,6 +429,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
         }
     }
 
+    @available(*, deprecated)
     func testFindAllThrowsInsteadOfDroppingDriftedRow() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -448,6 +460,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
 
     // MARK: - upsertByUnique (named-constraint facade)
 
+    @available(*, deprecated)
     func testUpsertByUniqueFacade() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -526,6 +539,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
     /// A slug stored in docB must be found even when the upsert names docA
     /// as the target; JS then saves the resolved record through
     /// `targetDocument`, so the resolved id is written into docA.
+    @available(*, deprecated)
     func testUpsertByUniqueFacadeSearchesAcrossDocs() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -600,6 +614,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
     /// the declared join order picks which join rows, but the batched
     /// `id: { $in: [...] }` query re-sorts the output, matching js-bao.
     /// (#1201: previously it returned targets in join-row order.)
+    @available(*, deprecated)
     func testHasManyThroughSharedReturnsTargetIdAscending() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -640,6 +655,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
     /// back. Cursors are now OPAQUE `String` tokens copied verbatim from
     /// the join leg's paged envelope, so the test feeds them back rather
     /// than asserting their bytes.
+    @available(*, deprecated)
     func testHasManyThroughSharedPaginatesJoinLeg() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -722,6 +738,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
     /// `position` value repeats ACROSS a page boundary must page with no
     /// skips and no duplicates — the composite `(position, id)` cursor
     /// handles the tie the old raw-scalar cursor mis-cut.
+    @available(*, deprecated)
     func testHasManyThroughSharedStraddlingTiePagesCleanly() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)
@@ -763,6 +780,7 @@ final class CrossDocumentStaticQueryTests: XCTestCase {
     /// The composite `(field, id)` cursor's `id` tiebreaker keeps a
     /// not-`required` order field deterministic, so paging must succeed and
     /// return the linked tag. See `warnIfOrderFieldNullable`.
+    @available(*, deprecated)
     func testHasManyThroughSharedNullableOrderFieldIsAccepted() async throws {
         let client = createTestClient(appId: "t", token: "t", offline: true, storageConfig: .memory)
         JsBaoClient.configureDefault(client)

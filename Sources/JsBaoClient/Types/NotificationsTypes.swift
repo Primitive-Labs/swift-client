@@ -60,12 +60,34 @@ public struct NotificationListResult: Decodable, Sendable, Equatable {
     public let items: [NotificationInfo]
     /// Unread count for the caller (bounded — capped for very large inboxes).
     public let unreadCount: Int
-    public let cursor: String?
+    /// True when a next page exists.
+    public let hasMore: Bool
+    /// Continuation token for the next page; pass it back as `cursor`.
+    public let nextCursor: String?
 
-    public init(items: [NotificationInfo], unreadCount: Int, cursor: String? = nil) {
+    private enum CodingKeys: String, CodingKey {
+        case items, unreadCount, hasMore, nextCursor
+    }
+
+    public init(
+        items: [NotificationInfo],
+        unreadCount: Int,
+        nextCursor: String? = nil,
+        hasMore: Bool? = nil
+    ) {
         self.items = items
         self.unreadCount = unreadCount
-        self.cursor = cursor
+        self.nextCursor = nextCursor
+        self.hasMore = hasMore ?? (nextCursor != nil)
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        items = try c.decodeIfPresent([NotificationInfo].self, forKey: .items) ?? []
+        unreadCount = try c.decode(Int.self, forKey: .unreadCount)
+        let next = try c.decodeIfPresent(String.self, forKey: .nextCursor)
+        nextCursor = next
+        hasMore = try c.decodeIfPresent(Bool.self, forKey: .hasMore) ?? (next != nil)
     }
 }
 

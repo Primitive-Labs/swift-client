@@ -1,0 +1,78 @@
+# The object defs the jsonshop type's JSON fields ref (#5899). Both tools read
+# this directory: swift-bao-codegen for the models beside it, `primitive
+# functions codegen --lang swift` for `Generated/JsonShared.generated.swift`,
+# which declares each def's type, alias and binding.
+
+# A closed struct with bounds, a pattern and an enum.
+[defs.ShipAddress]
+type = "object"
+required = ["city"]
+additionalProperties = false
+[defs.ShipAddress.properties.city]
+type = "string"
+minLength = 1
+maxLength = 40
+[defs.ShipAddress.properties.zip]
+type = "string"
+pattern = "^[0-9]{4}(-[0-9]{3})?$"
+[defs.ShipAddress.properties.floor]
+type = "integer"
+minimum = -5
+maximum = 200
+[defs.ShipAddress.properties.size]
+type = "string"
+enum = ["s", "m", "l"]
+
+# A closed struct with a nested closed struct and an array, keys in the
+# order the field table would give them.
+[defs.ShipParcel]
+type = "object"
+properties.label.type = "string"
+properties.box.type = "object"
+properties.box.properties.width.type = "number"
+properties.box.properties.count.type = "integer"
+properties.box.required = ["width"]
+properties.box.additionalProperties = false
+properties.codes.type = "array"
+properties.codes.items = { type = "integer" }
+required = ["label"]
+additionalProperties = false
+
+# Two open objects with no declared properties, both `[String: JSONValue]`
+# in Swift, with different schemas.
+[defs.ShipMeta]
+type = "object"
+
+[defs.ShipNeedsKind]
+type = "object"
+required = ["kind"]
+
+# A def no db3 field refs: it gets no alias and no binding.
+[defs.ShipUnused]
+type = "object"
+[defs.ShipUnused.properties.note]
+type = "string"
+
+# A list def (#6307): the field stores the array itself, `[String]` in Swift.
+[defs.ShipTags]
+type = "array"
+items = { type = "string", minLength = 1 }
+maxItems = 3
+
+# A list of an object def, by name: `[ShipAddress]` in Swift.
+[defs.ShipStops]
+type = "array"
+items = { ref = "ShipAddress" }
+
+# A map with typed values (#6307): `[String: Double]` in Swift.
+[defs.ShipWeights]
+type = "object"
+additionalProperties = { type = "number", minimum = 0 }
+
+# A value schema beside a required key `properties` does not declare: `id`
+# is a `Double` property, the other keys a `[String: Double]` catch-all.
+[defs.ShipKeyed]
+type = "object"
+properties = {}
+required = ["id"]
+additionalProperties = { type = "number" }

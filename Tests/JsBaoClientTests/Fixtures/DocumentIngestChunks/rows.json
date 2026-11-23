@@ -1,0 +1,21 @@
+{
+  "options": { "cutRows": 5 },
+  "rows": [
+    { "model": "Tag", "id": "n02", "patch": { "label": "same id as a note" } },
+    { "model": "Note", "id": "n03", "patch": { "b": 1, "a": 2, "10": 3, "9": 4 } },
+    { "model": "Note", "id": "n01", "patch": { "title": "integers", "whole": 3.0, "half": 0.5, "negativeZero": -0, "big": 123456789012345680000, "max": 9007199254740993 } },
+    { "model": "Note", "id": "n10", "patch": { "title": "exponents", "e21": 1e21, "e20": 1e20, "small": 1.5e-7, "edge": 1e-7, "fixed": 0.000001, "tiny": 5e-324, "huge": -1.7976931348623157e308, "third": 0.3333333333333333, "neg": -2.5e-12 } },
+    { "model": "Tag", "id": "t-b", "patch": { "empty": {}, "none": [], "nothing": null } },
+    { "model": "Note", "id": "n02", "patch": { "text": "quote \" backslash \\ slash / newline \n tab \t return \r back \b feed \f ctrl \u0001 \u001f del \u007f sep  " } },
+    { "model": "Note", "id": "n-Ａ", "patch": { "title": "a fullwidth A sorts before an emoji in UTF-8" } },
+    { "model": "Note", "id": "n-😀", "patch": { "title": "😀 after Ａ", "é": "e acute", "e": "plain", "Z": "upper" } },
+    { "model": "Note", "id": "n05", "patch": { "nested": { "z": { "y": [3, { "b": true, "a": false }, "x"], "a": null }, "10": "ten", "2": "two" } } },
+    { "model": "Tag", "id": "t-a", "patch": { "_deleted": true } },
+    { "model": "Note", "id": "n04", "patch": { "_deleted": true } },
+    { "model": "Note", "id": "n09", "patch": { "_deleted": true, "title": "passed through as it is" } },
+    { "model": "Note", "id": "n07", "patch": { "list": [1, 2.5, -0, "two", null, [], {}] } },
+    { "model": "Tag", "id": "t-c", "patch": { "日本語": "non-ASCII key and value", "label": "kept raw" } },
+    { "model": "Note", "id": "n08", "patch": {} },
+    { "model": "Note", "id": "n06", "patch": { "title": "six" } }
+  ]
+}

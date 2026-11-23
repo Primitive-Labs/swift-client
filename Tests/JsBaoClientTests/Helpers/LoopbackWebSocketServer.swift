@@ -11,7 +11,14 @@ import Network
 /// It accepts connections, auto-replies to pings, and drains incoming frames
 /// (including the client's close frame). It does not echo — the disconnect
 /// atomicity tests only need a socket that opens and can be closed.
+///
+/// Like the real server it sends `{"type":"ready"}` on each connection once
+/// the upgrade completes (#5578), unless `sendsReady` is off; a test about the
+/// window between the open and `ready` turns it off and pushes `ready` itself.
 final class LoopbackWebSocketServer: @unchecked Sendable {
+    /// The frame the real server sends once the user's events reach a socket.
+    static let readyFrame = #"{"type":"ready"}"#
+
     private let listener: NWListener
     private let queue = DispatchQueue(label: "loopback-ws-server")
     private var connections: [NWConnection] = []
@@ -22,6 +29,27 @@ final class LoopbackWebSocketServer: @unchecked Sendable {
 
     private var _acceptedCount = 0
     private var _receivedFrames: [String] = []
+    private var _framesByConnection: [Int: [String]] = [:]
+    private var _closedConnections: Set<Int> = []
+    private var _sendsReady: Bool
+
+    /// Whether each connection is sent `ready` once its upgrade completes.
+    /// Settable, so a test can let one connection come up and hold the next.
+    var sendsReady: Bool {
+        get { lock.withLock { _sendsReady } }
+        set { lock.withLock { _sendsReady = newValue } }
+    }
+
+    /// The text frames one connection received, by acceptance order (0 first).
+    func receivedFrames(onConnection index: Int) -> [String] {
+        lock.withLock { _framesByConnection[index] ?? [] }
+    }
+
+    /// Whether the connection at `index` has been closed by its peer, or by
+    /// `close(connection:)`.
+    func isClosed(connection index: Int) -> Bool {
+        lock.withLock { _closedConnections.contains(index) }
+    }
 
     /// Every text frame the server has received, in arrival order. Lets a test
     /// assert on what the client actually put on the wire (e.g. that no
@@ -40,7 +68,11 @@ final class LoopbackWebSocketServer: @unchecked Sendable {
     ///   have to inject a constructed `didOpen` / `didCloseWith` pair *while* a
     ///   connect is pending, which is impossible against a server that
     ///   completes the handshake on its own.
-    init(completesHandshake: Bool = true) throws {
+    ///
+    /// - Parameter sendsReady: whether each connection is sent `ready` once
+    ///   its upgrade completes, as the real server does (#5578).
+    init(completesHandshake: Bool = true, sendsReady: Bool = true) throws {
+        _sendsReady = sendsReady
         let params = NWParameters.tcp
         if completesHandshake {
             let wsOptions = NWProtocolWebSocket.Options()
@@ -59,12 +91,24 @@ final class LoopbackWebSocketServer: @unchecked Sendable {
         }
         listener.newConnectionHandler = { [weak self] connection in
             guard let self = self else { return }
-            self.lock.withLock {
+            let index = self.lock.withLock { () -> Int in
                 self.connections.append(connection)
                 self._acceptedCount += 1
+                return self._acceptedCount - 1
+            }
+            connection.stateUpdateHandler = { [weak self] state in
+                guard let self, case .ready = state, self.sendsReady else { return }
+                // On the server's own queue, where the send completes: not
+                // waited for, or the queue would wait on itself.
+                connection.send(
+                    content: Data(Self.readyFrame.utf8),
+                    contentContext: Self.textContext,
+                    isComplete: true,
+                    completion: .contentProcessed { _ in }
+                )
             }
             connection.start(queue: self.queue)
-            self.drain(connection)
+            self.drain(connection, index: index)
         }
         listener.start(queue: queue)
 
@@ -85,19 +129,80 @@ final class LoopbackWebSocketServer: @unchecked Sendable {
     /// then piled up in the receive buffer until TCP backpressure stalled its
     /// `send` for good, which is what a sustained send loop hits (#2171
     /// behavior 23). Only an error — which a peer close produces — ends it.
-    private func drain(_ connection: NWConnection) {
-        connection.receiveMessage { [weak self] data, _, _, error in
+    private func drain(_ connection: NWConnection, index: Int) {
+        connection.receiveMessage { [weak self] data, context, _, error in
             guard let self = self else { return }
-            if let data, let text = String(data: data, encoding: .utf8) {
-                self.lock.withLock { self._receivedFrames.append(text) }
+            let metadata = context?.protocolMetadata(definition: NWProtocolWebSocket.definition)
+                as? NWProtocolWebSocket.Metadata
+            if metadata?.opcode == .close {
+                self.lock.withLock { _ = self._closedConnections.insert(index) }
+            } else if let data, let text = String(data: data, encoding: .utf8) {
+                self.lock.withLock {
+                    self._receivedFrames.append(text)
+                    self._framesByConnection[index, default: []].append(text)
+                }
             }
             if error != nil {
                 // Peer closed or errored — let the connection tear down.
+                self.lock.withLock { _ = self._closedConnections.insert(index) }
                 connection.cancel()
                 return
             }
-            self.drain(connection)
+            self.drain(connection, index: index)
         }
+    }
+
+    private static let textContext = NWConnection.ContentContext(
+        identifier: "loopback-push", metadata: [NWProtocolWebSocket.Metadata(opcode: .text)]
+    )
+
+    /// Send one text frame on one connection and wait for it; whether it was
+    /// delivered. Never call it on the server's queue.
+    @discardableResult
+    private func send(_ text: String, on connection: NWConnection, timeout: TimeInterval = 10) -> Bool {
+        let context = Self.textContext
+        let delivered = LockedBox(false)
+        let done = DispatchSemaphore(value: 0)
+        connection.send(
+            content: Data(text.utf8),
+            contentContext: context,
+            isComplete: true,
+            completion: .contentProcessed { error in
+                if error == nil { delivered.value = true }
+                done.signal()
+            }
+        )
+        _ = done.wait(timeout: .now() + timeout)
+        return delivered.value
+    }
+
+    /// Push one text frame to the connection at `index` (acceptance order), the
+    /// way the server answers one socket rather than all of them.
+    ///
+    /// - Returns: `false` when there is no such connection or it is gone.
+    @discardableResult
+    func push(_ text: String, toConnection index: Int) -> Bool {
+        let target = lock.withLock { () -> NWConnection? in
+            guard index < connections.count, !_closedConnections.contains(index) else { return nil }
+            return connections[index]
+        }
+        guard let target else { return false }
+        return send(text, on: target)
+    }
+
+    /// Close the connection at `index` from the server's side with a close
+    /// frame carrying `code`, as the real server closes a socket.
+    func close(connection index: Int, code: NWProtocolWebSocket.CloseCode = .protocolCode(.internalServerError)) {
+        guard let target = lock.withLock({ index < connections.count ? connections[index] : nil }) else { return }
+        let metadata = NWProtocolWebSocket.Metadata(opcode: .close)
+        metadata.closeCode = code
+        let context = NWConnection.ContentContext(identifier: "loopback-close", metadata: [metadata])
+        let done = DispatchSemaphore(value: 0)
+        target.send(content: nil, contentContext: context, isComplete: true, completion: .contentProcessed { _ in
+            done.signal()
+        })
+        _ = done.wait(timeout: .now() + 5)
+        lock.withLock { _ = _closedConnections.insert(index) }
     }
 
     /// Push one text frame to every connected client.

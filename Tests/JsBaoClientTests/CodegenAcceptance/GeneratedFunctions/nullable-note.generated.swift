@@ -1,6 +1,6 @@
 // AUTO-GENERATED FROM functions/nullable-note.toml — DO NOT EDIT.
 // Run `primitive functions codegen --lang swift` to regenerate.
-// fingerprint: 7f9bb5c3aa94c7f4
+// fingerprint: 3007eedd717a11cf
 
 import Foundation
 import JsBaoClient

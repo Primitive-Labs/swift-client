@@ -1,0 +1,23 @@
+{
+  "name": "collections.create.withType",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "POST",
+  "path": "/app/<appId>/api/collections",
+  "caller": "owner",
+  "request": {
+    "name": "Baseline Typed Collection",
+    "collectionType": "default"
+  },
+  "status": 201,
+  "body": {
+    "collectionId": "<ulid>",
+    "appId": "<appId>",
+    "name": "Baseline Typed Collection",
+    "collectionType": "default",
+    "documentCount": 0,
+    "createdBy": "<ulid>",
+    "createdAt": "<iso>",
+    "modifiedAt": "<iso>"
+  }
+}

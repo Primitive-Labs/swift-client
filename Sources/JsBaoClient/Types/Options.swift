@@ -15,7 +15,7 @@ public struct JsBaoClientOptions: Sendable {
     /// (5 minutes), the same ceiling js-bao uses (`src/client/JsBaoClient.ts`,
     /// `maxReconnectDelay` → `300_000` ms). Both clients compute the same
     /// backoff, so a lower ceiling here just means retrying more often forever
-    /// against a server that is down (#2364). Pass a smaller value if your app
+    /// against a server that is down. Pass a smaller value if your app
     /// wants to reconnect sooner.
     public let maxReconnectDelay: TimeInterval
     public let globalAdminAppId: String
@@ -28,19 +28,26 @@ public struct JsBaoClientOptions: Sendable {
     public let commitRetryBackoff: CommitRetryBackoff
     public let autoNetwork: Bool
     /// Per-feature gating for the analytics auto-events the client emits
-    /// without explicit app calls (#963). Mirrors js-bao's
+    /// without explicit app calls. Mirrors js-bao's
     /// `analyticsAutoEvents` option.
     public let analyticsAutoEvents: AnalyticsAutoEventsConfig
-    /// How much room this app will give a large document, and which models are
-    /// worth it when the device cannot hold the whole thing (#3437,
-    /// behavior 34). Mirrors js-bao's `largeDocumentStorage` option.
-    ///
-    /// `nil` — the default — probes the volume the client's database is on.
-    /// Configure `capability` to override that measurement, and `models` to
-    /// say what to keep when the document does not fit: with none named, a
-    /// device that cannot take the document is refused rather than capped,
-    /// because there is nothing to cap it to.
-    public let largeDocumentStorage: LargeDocumentStorageOptions?
+    /// Which of the indexes a synced db3's room places on this device the
+    /// client builds when it has not built them yet: `.all` (the default),
+    /// `.none`, or the kinds to build. An index already built stays built, one
+    /// left out reads `declined` in `client.db3.indexes.local(_:)`, and
+    /// `accept`/`decline` decide one index whatever this says. A db3 that
+    /// lives only on this device builds all of its indexes.
+    public let deviceIndexes: Db3DeviceIndexes
+    /// The version this copy of the app reports, in place of the bundle's
+    /// `CFBundleShortVersionString`: one to three dot-separated numbers of one
+    /// to six digits, such as `"1.4"` or `"2.0.1"`. `nil` (the default) reads
+    /// the bundle. An illegal value stops construction.
+    public let appVersion: String?
+    /// The platform this copy of the app reports, in place of the OS default
+    /// (`ios` on iOS, `macos` on macOS): a lowercase letter followed by up to
+    /// 31 lowercase letters, digits or hyphens. An illegal value stops
+    /// construction.
+    public let platform: String?
 
     public init(
         apiUrl: String,
@@ -59,7 +66,9 @@ public struct JsBaoClientOptions: Sendable {
         commitRetryBackoff: CommitRetryBackoff = CommitRetryBackoff(),
         autoNetwork: Bool = true,
         analyticsAutoEvents: AnalyticsAutoEventsConfig = AnalyticsAutoEventsConfig(),
-        largeDocumentStorage: LargeDocumentStorageOptions? = nil
+        deviceIndexes: Db3DeviceIndexes = .all,
+        appVersion: String? = nil,
+        platform: String? = nil
     ) {
         self.apiUrl = apiUrl
         self.wsUrl = wsUrl
@@ -77,7 +86,9 @@ public struct JsBaoClientOptions: Sendable {
         self.commitRetryBackoff = commitRetryBackoff
         self.autoNetwork = autoNetwork
         self.analyticsAutoEvents = analyticsAutoEvents
-        self.largeDocumentStorage = largeDocumentStorage
+        self.deviceIndexes = deviceIndexes
+        self.appVersion = appVersion
+        self.platform = platform
     }
 }
 
@@ -178,7 +189,7 @@ public struct AuthConfig: Sendable {
     public let storageKeyPrefix: String?
     public let refreshProxy: RefreshProxyConfig?
     /// The relying party every passkey ceremony runs against, unless a call
-    /// names another one (#3024).
+    /// names another one.
     ///
     /// Set it to the host in the app's `webcredentials:` associated-domains
     /// entitlement. A native request carries no `Origin` header, so without
@@ -189,17 +200,29 @@ public struct AuthConfig: Sendable {
     /// the server rejects an unconfigured one with
     /// `PASSKEY_RP_NOT_CONFIGURED` rather than substituting another.
     public let passkeyRpId: String?
+    /// Where an emailed sign-in link lands when a request names no target,
+    /// ahead of `links.appBaseURL`'s origin + `/oauth/callback`. Mirrors the
+    /// JS client's `oauthRedirectUri`.
+    ///
+    /// Set it to `<scheme>://oauth/callback` for links that open the app
+    /// through its registered URL scheme; `client.auth.handleSignInCallback`
+    /// then accepts that scheme. An http(s) value sets the callback path only:
+    /// web callbacks are accepted on `links.appBaseURL`'s origin alone. The
+    /// value must be in the app's `emailRedirectUris`.
+    public let oauthRedirectUri: String?
 
     public init(
         persistJwtInStorage: Bool = false,
         storageKeyPrefix: String? = nil,
         refreshProxy: RefreshProxyConfig? = nil,
-        passkeyRpId: String? = nil
+        passkeyRpId: String? = nil,
+        oauthRedirectUri: String? = nil
     ) {
         self.persistJwtInStorage = persistJwtInStorage
         self.storageKeyPrefix = storageKeyPrefix
         self.refreshProxy = refreshProxy
         self.passkeyRpId = passkeyRpId
+        self.oauthRedirectUri = oauthRedirectUri
     }
 }
 
@@ -269,7 +292,9 @@ public struct OpenDocumentOptions: Sendable {
     public var enableNetworkSync: Bool
     public var retainLocal: Bool
     /// Maximum time to wait for the document to become available from the
-    /// network. When the open needs server state — `waitForLoad: .network`,
+    /// network. A large document's open waits this long without any of the
+    /// document arriving, however long the whole download takes. When the
+    /// open needs server state — `waitForLoad: .network`,
     /// or `.localIfAvailableElseNetwork` with no local copy — and the budget
     /// runs out, `openDocument` throws `JsBaoError(.networkTimeout)` rather
     /// than returning a possibly-empty document; `0` means "don't wait for
@@ -287,7 +312,7 @@ public struct OpenDocumentOptions: Sendable {
     /// When `true`, syncStep1 messages for this document carry
     /// `requestPerf: true`, asking the server for a `syncPerf` telemetry
     /// frame after each sync round-trip (delivered via the `.syncPerf`
-    /// event). Mirrors JS `openDocument`'s `requestSyncPerf` option (#996).
+    /// event). Mirrors JS `openDocument`'s `requestSyncPerf` option.
     public var requestSyncPerf: Bool
 
     public init(
@@ -317,14 +342,13 @@ public struct CreateDocumentOptions: Encodable, Sendable {
     /// Opaque metadata blob to attach at creation (≤ 4 KB). The platform
     /// round-trips it verbatim — it does not introspect the value.
     public var metadata: JSONValue?
-    /// Create a LARGE document (`2`) instead of an ordinary one (#3436).
+    /// The document's format: `1` (an ordinary document) or `3` (a
+    /// record-log document, which keeps its records in a persisted local store
+    /// and needs `.sqlite` storage). Named after the REST field, and after the
+    /// JS client's `documents.create({ documentFormat: 3 })`.
     ///
-    /// A large document keeps its records in a persisted table on both ends
-    /// and carries only the current epoch's changes in its Y.Doc, so it scales
-    /// to far more data than an ordinary document — at the cost of needing
-    /// persistent on-device storage (`.sqlite`, not `.memory`). Named after
-    /// the REST field, and after the JS client's `documents.create({
-    /// documentFormat: 2 })`.
+    /// `2` (a large document) is no longer served: a create asking for it
+    /// throws `.documentFormatUnsupported` before anything is created or sent.
     ///
     /// `nil` — the default — sends nothing, so an ordinary create's request
     /// body is exactly what it was before this option existed.
@@ -437,26 +461,19 @@ public struct PaginationOptions: Sendable {
 
 public struct PaginatedResult<T: Sendable>: Sendable {
     public let items: [T]
-    /// Continuation token for the next page (#1316).
+    /// Continuation token for the next page.
     public let nextCursor: String?
-    /// True when a next page exists (#1316).
+    /// True when a next page exists.
     public let hasMore: Bool
-    /// Deprecated alias of `nextCursor` kept for one deprecation window
-    /// (#1316, #1982). Computed from `nextCursor` so the type's own
-    /// initializers never reference the deprecated declaration.
-    @available(*, deprecated, message: "Use nextCursor.")
-    public var cursor: String? { nextCursor }
 
     public init(
         items: [T],
-        cursor: String? = nil,
         nextCursor: String? = nil,
         hasMore: Bool? = nil
     ) {
         self.items = items
-        let next = nextCursor ?? cursor
-        self.nextCursor = next
-        self.hasMore = hasMore ?? (next != nil)
+        self.nextCursor = nextCursor
+        self.hasMore = hasMore ?? (nextCursor != nil)
     }
 }
 
@@ -487,7 +504,7 @@ public struct NetworkStatus: Sendable {
     }
 }
 
-// MARK: - Workflow Options
+// MARK: - Client Options
 
 /// Options for `client.setNetworkMode(_:options:)`. Matches the JS
 /// client's options bag passed as the second argument.
@@ -512,9 +529,14 @@ public struct RetentionPolicy: Sendable {
     /// shape parity with js-bao; not yet consumed by enforcement
     /// (matches JS — same field is set but unused in enforcement).
     public var `default`: DefaultMode
-    /// Evict docs whose `lastOpenedAt` age exceeds this.
+    /// Evict docs whose `lastOpenedAt` age exceeds this, in seconds. A
+    /// positive number, a fraction included; `nil` is no TTL. `0`, a
+    /// negative or a non-finite number is refused `.invalidArgument`, and the
+    /// policy stays as it was.
     public var ttl: TimeInterval?
-    /// Cap on local-doc count; oldest-first eviction when exceeded.
+    /// Cap on local-doc count; oldest-first eviction when exceeded. A
+    /// positive integer; `nil` is no cap. `0` or a negative is refused
+    /// `.invalidArgument`, and the policy stays as it was.
     public var maxDocs: Int?
     /// Cap on total `localBytes`; oldest-first eviction when exceeded.
     public var maxBytes: Int?
@@ -536,11 +558,46 @@ public struct RetentionPolicy: Sendable {
     }
 }
 
+extension RetentionPolicy {
+    /// The one `maxDocs` rule: `nil` is no cap, `1` or more is a cap,
+    /// and `0` or a negative is refused. Answers the `.invalidArgument` error
+    /// `call` refuses with, or `nil` when the value is accepted.
+    func maxDocsRefusal(call: String) -> JsBaoError? {
+        guard let maxDocs, maxDocs < 1 else { return nil }
+        return JsBaoError(
+            code: .invalidArgument,
+            message: "\(call): maxDocs must be a positive integer (got \(maxDocs)); pass nil for no cap",
+            details: ["maxDocs": .number(Double(maxDocs))]
+        )
+    }
+
+    /// The one `ttl` rule, beside the `maxDocs` one: `nil` is no TTL,
+    /// a finite number of seconds above `0` (a fraction included) is a TTL,
+    /// and `0`, a negative, `nan` or an infinity is refused. Answers the
+    /// `.invalidArgument` error `call` refuses with, or `nil` when the value
+    /// is accepted.
+    func ttlRefusal(call: String) -> JsBaoError? {
+        guard let ttl, !(ttl.isFinite && ttl > 0) else { return nil }
+        return JsBaoError(
+            code: .invalidArgument,
+            message: "\(call): ttl must be a positive number of seconds (got \(ttl)); pass nil for no TTL",
+            details: ["ttl": .number(ttl)]
+        )
+    }
+
+    /// The policy's validator, which both doors (`client.retentionPolicy` and
+    /// `client.db3.setRetentionPolicy(_:)`) call before applying anything:
+    /// the `maxDocs` refusal, else the `ttl` one, else `nil`.
+    func refusal(call: String) -> JsBaoError? {
+        maxDocsRefusal(call: call) ?? ttlRefusal(call: call)
+    }
+}
+
 /// Options for `client.syncMetadata(options:)`. Matches the JS
 /// client's options bag.
 public struct SyncMetadataOptions: Sendable {
-    /// Restrict the sync to a single document. `nil` syncs all open
-    /// docs (default).
+    /// Restrict the sync to a single document. `nil` syncs the user's whole
+    /// document scope, owned and shared (default).
     public var documentId: String?
     /// `"full"` (default) syncs every doc's full metadata blob; `"ids"` syncs
     /// only the doc ID list. js-bao name parity.
@@ -576,96 +633,6 @@ public struct SyncMetadataOptions: Sendable {
         self.payloadType = payloadType
         self.background = background
         self.authoritative = authoritative
-    }
-}
-
-public struct StartWorkflowOptions: Sendable {
-    /// The workflow key identifying which workflow to start. Carried here so
-    /// the single-object `start(_:)` overload mirrors js-bao's
-    /// `start({ workflowKey, input, ... })`. Defaults to `""` for the
-    /// positional `start(workflowKey:input:options:)` form, which sources
-    /// the key from its own parameter and ignores this field.
-    public var workflowKey: String
-    /// Input data passed to the workflow (the server's opaque `rootInput`).
-    /// Used by the single-object `start(_:)` overload; ignored by the
-    /// positional form, which takes its own `input` parameter.
-    public var input: [String: JSONValue]
-    public var runKey: String?
-    public var contextDocId: String?
-    public var meta: [String: JSONValue]?
-    /// When true, re-runs a workflow even if a prior run with the same
-    /// `runKey` exists. Matches js-bao's `StartWorkflowOptions.forceRerun`.
-    public var forceRerun: Bool?
-
-    public init(
-        workflowKey: String = "",
-        input: [String: JSONValue] = [:],
-        runKey: String? = nil,
-        contextDocId: String? = nil,
-        meta: [String: JSONValue]? = nil,
-        forceRerun: Bool? = nil
-    ) {
-        self.workflowKey = workflowKey
-        self.input = input
-        self.runKey = runKey
-        self.contextDocId = contextDocId
-        self.meta = meta
-        self.forceRerun = forceRerun
-    }
-}
-
-/// Options for terminating a workflow run. Mirrors js-bao's
-/// `TerminateWorkflowOptions` so the single-object `terminate(_:)` call
-/// lines up field-for-field. `contextDocId` rides here rather than as a
-/// positional parameter.
-public struct TerminateWorkflowOptions: Sendable {
-    /// The workflow key identifying which workflow this run belongs to.
-    public var workflowKey: String
-    /// The run key identifying this workflow run.
-    public var runKey: String
-    /// Document ID the workflow is scoped to. Uses the user's root document
-    /// when not provided.
-    public var contextDocId: String?
-
-    public init(
-        workflowKey: String,
-        runKey: String,
-        contextDocId: String? = nil
-    ) {
-        self.workflowKey = workflowKey
-        self.runKey = runKey
-        self.contextDocId = contextDocId
-    }
-}
-
-public struct ListWorkflowRunsOptions: Sendable {
-    public var workflowKey: String?
-    public var status: String?
-    public var limit: Int?
-    public var cursor: String?
-    /// Walk-direction for cursor pagination. `true` = forward (default),
-    /// `false` = backward. Matches js-bao's `forward` flag on the same
-    /// options object.
-    public var forward: Bool?
-    /// Restrict to runs scoped to a particular document (multi-doc
-    /// workflows fan out per `contextDocId`). Matches js-bao's
-    /// `ListWorkflowRunsOptions.contextDocId`.
-    public var contextDocId: String?
-
-    public init(
-        workflowKey: String? = nil,
-        status: String? = nil,
-        limit: Int? = nil,
-        cursor: String? = nil,
-        forward: Bool? = nil,
-        contextDocId: String? = nil
-    ) {
-        self.workflowKey = workflowKey
-        self.status = status
-        self.limit = limit
-        self.cursor = cursor
-        self.forward = forward
-        self.contextDocId = contextDocId
     }
 }
 
@@ -787,7 +754,7 @@ public struct OfflineGrantStatus: Sendable {
 ///
 /// A cached value is never held back waiting on the network: with
 /// `waitForLoad` at its default, a cache hit returns right away and any
-/// refresh the other options ask for runs in the background (#2364). Use
+/// refresh the other options ask for runs in the background. Use
 /// `waitForLoad: .network` when the call must wait for fresh server data.
 ///
 /// The one entry with nothing to serve is a cached "no such record" (an empty

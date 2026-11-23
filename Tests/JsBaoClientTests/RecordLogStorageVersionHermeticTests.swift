@@ -1,0 +1,546 @@
+import XCTest
+@testable import JsBaoClient
+
+/// #4700 behaviour 21 and edge 32: a store from before the view path, opened
+/// after it, is brought to the storage version once: every projection table
+/// (a `_meta_doc_id` column) and its junctions, the projection marks and
+/// rule, and the view indexes the store built from declarations are dropped;
+/// `record_log_meta.storage_version` reads 3 (#5136; 2 before it); every
+/// record is kept. A store at the version is answered by one version read and
+/// one `sqlite_master` probe, and retired again when an older build has
+/// recreated the projection layout since (finding 4700-R1).
+///
+/// #5136 behaviours 4, 7 and 8: a version-1 store reaches the version (3,
+/// and 4 since #5155) in one open, its rows re-encoded as JSONB without `id`;
+/// a fresh store is at the version with the version-2 columns and the
+/// local-only columns of version 4 (a row's own encoding marks its
+/// conversion), and a store above the build's version keeps it.
+final class RecordLogStorageVersionHermeticTests: XCTestCase {
+
+    /// The record-log tables as the build before #4700 created them,
+    /// statement for statement (`RecordLogSchema.ddl` at 5d6a8a334).
+    private static let version1DDL: [String] = [
+        """
+        CREATE TABLE IF NOT EXISTS record_log_rows (
+          doc_id TEXT NOT NULL,
+          _type TEXT NOT NULL,
+          _id TEXT NOT NULL,
+          _data TEXT NOT NULL,
+          _gen INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (doc_id, _type, _id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS record_log_view (
+          doc_id TEXT NOT NULL,
+          _type TEXT NOT NULL,
+          _id TEXT NOT NULL,
+          _data TEXT NOT NULL,
+          PRIMARY KEY (doc_id, _type, _id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS record_log_state (
+          doc_id TEXT PRIMARY KEY,
+          cursor INTEGER NOT NULL DEFAULT 0,
+          open_epoch INTEGER NOT NULL DEFAULT 1,
+          grant_epoch INTEGER NOT NULL DEFAULT 2,
+          epoch_entries INTEGER NOT NULL DEFAULT 10000,
+          constraints TEXT NOT NULL DEFAULT '[]',
+          last_catch_up_at INTEGER,
+          permission TEXT,
+          rows_gen INTEGER NOT NULL DEFAULT 0,
+          replacing INTEGER,
+          receipt TEXT,
+          segment TEXT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS record_log_writers (
+          doc_id TEXT NOT NULL,
+          client_id TEXT NOT NULL,
+          writer TEXT NOT NULL,
+          next_seq INTEGER NOT NULL DEFAULT 1,
+          resumed_at INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (doc_id, client_id)
+        )
+        """,
+        "CREATE UNIQUE INDEX IF NOT EXISTS record_log_writers_by_writer ON record_log_writers(doc_id, writer)",
+        """
+        CREATE TABLE IF NOT EXISTS record_log_pending (
+          doc_id TEXT NOT NULL,
+          writer TEXT NOT NULL,
+          seq INTEGER NOT NULL,
+          ord INTEGER NOT NULL,
+          e INTEGER NOT NULL,
+          entry TEXT NOT NULL,
+          ts INTEGER,
+          void INTEGER NOT NULL DEFAULT 0,
+          acked INTEGER,
+          PRIMARY KEY (doc_id, writer, seq)
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS record_log_pending_acked ON record_log_pending(doc_id, acked) WHERE acked IS NOT NULL",
+        // A write numbers its entry after the highest `ord` and counts its
+        // epoch's unwithdrawn entries; neither reads the entries.
+        "CREATE INDEX IF NOT EXISTS record_log_pending_by_ord ON record_log_pending(doc_id, ord)",
+        "CREATE INDEX IF NOT EXISTS record_log_pending_by_epoch ON record_log_pending(doc_id, e) WHERE void = 0",
+        """
+        CREATE TABLE IF NOT EXISTS record_log_pending_keys (
+          doc_id TEXT NOT NULL,
+          writer TEXT NOT NULL,
+          seq INTEGER NOT NULL,
+          _type TEXT NOT NULL,
+          _id TEXT NOT NULL,
+          resolved INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (doc_id, writer, seq, _type, _id)
+        )
+        """,
+        // The entries touching a record, answered from the index alone: without
+        // `writer, seq` in it SQLite reads the keys' primary key by document.
+        "DROP INDEX IF EXISTS record_log_pending_keys_by_record",
+        "CREATE INDEX IF NOT EXISTS record_log_pending_keys_by_record_entry ON record_log_pending_keys(doc_id, _type, _id, writer, seq)",
+        """
+        CREATE TABLE IF NOT EXISTS record_log_pending_values (
+          doc_id TEXT NOT NULL,
+          writer TEXT NOT NULL,
+          seq INTEGER NOT NULL,
+          _type TEXT NOT NULL,
+          field TEXT NOT NULL,
+          value,
+          upsert INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (doc_id, writer, seq, _type, field, value)
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS record_log_pending_values_by_value \
+        ON record_log_pending_values(doc_id, _type, field, upsert, value)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS record_log_handled (
+          doc_id TEXT NOT NULL,
+          writer TEXT NOT NULL,
+          _type TEXT NOT NULL,
+          _id TEXT NOT NULL,
+          from_seq INTEGER NOT NULL,
+          until_seq INTEGER NOT NULL,
+          PRIMARY KEY (doc_id, writer, _type, _id, from_seq)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS record_log_epoch_counts (
+          doc_id TEXT NOT NULL,
+          epoch INTEGER NOT NULL,
+          count INTEGER NOT NULL,
+          PRIMARY KEY (doc_id, epoch)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS record_log_projection (
+          doc_id TEXT NOT NULL,
+          model TEXT NOT NULL,
+          PRIMARY KEY (doc_id, model)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS record_log_load_keys (
+          doc_id TEXT NOT NULL,
+          attempt TEXT NOT NULL,
+          _type TEXT NOT NULL,
+          _id TEXT NOT NULL,
+          PRIMARY KEY (doc_id, attempt, _type, _id)
+        )
+        """,
+        "CREATE TABLE IF NOT EXISTS record_log_owner (user_id TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS record_log_projection_rule (rule INTEGER NOT NULL)",
+    ]
+
+    private static let documentId = "rl-version"
+
+    private var directory = ""
+    private let lines = LockedBox<[String]>([])
+
+    override func setUp() {
+        super.setUp()
+        directory = NSTemporaryDirectory() + "/record-log-version-\(UUID().uuidString)"
+        try? FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        let lines = lines
+        Logger.lineForTest = { _, _, message in
+            if message.contains("storage version") { lines.withValue { $0.append(message) } }
+        }
+    }
+
+    override func tearDown() {
+        Logger.lineForTest = nil
+        try? FileManager.default.removeItem(atPath: directory)
+        super.tearDown()
+    }
+
+    private func provider() async throws -> SQLiteStorageProvider {
+        let provider = SQLiteStorageProvider(path: directory + "/store.sqlite")
+        try await provider.initialize(namespace: "test")
+        return provider
+    }
+
+    private func store(_ provider: SQLiteStorageProvider) -> RecordLogStore {
+        RecordLogStore(host: provider, documentId: Self.documentId, clientId: "client-1", logger: Logger(level: .info))
+    }
+
+    private func rows(_ provider: SQLiteStorageProvider, _ sql: String) throws -> [[String: Format2SqlValue]] {
+        try provider.withConnection { try $0.query(sql) }.map(\.columns)
+    }
+
+    private func names(_ provider: SQLiteStorageProvider, _ type: String) throws -> Set<String> {
+        Set(try rows(provider, "SELECT name FROM sqlite_master WHERE type = '\(type)'").compactMap { $0["name"]?.stringValue })
+    }
+
+    private func version(_ provider: SQLiteStorageProvider) throws -> String? {
+        try rows(provider, "SELECT value FROM record_log_meta WHERE key = 'storage_version'").first?["value"]?.stringValue
+    }
+
+    /// What a store holds of its documents, table by table: a record's
+    /// `_data` as its row with `id`, whether stored as text with `id` or as
+    /// JSONB without it (#5136).
+    private func records(_ provider: SQLiteStorageProvider) throws -> [String: [[String: Format2SqlValue]]] {
+        var out: [String: [[String: Format2SqlValue]]] = [:]
+        for (table, order) in [
+            ("record_log_rows", "_id"), ("record_log_view", "_id"), ("record_log_state", "doc_id"),
+            ("record_log_pending", "seq"), ("record_log_pending_keys", "seq"), ("record_log_writers", "client_id"),
+        ] {
+            let data = table == "record_log_rows" || table == "record_log_view"
+            out[table] = try rows(provider, "SELECT *\(data ? ", json(_data) AS _json" : "") FROM \(table) ORDER BY \(order)").map { row in
+                guard data else { return row }
+                var row = row
+                let restored = RecordLogJSON.row(row["_json"]?.stringValue, id: row["_id"]?.stringValue)
+                row["_data"] = .text(RecordLogJSON.text(.object(restored)))
+                row["_json"] = nil
+                return row
+            }
+        }
+        // The `staged` column a store gains at open (#4701), the local-only
+        // columns of version 4 (#5155) and the head columns of version 7
+        // (#5221), and the clear marks of version 11 (#5994), are no record.
+        let added: Set<String> = [
+            "staged", "local_only", "local_indexes", "known_head", "known_head_at", "cleared_lsn", "cleared_models",
+        ]
+        out["record_log_state"] = out["record_log_state"]?.map { $0.filter { !added.contains($0.key) } }
+        return out
+    }
+
+    /// The projection layout an older build keeps beside the view: a model's
+    /// table and its set junction (both with `_meta_doc_id`), the marks, the
+    /// rule, and the view and rows indexes it built from declarations.
+    private func projectionLayout(_ connection: any Format2SqlConnection, rule: Bool = true) throws {
+        try connection.executeScript(
+            "CREATE TABLE IF NOT EXISTS \"Item\" (\"_meta_doc_id\" TEXT NOT NULL, \"id\" TEXT NOT NULL, \"n\" REAL, PRIMARY KEY (\"_meta_doc_id\", \"id\"))"
+        )
+        try connection.executeScript(
+            "CREATE TABLE IF NOT EXISTS \"Item__tags\" (\"_meta_doc_id\" TEXT NOT NULL, \"parent_id\" TEXT NOT NULL, \"value\" TEXT NOT NULL)"
+        )
+        try connection.execute("INSERT INTO \"Item\" (\"_meta_doc_id\", \"id\", \"n\") VALUES (?, 'i1', 5)", [.text(Self.documentId)])
+        try connection.execute(
+            "INSERT INTO \"Item__tags\" (\"_meta_doc_id\", \"parent_id\", \"value\") VALUES (?, 'i1', 'a')", [.text(Self.documentId)]
+        )
+        try connection.executeScript("CREATE TABLE IF NOT EXISTS record_log_projection (doc_id TEXT NOT NULL, model TEXT NOT NULL, PRIMARY KEY (doc_id, model))")
+        try connection.execute("INSERT OR IGNORE INTO record_log_projection (doc_id, model) VALUES (?, 'Item')", [.text(Self.documentId)])
+        if rule {
+            try connection.executeScript("CREATE TABLE IF NOT EXISTS record_log_projection_rule (rule INTEGER NOT NULL)")
+            try connection.execute("DELETE FROM record_log_projection_rule", [])
+            try connection.execute("INSERT INTO record_log_projection_rule (rule) VALUES (1)", [])
+        }
+        try connection.executeScript(
+            "CREATE INDEX IF NOT EXISTS idx_record_log_view_f4_item_n ON record_log_view(doc_id, json_extract(_data, '$.n'), _id) WHERE _type = 'Item'"
+        )
+        try connection.executeScript(
+            "CREATE INDEX IF NOT EXISTS idx_record_log_view_u4_item_by_n ON record_log_view(doc_id, json_extract(_data, '$.n'), _id) WHERE _type = 'Item'"
+        )
+    }
+
+    /// A store as the build before #4700 wrote it: its tables, one record
+    /// confirmed and one pending, and the projection layout beside them.
+    private func version1Store() async throws -> SQLiteStorageProvider {
+        let provider = try await provider()
+        try provider.withConnection { connection in
+            for statement in Self.version1DDL { try connection.executeScript(statement) }
+            let data = #"{"id":"i1","n":5,"tags":["a"]}"#
+            for table in ["record_log_rows", "record_log_view"] {
+                try connection.execute(
+                    "INSERT INTO \(table) (doc_id, _type, _id, _data) VALUES (?, 'Item', 'i1', ?)", [.text(Self.documentId), .text(data)]
+                )
+            }
+            try connection.execute("INSERT INTO record_log_state (doc_id, cursor) VALUES (?, 7)", [.text(Self.documentId)])
+            try connection.execute(
+                "INSERT INTO record_log_writers (doc_id, client_id, writer, next_seq) VALUES (?, 'client-1', 'W1', 2)",
+                [.text(Self.documentId)]
+            )
+            try connection.execute(
+                "INSERT INTO record_log_pending (doc_id, writer, seq, ord, e, entry) VALUES (?, 'W1', 1, 1, 1, '{}')",
+                [.text(Self.documentId)]
+            )
+            try connection.execute(
+                "INSERT INTO record_log_pending_keys (doc_id, writer, seq, _type, _id) VALUES (?, 'W1', 1, 'Item', 'i1')",
+                [.text(Self.documentId)]
+            )
+            try connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_record_log_rows_f4_item_n ON record_log_rows(doc_id, json_extract(_data, '$.n'), _id) WHERE _type = 'Item'",
+                []
+            )
+            try projectionLayout(connection)
+        }
+        return provider
+    }
+
+    private func assertRetired(
+        _ provider: SQLiteStorageProvider, version expected: String = String(RecordLogSchema.storageVersion), file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let tables = try names(provider, "table")
+        for gone in ["Item", "Item__tags", "record_log_projection", "record_log_projection_rule"] {
+            XCTAssertFalse(tables.contains(gone), "\(gone) is dropped", file: file, line: line)
+        }
+        let derived = try rows(provider, """
+            SELECT m.name AS name FROM sqlite_master m WHERE m.type = 'table'
+              AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) WHERE name = '_meta_doc_id')
+            """)
+        XCTAssertEqual(derived.count, 0, "no table with a _meta_doc_id column: \(derived)", file: file, line: line)
+        let declared = try names(provider, "index").filter {
+            $0.hasPrefix("idx_record_log_view_f") || $0.hasPrefix("idx_record_log_view_u")
+        }
+        XCTAssertEqual(declared, [], "the declaration-built view indexes are dropped", file: file, line: line)
+        XCTAssertEqual(try version(provider), expected, file: file, line: line)
+    }
+
+    // MARK: - Behaviour 21
+
+    func testAStoreFromBeforeTheViewPathIsRetiredOnceKeepingEveryRecord() async throws {
+        let provider = try await version1Store()
+        let before = try records(provider)
+        XCTAssertEqual(before["record_log_view"]?.count, 1)
+
+        try store(provider).initialize()
+        try assertRetired(provider)
+        XCTAssertEqual(try records(provider), before, "every record is kept")
+        // #5136 behaviour 7: in the same open, its rows are JSONB without id.
+        let stored = try rows(provider, """
+            SELECT typeof(_data) AS kind, json_extract(_data, '$.id') IS NULL AS no_id FROM record_log_rows
+            UNION ALL SELECT typeof(_data), json_extract(_data, '$.id') IS NULL FROM record_log_view
+            """)
+        XCTAssertEqual(stored.map { $0["kind"]?.stringValue }, ["blob", "blob"])
+        XCTAssertEqual(stored.map { $0["no_id"]?.intValue }, [1, 1])
+        XCTAssertEqual(lines.value.count, 1, "one line names the version: \(lines.value)")
+        XCTAssertTrue(lines.value.first?.contains("storage version \(RecordLogSchema.storageVersion)") ?? false, lines.value.first ?? "")
+        XCTAssertTrue(
+            lines.value.first?.contains("1 document(s), 2 row(s) re-encoded as JSONB without id") ?? false, lines.value.first ?? ""
+        )
+        XCTAssertTrue(lines.value.first?.contains("dropped Item, Item__tags") ?? false, lines.value.first ?? "")
+
+        // A second open reads the version and probes for an older build's layout, nothing more.
+        lines.value = []
+        let trace = try RecordLogStatementTrace.install(on: provider, self)
+        try store(provider).initialize()
+        let ran = trace.statements.filter { statement in
+            !["BEGIN", "COMMIT", "ROLLBACK", "PRAGMA", "SAVEPOINT", "RELEASE"].contains {
+                statement.trimmingCharacters(in: .whitespacesAndNewlines).uppercased().hasPrefix($0)
+            }
+        }
+        XCTAssertEqual(ran.count, 2, "one version read and one sqlite_master probe: \(ran)")
+        XCTAssertTrue(ran.first?.contains("record_log_meta") ?? false, "\(ran)")
+        XCTAssertTrue(ran.last?.contains("sqlite_master") ?? false, "\(ran)")
+        XCTAssertEqual(lines.value, [], "nothing to drop, nothing logged")
+        XCTAssertEqual(try records(provider), before)
+    }
+
+    func testAnOlderBuildsRecreatedLayoutIsRetiredAgainAtTheVersion() async throws {
+        let provider = try await version1Store()
+        try store(provider).initialize()
+        let before = try records(provider)
+        // An older build opened the store since: it recreated its layout and
+        // left the marker as it found it.
+        try provider.withConnection { try projectionLayout($0) }
+        XCTAssertEqual(try version(provider), String(RecordLogSchema.storageVersion))
+        lines.value = []
+
+        try store(provider).initialize()
+        try assertRetired(provider)
+        XCTAssertEqual(try records(provider), before, "every record and the marker kept")
+        XCTAssertEqual(lines.value.count, 1, "the drop is logged once: \(lines.value)")
+    }
+
+    // MARK: - Edge 32
+
+    func testTheMigrationRunsUnderSetOwnerAndAgainWhenItsMarkerIsDeleted() async throws {
+        let provider = try await version1Store()
+        try RecordLogStore.setOwner(host: provider, userId: "user-a")
+        try assertRetired(provider)
+        XCTAssertEqual(try RecordLogStore.owner(host: provider), "user-a")
+
+        try provider.withConnection { try $0.execute("DELETE FROM record_log_meta", []) }
+        XCTAssertNil(try version(provider))
+        try store(provider).initialize()
+        try assertRetired(provider)
+    }
+
+    // MARK: - Finding 4700-I2: a purge of a store from before the view path
+
+    /// An owner change resets the store before any binding migrated it: the
+    /// reset clears every current table, `record_log_indexes` among them, so
+    /// the store is brought to the version first.
+    func testAnOwnerChangeResetsAStoreFromBeforeTheViewPath() async throws {
+        let provider = try await version1Store()
+        try provider.withConnection { try $0.execute("INSERT INTO record_log_owner (user_id) VALUES ('user-a')", []) }
+
+        XCTAssertEqual(try RecordLogStore.purgeAll(host: provider), 1, "the one unsent write is dropped")
+        try RecordLogStore.setOwner(host: provider, userId: "user-b")
+        try assertRetired(provider)
+        XCTAssertEqual(try RecordLogStore.owner(host: provider), "user-b")
+        XCTAssertEqual(try records(provider).values.map(\.count), [0, 0, 0, 0, 0, 0], "every document's rows are gone")
+    }
+
+    /// Purging a document no binding opened since the upgrade.
+    func testPurgingAnUnopenedDocumentOfAStoreFromBeforeTheViewPath() async throws {
+        let provider = try await version1Store()
+        let reply = try store(provider).purge(force: true)
+        XCTAssertTrue(reply.purged)
+        XCTAssertFalse(reply.nothingStored)
+        try assertRetired(provider)
+        XCTAssertEqual(try records(provider).values.map(\.count), [0, 0, 0, 0, 0, 0], "the document's rows are gone")
+    }
+
+    /// A database that never held a record-log table stays without one.
+    func testPurgingAStoreWithNoRecordLogTablesCreatesNone() async throws {
+        let provider = try await provider()
+        XCTAssertEqual(try RecordLogStore.purgeAll(host: provider), 0)
+        XCTAssertTrue(try store(provider).purge(force: true).nothingStored)
+        XCTAssertEqual(try names(provider, "table").filter { $0.hasPrefix("record_log_") }, [])
+    }
+
+    // MARK: - #5223 behavior 3: a version-1 store with a cached index reaches version 6
+
+    /// The index cache as #4700 created it (storage version 2): no `members`
+    /// (version 5) and no `kind` (version 6).
+    private static let indexCacheAt2 = """
+        CREATE TABLE IF NOT EXISTS record_log_indexes (
+          doc_id TEXT NOT NULL,
+          model TEXT NOT NULL,
+          fields TEXT NOT NULL,
+          is_unique INTEGER NOT NULL DEFAULT 0,
+          room_name TEXT,
+          PRIMARY KEY (doc_id, model, fields)
+        )
+        """
+
+    /// A version-1 store holding a cached scalar entry and its view index
+    /// opens at version 6 in one open: the `members` column added before the
+    /// cache is copied, the entry read `scalar`, every record kept.
+    func testAVersion1StoreWithACachedIndexOpensAtTheVersionWithItsEntryScalar() async throws {
+        let provider = try await version1Store()
+        try provider.withConnection { connection in
+            try connection.executeScript(Self.indexCacheAt2)
+            try connection.execute(
+                "INSERT INTO record_log_indexes (doc_id, model, fields, is_unique, room_name) VALUES (?, 'Item', '[\"n\"]', 1, 'idx_records_item_n')",
+                [.text(Self.documentId)]
+            )
+            try connection.executeScript(
+                "CREATE INDEX idx_record_log_view_4_item_1_n ON record_log_view(doc_id, json_extract(_data, '$.n'), _id) WHERE _type = 'Item'"
+            )
+        }
+        let before = try records(provider)
+        try store(provider).initialize()
+        try assertRetired(provider)
+        XCTAssertEqual(try version(provider), String(RecordLogSchema.storageVersion))
+        XCTAssertEqual(try records(provider), before, "every record is kept")
+        let cached = try rows(provider, "SELECT doc_id, model, fields, kind, is_unique, room_name, members, text, options FROM record_log_indexes")
+        XCTAssertEqual(cached.count, 1)
+        XCTAssertEqual(cached.first?["kind"]?.stringValue, "scalar")
+        XCTAssertEqual(cached.first?["is_unique"]?.intValue, 1)
+        XCTAssertEqual(cached.first?["room_name"]?.stringValue, "idx_records_item_n")
+        for column in ["members", "text", "options"] { XCTAssertTrue(cached.first?[column]?.isNull ?? false, column) }
+        XCTAssertTrue(try names(provider, "index").contains("idx_record_log_view_4_item_1_n"), "the view index is kept")
+        XCTAssertEqual(try store(provider).indexTuples(), [RecordLogIndexTuple(model: "Item", fields: ["n"], unique: true)])
+    }
+
+    // MARK: - #4701 edge 50: the staged replacement's column and table, added without a version change
+
+    /// A store at the version without the staged replacement's column and
+    /// table (as a build before #4701 left a version-2 store) gains both at
+    /// the next open, with the version unchanged and every record kept.
+    func testAStoreAtTheVersionWithoutTheStagedReplacementGainsItsColumnAndTableAtOpen() async throws {
+        let provider = try await version1Store()
+        try store(provider).initialize()
+        try provider.withConnection { connection in
+            if try connection.query("SELECT 1 AS present FROM pragma_table_info('record_log_state') WHERE name = 'staged'").first != nil {
+                try connection.executeScript("ALTER TABLE record_log_state DROP COLUMN staged")
+            }
+            try connection.executeScript("DROP TABLE IF EXISTS record_log_staged_base")
+        }
+        let before = try records(provider)
+        XCTAssertEqual(try version(provider), String(RecordLogSchema.storageVersion))
+
+        try store(provider).initialize()
+        XCTAssertEqual(try version(provider), String(RecordLogSchema.storageVersion), "no version change")
+        XCTAssertTrue(try names(provider, "table").contains("record_log_staged_base"))
+        let columns = try rows(provider, "SELECT name FROM pragma_table_info('record_log_state')").compactMap { $0["name"]?.stringValue }
+        XCTAssertEqual(columns.last, "staged")
+        let after = try records(provider)
+        XCTAssertEqual(after.mapValues(\.count), before.mapValues(\.count), "every record kept")
+        XCTAssertEqual(after["record_log_view"], before["record_log_view"])
+        XCTAssertEqual(after["record_log_pending"], before["record_log_pending"])
+        XCTAssertTrue(try rows(provider, "SELECT staged FROM record_log_state").first?["staged"]?.isNull ?? false, "the added column is NULL")
+        XCTAssertFalse(try store(provider).storedState().staged)
+    }
+
+    // MARK: - #5136 behaviour 4 and edge 021: a fresh store
+
+    /// The statements `trace` holds other than transaction control.
+    private func ran(_ trace: RecordLogStatementTrace) -> [String] {
+        trace.statements.filter { statement in
+            !["BEGIN", "COMMIT", "ROLLBACK", "PRAGMA", "SAVEPOINT", "RELEASE"].contains {
+                statement.trimmingCharacters(in: .whitespacesAndNewlines).uppercased().hasPrefix($0)
+            }
+        }
+    }
+
+    func testAFreshStoreIsAtVersion4WithTheVersion2StateColumnsAndTheLocalOnlyOnes() async throws {
+        let provider = try await provider()
+        let trace = try RecordLogStatementTrace.install(on: provider, self)
+        try store(provider).initialize()
+        XCTAssertEqual(try version(provider), String(RecordLogSchema.storageVersion))
+        let columns = try rows(provider, "SELECT name FROM pragma_table_info('record_log_state')").compactMap { $0["name"]?.stringValue }
+        XCTAssertEqual(
+            Array(columns.suffix(7)),
+            ["staged", "local_only", "local_indexes", "known_head", "known_head_at", "cleared_lsn", "cleared_models"],
+            "no marker column: a row's encoding is its marker; version 4's local-only columns follow, then version 7's head, then version 11's clear marks"
+        )
+        XCTAssertFalse(trace.statements.contains { $0.contains("UPDATE record_log_rows") }, "nothing to convert")
+        XCTAssertEqual(lines.value, [], "nothing converted or dropped, nothing logged")
+
+        // A second open reads the version and probes, nothing more.
+        trace.clear()
+        try store(provider).initialize()
+        let second = ran(trace)
+        XCTAssertEqual(second.count, 2, "one version read and one sqlite_master probe: \(second)")
+        XCTAssertTrue(second.first?.contains("record_log_meta") ?? false, "\(second)")
+        XCTAssertTrue(second.last?.contains("sqlite_master") ?? false, "\(second)")
+    }
+
+    // MARK: - #5136 behaviour 8: a store above the build's version
+
+    func testAStoreAboveTheBuildsVersionKeepsItsVersionAndIsRetiredWhenAnOlderBuildWasHere() async throws {
+        let provider = try await provider()
+        try store(provider).initialize()
+        let newer = String(RecordLogSchema.storageVersion + 1)
+        try provider.withConnection {
+            try $0.execute("UPDATE record_log_meta SET value = ? WHERE key = 'storage_version'", [.text(newer)])
+        }
+        let trace = try RecordLogStatementTrace.install(on: provider, self)
+        try store(provider).initialize()
+        let fast = ran(trace)
+        XCTAssertEqual(fast.count, 2, "the fast path: \(fast)")
+        XCTAssertEqual(try version(provider), newer, "a newer build's version is kept")
+
+        // An older build opened it since: its layout is retired, the version not lowered.
+        try provider.withConnection { try projectionLayout($0) }
+        try store(provider).initialize()
+        try assertRetired(provider, version: newer)
+        XCTAssertEqual(lines.value.count, 1, "the drop is logged once: \(lines.value)")
+    }
+}

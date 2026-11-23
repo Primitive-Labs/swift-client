@@ -95,7 +95,7 @@ public struct PasskeySignInResult: Decodable, Sendable, Equatable {
 }
 
 /// Deferred-grant resolution summary returned when an `inviteToken` is
-/// folded into passkey registration (#466).
+/// folded into passkey registration.
 public struct PasskeyInvitationGrants: Decodable, Sendable, Equatable {
     public let groups: Int
     public let documents: Int
@@ -115,7 +115,7 @@ public struct PasskeyRegistrationResult: Decodable, Sendable, Equatable {
     /// Whether the authenticator reported the credential as backed up
     /// (synced to iCloud Keychain).
     public let credentialBackedUp: Bool?
-    /// Present when an `inviteToken` was supplied and accepted (#466).
+    /// Present when an `inviteToken` was supplied and accepted.
     public let invitation: PasskeyInvitationResult?
 }
 

@@ -1,0 +1,22 @@
+{
+  "model": "Turn",
+  "row": {
+    "id": "turn_2",
+    "seq": 2,
+    "status": "running",
+    "initiatorUserId": "u_owner",
+    "configId": "cfg_main",
+    "startedAt": "2026-09-28T12:00:00.000Z"
+  },
+  "expect": {
+    "id": "turn_2",
+    "seq": 2,
+    "status": "running",
+    "initiatorUserId": "u_owner",
+    "configId": "cfg_main",
+    "startedAt": "2026-09-28T12:00:00.000Z",
+    "endedAt": {
+      "$absent": true
+    }
+  }
+}

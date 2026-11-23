@@ -4,6 +4,7 @@ import YSwift
 
 /// Port of tests/client/js-bao-client-node-offline.test.ts
 /// Tests offline-first behavior, local persistence, and sync.
+@available(*, deprecated)
 final class OfflineTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!
@@ -382,6 +383,7 @@ final class OfflineTests: XCTestCase {
 
     // MARK: - Data available immediately after network sync (evict + reopen)
 
+    @available(*, deprecated)
     func testDataAvailableAfterEvictAndReopen() async throws {
         let dbPath = tempDir + "evict-reopen-\(UUID().uuidString.prefix(6)).sqlite"
         let client = createTestClient(

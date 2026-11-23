@@ -10,6 +10,7 @@ import XCTest
 ///  - offline / `localOnly` / `refreshFromServer: false`: local cache subset
 ///    only, no server call, no throw
 ///  - owned vs shared discriminated by the cached `permission`.
+@available(*, deprecated)
 final class MeOfflineFirstTests: XCTestCase {
     var ctx: TestContext!
     var testApp: TestApp!

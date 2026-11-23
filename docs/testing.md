@@ -46,7 +46,8 @@ The backend integration tests require the setup below.
    cp .env.tests.example .env.tests
    ```
    You normally **don't** need to set anything: the suite resolves its
-   super-admin at setup time, in this order (`TestConfig.resolveSuperAdminJwt`):
+   super-admin once per test process, in this order
+   (`TestConfig.resolveSuperAdminCredential`):
 
    1. `TEST_SUPERADMIN_JWT`, when set — used as is.
    2. `TEST_SUPERADMIN_EMAIL`, when set — the suite signs an email-only token
@@ -56,6 +57,11 @@ The backend integration tests require the setup below.
       TEST_ADMIN_TOKEN`, default `local-test-secret`) to find or create the
       `swift-client-tests@js-bao-wss.test` super-admin, and signs a token for
       that row.
+
+   In cases 2 and 3 the suite signs a fresh one-hour token each time a test
+   sets up, so a full run longer than an hour keeps authenticating. A
+   `TEST_SUPERADMIN_JWT` is used as is for the whole run, so give it a lifetime
+   longer than the run.
 
    Tokens are signed with `TEST_JWT_SECRET` (default
    `test-jwt-secret-only-for-agents`, matching the dev server's `JWT_SECRET` in

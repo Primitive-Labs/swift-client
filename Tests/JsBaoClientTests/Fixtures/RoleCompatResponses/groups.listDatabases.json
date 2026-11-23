@@ -1,0 +1,22 @@
+{
+  "name": "groups.listDatabases",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "GET",
+  "path": "/app/<appId>/api/groups/team/baseline/databases",
+  "caller": "owner",
+  "request": null,
+  "status": 200,
+  "body": [
+    {
+      "databaseId": "<ulid>",
+      "title": "Baseline Database",
+      "databaseType": "baseline",
+      "createdBy": "<ulid>",
+      "createdAt": "<iso>",
+      "modifiedAt": "<iso>",
+      "permission": "manager",
+      "grantedAt": "<iso>"
+    }
+  ]
+}

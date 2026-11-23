@@ -1,0 +1,13 @@
+{
+  "name": "groups.removeMember",
+  "removal": "#4718",
+  "recordedFrom": "local dev",
+  "method": "DELETE",
+  "path": "/app/<appId>/api/groups/team/baseline/members/<ulid>",
+  "caller": "owner",
+  "request": null,
+  "status": 200,
+  "body": {
+    "success": true
+  }
+}

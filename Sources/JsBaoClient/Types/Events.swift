@@ -68,6 +68,7 @@ public enum DocumentPermission: String, Sendable, Codable {
     case owner
     case readWrite = "read-write"
     case reader
+    @available(*, deprecated, message: "No answer sends admin: a console administrator's access is owner.")
     case admin
 }
 
@@ -92,7 +93,7 @@ public enum StartNetworkMode: String, Sendable {
 /// Every event key the client can deliver.
 ///
 /// Each key has exactly one `JsBaoEventPayload` type, which is what
-/// `client.stream(for:)` resolves a subscription from. Since #2367 there are no
+/// `client.stream(for:)` resolves a subscription from. There are no
 /// exceptions: the three never-emitted or Swift-only cases (`auth`,
 /// `blobsUploadQueued`, `remoteUpdate`) were removed with the rest of the
 /// deprecated surface.
@@ -124,21 +125,20 @@ public enum JsBaoEvent: String, Sendable {
     case blobsQueueDrained = "blobs:queue-drained"
     case permission
     case meUpdated
-    /// Live mirror of a durable in-app notification (#779 / #1601). Payload:
+    /// Live mirror of a durable in-app notification. Payload:
     /// `NotificationEvent`. Emitted when the signed-in user receives an in-app
     /// notification while connected. Mirrors the JS client's `notification`
     /// event; fetch older rows via `client.notifications.list()`.
     case notification
-    case workflowStatus
-    /// A message a server function published to a channel this client joined
-    /// (#3278). Payload: `ChannelMessageEvent`. Mirrors JS `channelMessage`.
+    /// A message a server function published to a channel this client joined.
+    /// Payload: `ChannelMessageEvent`. Mirrors JS `channelMessage`.
     case channelMessage
     /// A channel subscribe the server refused when nothing was waiting on it
-    /// — the reconnect re-issue of an expired grant (#3278). Payload:
+    /// — the reconnect re-issue of an expired grant. Payload:
     /// `ChannelSubscribeFailedEvent`. Mirrors JS `channelSubscribeFailed`.
     case channelSubscribeFailed
     /// A message a server function sent straight to this user or connection
-    /// with `ctx.users.send` / `ctx.connections.send` (#3278). Payload:
+    /// with `ctx.users.send` / `ctx.connections.send`. Payload:
     /// `DirectMessageEvent`. Mirrors JS `directMessage`.
     case directMessage
     case documentMetadataChanged
@@ -169,27 +169,18 @@ public enum JsBaoEvent: String, Sendable {
     case pendingCreateCommitted
     case schemaDiscovered = "schema-discovered"
     case syncPerf
-    case workflowStarted
     case documentSyncStateChanged
-    /// How a large document's base snapshot load is going (#3436). Mirrors the
-    /// JS client's `document:snapshot-load`.
-    case documentSnapshotLoad = "document:snapshot-load"
-    /// Every refused write on a large document past its offline window
-    /// (#3758). Raised for EVERY door — `create`, `update`, `save`, `upsert`,
+    /// Every write a record-log document's room refused, handed back with what
+    /// it wrote. Raised for EVERY door — `create`, `update`, `save`, `upsert`,
     /// the string-set verbs, `delete(id:)` and the record field setters — and
     /// the doors that can throw throw the same error as well. The JS client's
     /// `document:write-refused`, by that name.
     case documentWriteRefused = "document:write-refused"
-    /// A large document that was away replayed what it wrote offline and some
-    /// of it did not simply apply (#3437, behavior 20). The JS client's
-    /// `documentOfflineWritesResolved`, by that name: an app that subscribes on
-    /// both clients subscribes to one string.
-    case documentOfflineWritesResolved
     // Appended for the reason `JsBaoErrorCode.documentFormatMismatch` is: a case
     // inserted into an enum shifts every later ordinal, and a stale incremental
     // test build then reads each one as its neighbour (#3436's hazard).
     /// The platform refused a document because the format this client believed
-    /// it had is not the format the platform resolved (#3764). The document is
+    /// it had is not the format the platform resolved. The document is
     /// closed when this arrives, with its store intact; an open that was waiting
     /// on the network throws the same error as well. The JS client's
     /// `document:format-mismatch`, by that name.
@@ -205,6 +196,48 @@ public enum JsBaoEvent: String, Sendable {
     /// JS `KvCache`'s `cacheUpdateFailed` (`src/client/kv-cache.ts`).
     /// Payload: `CacheUpdateFailedEvent` (`key` / `error`).
     case cacheUpdateFailed
+    // Appended, as `documentFormatMismatch` was, so no earlier case's ordinal moves.
+    /// A session you own or belong to changed for you: activity, a read mark,
+    /// a status change, a rename, a member change, a removal or a delete.
+    /// Payload: `AgentSessionChangedEvent`. Mirrors JS `agentSessionChanged`;
+    /// `agents.sessions.watch` and an open session view apply it for you.
+    case agentSessionChanged
+    // The `client.db3` events, appended for the same reason; each is the JS
+    // client's key verbatim. A `Db3Subscription` delivers its own db3's.
+    /// A db3's state on this device changed. Payload: `Db3StateEvent`.
+    case db3State = "db3:state"
+    /// A subscription reached `live`, once per subscribe. Payload: `Db3ReadyEvent`.
+    case db3Ready = "db3:ready"
+    /// Records of a db3 changed in the local copy. Payload: `Db3RowsEvent`.
+    case db3Rows = "db3:rows"
+    /// Writes to a db3 were handed back. Payload: `Db3WriteRefusedEvent`.
+    case db3WriteRefused = "db3:write-refused"
+    /// A db3's records left this device. Payload: `Db3EvictedEvent`.
+    case db3Evicted = "db3:evicted"
+    /// The room refused this user access to a db3. Payload: `Db3GoneEvent`.
+    case db3Gone = "db3:gone"
+    /// An open attempt of a db3 failed; the client retries. Payload: `Db3ErrorEvent`.
+    case db3Error = "db3:error"
+    // Appended (#4921), so no earlier case's ordinal moves.
+    /// The server has a db3 `client.db3.create` made. Payload: `Db3CreatedEvent`.
+    case db3Created = "db3:created"
+    /// The server refused a `client.db3.create`. Payload: `Db3CreateFailedEvent`.
+    case db3CreateFailed = "db3:create-failed"
+    // The access-request events, appended for the same reason; each is the JS
+    // client's key verbatim. The `document:` pair follows the deprecated
+    // documents family; a db3 request also sends the `db3:` pair.
+    /// Someone asked for access to a document this user owns. Payload:
+    /// `DocumentAccessRequestCreatedEvent`.
+    case documentAccessRequestCreated = "document:access-request-created"
+    /// An access request on a document was approved or denied. Payload:
+    /// `DocumentAccessRequestResolvedEvent`.
+    case documentAccessRequestResolved = "document:access-request-resolved"
+    /// Someone asked for access to a db3 this user owns. Payload:
+    /// `Db3AccessRequestCreatedEvent`.
+    case db3AccessRequestCreated = "db3:access-request-created"
+    /// An access request on a db3 was approved or denied. Payload:
+    /// `Db3AccessRequestResolvedEvent`.
+    case db3AccessRequestResolved = "db3:access-request-resolved"
 }
 
 // MARK: - Event Payloads
@@ -266,7 +299,7 @@ public struct SyncEvent: Sendable {
 /// `client.getAwarenessStates(documentId:)` with the delivered IDs —
 /// same pattern as JS.
 ///
-/// (#996: this replaced the previous Swift-only full-snapshot `states`
+/// (this replaced the previous Swift-only full-snapshot `states`
 /// payload, which JS never delivered.)
 public struct AwarenessEvent: Sendable {
     public let documentId: String
@@ -284,7 +317,7 @@ public struct AwarenessEvent: Sendable {
 
 /// Payload for `.permission`. JS delivers `permission` as a plain string
 /// (`"owner" | "read-write" | "reader" | "admin"`); Swift keeps a typed
-/// enum whose `rawValue`s are exactly those wire strings (#996 decision:
+/// enum whose `rawValue`s are exactly those wire strings (decision:
 /// typed accessor with matching observable value). Read
 /// `event.permission.rawValue` for the JS-identical string — also exposed
 /// directly as `permissionRaw`.
@@ -307,7 +340,7 @@ public struct DocumentMetadataChangedEvent: Sendable {
     public let action: String
     public let metadata: [String: JSONValue]?
     public let changedFields: [String]?
-    /// Where the change originated. Always present (#996). Matches js-bao's
+    /// Where the change originated. Always present. Matches js-bao's
     /// `documentMetadataChanged.source` vocabulary field-for-field:
     /// - `"local"`  — write originated on this device
     /// - `"server"` — the server pushed it over the WebSocket
@@ -542,71 +575,10 @@ public struct BlobUploadFailedEvent: Sendable {
     }
 }
 
-/// Server-pushed workflow status event. Mirrors the JS client's
-/// `WorkflowStatusEvent` payload field-for-field — matches the
-/// `WorkflowStatusPayload` the server emits in
-/// `src/app-api/services/websocket-notifier.ts`.
-///
-/// The server only fires this for terminal statuses (`completed`, `failed`,
-/// `terminated`). When `needsApply == true` and the workflow has a handler
-/// registered via `client.workflows.define(...)`, the client triggers the
-/// claim → apply → confirm flow automatically.
-public struct WorkflowStatusEvent: @unchecked Sendable {
-    public let workflowKey: String
-    public let workflowId: String
-    public let runKey: String
-    public let runId: String
-    public let status: String   // "completed" | "failed" | "terminated" | "skipped"
-    public let output: Any?
-    public let error: String?
-    /// #2636 — the platform's classification of a `"failed"` run
-    /// (`"LOCK_CONTENTION"` / `"LOCK_TIMEOUT"`); `nil` on any other status.
-    public let errorCode: String?
-    /// #2636 — why a `"skipped"` run did not run (`"LOCK_CONTENTION"`): its
-    /// declarative lock was held and the definition declared
-    /// `onContention: "ignore"`. `nil` on any other status; such a frame
-    /// carries no `error`.
-    public let skipReason: String?
-    public let contextDocId: String?
-    public let needsApply: Bool
-    public let meta: [String: JSONValue]?
-    public let startedByUserId: String?
-
-    public init(
-        workflowKey: String,
-        workflowId: String,
-        runKey: String,
-        runId: String,
-        status: String,
-        output: Any? = nil,
-        error: String? = nil,
-        errorCode: String? = nil,
-        skipReason: String? = nil,
-        contextDocId: String? = nil,
-        needsApply: Bool = false,
-        meta: [String: JSONValue]? = nil,
-        startedByUserId: String? = nil
-    ) {
-        self.workflowKey = workflowKey
-        self.workflowId = workflowId
-        self.runKey = runKey
-        self.runId = runId
-        self.status = status
-        self.output = output
-        self.error = error
-        self.errorCode = errorCode
-        self.skipReason = skipReason
-        self.contextDocId = contextDocId
-        self.needsApply = needsApply
-        self.meta = meta
-        self.startedByUserId = startedByUserId
-    }
-}
-
 /// Payload for `.notification`
 /// (`for await e in client.stream(for: NotificationEvent.self)`).
 ///
-/// Real-time mirror of a durable in-app notification (#779 / #1601). Mirrors
+/// Real-time mirror of a durable in-app notification. Mirrors
 /// the JS client's `NotificationEvent` (`src/client/JsBaoClient.ts`)
 /// field-for-field, including optionality. Emitted over the `notification`
 /// channel when the signed-in user receives an in-app notification while
@@ -638,6 +610,107 @@ public struct NotificationEvent: Sendable, Equatable {
         self.deepLink = deepLink
         self.sourceRef = sourceRef
         self.createdAt = createdAt
+    }
+}
+
+/// Payload for `.documentAccessRequestCreated`
+/// (`for await e in client.stream(for: DocumentAccessRequestCreatedEvent.self)`).
+///
+/// Someone asked for access to a document this user owns. Sent to every
+/// connected owner when a request is made or a pending one is re-submitted;
+/// a db3 request is also delivered as `Db3AccessRequestCreatedEvent`. Nothing
+/// is replayed after a reconnect: list the requests then and apply the events
+/// from there. Mirrors the JS client's `AccessRequestCreatedEvent`.
+public struct DocumentAccessRequestCreatedEvent: Decodable, Sendable, Equatable {
+    public let requestId: String
+    public let documentId: String
+    public let requesterId: String
+    /// `"read-write"` or `"reader"`.
+    public let requestedPermission: String
+    /// Always `"pending"`.
+    public let status: String
+    public let requesterEmail: String?
+    public let requesterName: String?
+    /// The requester's note, when they wrote one.
+    public let message: String?
+    /// When the request was made, ISO 8601.
+    public let createdAt: String?
+    public let title: String?
+    public let document: AccessRequestDocumentSummary?
+
+    public init(
+        requestId: String,
+        documentId: String,
+        requesterId: String,
+        requestedPermission: String,
+        status: String,
+        requesterEmail: String? = nil,
+        requesterName: String? = nil,
+        message: String? = nil,
+        createdAt: String? = nil,
+        title: String? = nil,
+        document: AccessRequestDocumentSummary? = nil
+    ) {
+        self.requestId = requestId
+        self.documentId = documentId
+        self.requesterId = requesterId
+        self.requestedPermission = requestedPermission
+        self.status = status
+        self.requesterEmail = requesterEmail
+        self.requesterName = requesterName
+        self.message = message
+        self.createdAt = createdAt
+        self.title = title
+        self.document = document
+    }
+}
+
+/// Payload for `.documentAccessRequestResolved`
+/// (`for await e in client.stream(for: DocumentAccessRequestResolvedEvent.self)`).
+///
+/// An access request was approved or denied. Sent to the requester and to
+/// every connected owner, whoever resolved it; a db3 request is also delivered
+/// as `Db3AccessRequestResolvedEvent`. `grantedPermission` is set only when
+/// `status` is `"approved"`. Mirrors the JS client's `AccessRequestResolvedEvent`.
+public struct DocumentAccessRequestResolvedEvent: Decodable, Sendable, Equatable {
+    public let requestId: String
+    public let documentId: String
+    public let requesterId: String
+    /// `"read-write"` or `"reader"`.
+    public let requestedPermission: String
+    /// `"approved"` or `"denied"`.
+    public let status: String
+    /// `"read-write"` or `"reader"`, when approved.
+    public let grantedPermission: String?
+    /// The user who approved or denied it.
+    public let resolvedBy: String?
+    /// When it was resolved, ISO 8601.
+    public let resolvedAt: String?
+    public let title: String?
+    public let document: AccessRequestDocumentSummary?
+
+    public init(
+        requestId: String,
+        documentId: String,
+        requesterId: String,
+        requestedPermission: String,
+        status: String,
+        grantedPermission: String? = nil,
+        resolvedBy: String? = nil,
+        resolvedAt: String? = nil,
+        title: String? = nil,
+        document: AccessRequestDocumentSummary? = nil
+    ) {
+        self.requestId = requestId
+        self.documentId = documentId
+        self.requesterId = requesterId
+        self.requestedPermission = requestedPermission
+        self.status = status
+        self.grantedPermission = grantedPermission
+        self.resolvedBy = resolvedBy
+        self.resolvedAt = resolvedAt
+        self.title = title
+        self.document = document
     }
 }
 
@@ -707,43 +780,6 @@ public struct ChannelSubscribeFailedEvent: Sendable, Equatable {
     }
 }
 
-/// Context delivered to the user's `onApply` handler registered via
-/// `client.workflows.define(...)`. Mirrors the JS client's apply context.
-public struct WorkflowApplyContext: @unchecked Sendable {
-    public let workflowKey: String
-    public let runKey: String
-    public let runId: String
-    public let contextDocId: String?
-    public let output: Any?
-    public let startedByUserId: String?
-    public let meta: [String: JSONValue]?
-
-    public init(
-        workflowKey: String,
-        runKey: String,
-        runId: String,
-        contextDocId: String? = nil,
-        output: Any? = nil,
-        startedByUserId: String? = nil,
-        meta: [String: JSONValue]? = nil
-    ) {
-        self.workflowKey = workflowKey
-        self.runKey = runKey
-        self.runId = runId
-        self.contextDocId = contextDocId
-        self.output = output
-        self.startedByUserId = startedByUserId
-        self.meta = meta
-    }
-}
-
-/// Closure type for the user's apply handler registered via
-/// `client.workflows.define(workflowKey, onApply: ...)`. The closure runs
-/// after the client successfully claims the apply lease and fetches the
-/// workflow output. Throw to cause the claim to be released so another
-/// client (or a retry) can pick it up.
-public typealias WorkflowApplyHandler = @Sendable (WorkflowApplyContext) async throws -> Void
-
 // MARK: - Newly-added event payloads (parity gap 5)
 // Each struct mirrors the JS counterpart's payload field-for-field.
 // Where the JS payload is `{}`, the struct is empty.
@@ -801,11 +837,11 @@ public struct DocumentOpenedEvent: Sendable {
     public init(documentId: String) { self.documentId = documentId }
 }
 
-/// A local mutation on a large document that was refused, reported through
-/// the one channel a non-throwing verb has (#3437, behavior 2a).
+/// A local mutation on a record-log document that was refused, reported
+/// through the one channel a non-throwing verb has.
 ///
-/// Raised for EVERY refused write, not only for the verbs that cannot throw
-/// (#3758). `DynamicModel.delete(id:)` is declared without `throws`, as are a
+/// Raised for EVERY refused write, not only for the verbs that cannot throw.
+/// `DynamicModel.delete(id:)` is declared without `throws`, as are a
 /// `PrimitiveRecord` field assignment and an explicit clear, so for those the
 /// event is the only channel there is; `create`, `update`, `save`, `upsert`,
 /// `addMember` and `removeMember` throw the same error AND raise this, so an
@@ -816,14 +852,25 @@ public struct DocumentOpenedEvent: Sendable {
 /// handler may read any document — including the refusing one — without
 /// deadlocking against the write it is being told about.
 ///
-/// Only ever emitted for a LARGE document: an ordinary document has no
-/// offline window and no refusal to report.
+/// Only ever emitted for a record-log document: an ordinary document has no
+/// room that refuses a write.
 public struct DocumentWriteRefusedEvent: Sendable {
     public let documentId: String
     public let model: String
     public let recordId: String
-    /// Why, typed — `DOCUMENT_OFFLINE_WINDOW_EXPIRED` and its details today.
+    /// Why, typed — the refusal's own code (`.documentConstraintViolated`,
+    /// `.documentEpochFrozen`, …). Branch on `error.code`.
     public let error: JsBaoError
+    /// Every handed-back write with its values, in the order they were made:
+    /// what an app needs to redo them. `nil` when the event was built with
+    /// the four-argument initialiser.
+    public let writes: [RecordLogRefusedWrite]?
+    /// The record already holding the key, for a format-3 constraint refusal.
+    public let conflictingRecord: RecordLogRecordKey?
+    /// For `DB3_CONDITION_NOT_MET`, the record whose guard failed and the
+    /// room's row of it; for `DB3_RECORD_NOT_FOUND`, the record an increment
+    /// named (`row == nil`). `nil` for any other refusal.
+    public let current: RecordLogCurrentRecord?
 
     public init(
         documentId: String, model: String, recordId: String, error: JsBaoError
@@ -832,10 +879,36 @@ public struct DocumentWriteRefusedEvent: Sendable {
         self.model = model
         self.recordId = recordId
         self.error = error
+        self.writes = nil
+        self.conflictingRecord = nil
+        self.current = nil
+    }
+
+    public init(
+        documentId: String, model: String, recordId: String, error: JsBaoError,
+        writes: [RecordLogRefusedWrite]?, conflictingRecord: RecordLogRecordKey?
+    ) {
+        self.init(
+            documentId: documentId, model: model, recordId: recordId, error: error,
+            writes: writes, conflictingRecord: conflictingRecord, current: nil
+        )
+    }
+
+    public init(
+        documentId: String, model: String, recordId: String, error: JsBaoError,
+        writes: [RecordLogRefusedWrite]?, conflictingRecord: RecordLogRecordKey?, current: RecordLogCurrentRecord?
+    ) {
+        self.documentId = documentId
+        self.model = model
+        self.recordId = recordId
+        self.error = error
+        self.writes = writes
+        self.conflictingRecord = conflictingRecord
+        self.current = current
     }
 }
 
-/// The platform and this client disagree about a document's format (#3764).
+/// The platform and this client disagree about a document's format.
 ///
 /// Fired when the room refuses a document because the format this client
 /// declared is not the one the platform resolved. The document is CLOSED when
@@ -864,94 +937,6 @@ public struct DocumentFormatMismatchEvent: Sendable {
         self.declared = declared
         self.actual = actual
         self.error = error
-    }
-}
-
-/// What a large document's offline writes were judged to be (#3437,
-/// behavior 20).
-///
-/// Fired when a large document that was away replays what it wrote offline and
-/// some of it did not simply apply: a write the online side clearly beat is
-/// DROPPED, and one whose order cannot be established is applied but reported.
-/// SILENCE means every offline write replayed cleanly — the event carries
-/// notices or it is not sent.
-///
-/// Field for field the JS client's `documentOfflineWritesResolved` payload, so
-/// an application that handles one handles the other.
-public struct DocumentOfflineWritesResolvedEvent: Sendable, Equatable {
-    public let documentId: String
-    /// The epoch the writes were replayed onto.
-    public let epoch: Int
-    public let notices: [OfflineReplayNotice]
-
-    public init(documentId: String, epoch: Int, notices: [OfflineReplayNotice]) {
-        self.documentId = documentId
-        self.epoch = epoch
-        self.notices = notices
-    }
-}
-
-/// How a large document's base snapshot load is going (#3436, behavior 24).
-///
-/// A cold open of a large document streams however many megabytes its base
-/// carries before the document can answer anything, so a load that reported
-/// only at the end would be indistinguishable to an application from a hang.
-/// Mirrors the JS client's `document:snapshot-load` payload field for field.
-public struct DocumentSnapshotLoadEvent: Sendable, Equatable {
-
-    public enum Phase: String, Sendable {
-        /// The manifest is in and the chunk count is known.
-        case started
-        /// One chunk landed.
-        case progress
-        /// Every chunk of one model landed: it is QUERYABLE now, not merely
-        /// downloaded.
-        case model
-        /// The whole base is in and the document has joined its epoch.
-        case loaded
-    }
-
-    public let documentId: String
-    public let phase: Phase
-    /// What this load IS. Always `"load"` on Swift: a base is installed
-    /// WHOLE, whether it is a cold start, a reload after a chain that could
-    /// not be applied, or a rebuild past a bulk load.
-    ///
-    /// The JS client also reports `"converge"`, which replaces only the ranges
-    /// a bulk load touched. Swift does not: the intent's rule for this client
-    /// is a reload from the latest snapshot, never range replacement (#3437).
-    /// Applying the sealed chain above a whole reload is the ordinary cold
-    /// path, not a range replacement, so it keeps this mode too.
-    public let mode: String
-    /// The epoch the snapshot is a base for.
-    public let epoch: Int
-    public let rows: Int
-    public let totalRows: Int
-    public let chunks: Int
-    public let totalChunks: Int
-    /// The model the event concerns, when it concerns one.
-    public let model: String?
-
-    public init(
-        documentId: String,
-        phase: Phase,
-        mode: String = "load",
-        epoch: Int,
-        rows: Int,
-        totalRows: Int,
-        chunks: Int,
-        totalChunks: Int,
-        model: String? = nil
-    ) {
-        self.documentId = documentId
-        self.phase = phase
-        self.mode = mode
-        self.epoch = epoch
-        self.rows = rows
-        self.totalRows = totalRows
-        self.chunks = chunks
-        self.totalChunks = totalChunks
-        self.model = model
     }
 }
 
@@ -1019,7 +1004,7 @@ public struct SchemaDiscoveredEvent: Sendable {
 /// yet instrument per-phase sync timings (no `getSyncTimings` analog), so
 /// it is `nil` today; the field exists for cross-platform payload parity.
 ///
-/// (#996: the previous Swift-only `phase`/`elapsedMs` pair was removed —
+/// (the previous Swift-only `phase`/`elapsedMs` pair was removed —
 /// JS never carried those fields.)
 public struct SyncPerfEvent: Sendable {
     public let documentId: String
@@ -1040,55 +1025,18 @@ public struct SyncPerfEvent: Sendable {
     }
 }
 
-/// Fired when a workflow run is started. Mirrors the JS client's
-/// `WorkflowStartedEvent` (`src/client/JsBaoClient.ts`) field-for-field.
-///
-/// Emitted exclusively from the server-pushed `workflowStarted` WS frame
-/// (the JS source of truth); every field is populated from the frame.
-/// The local `workflows.start(...)` HTTP path does NOT emit — it did
-/// pre-#1112, which double-emitted every start observed over WS.
-/// All fields beyond `workflowKey`/`runId` are optional so decoding /
-/// construction stays lenient when the frame omits them.
-public struct WorkflowStartedEvent: Sendable {
-    public let workflowKey: String
-    public let runId: String
-    public let workflowId: String?
-    public let runKey: String?
-    public let instanceId: String?
-    public let contextDocId: String?
-    public let meta: [String: JSONValue]?
-
-    public init(
-        workflowKey: String,
-        runId: String,
-        workflowId: String? = nil,
-        runKey: String? = nil,
-        instanceId: String? = nil,
-        contextDocId: String? = nil,
-        meta: [String: JSONValue]? = nil
-    ) {
-        self.workflowKey = workflowKey
-        self.runId = runId
-        self.workflowId = workflowId
-        self.runKey = runKey
-        self.instanceId = instanceId
-        self.contextDocId = contextDocId
-        self.meta = meta
-    }
-}
-
 /// Payload for `.documentSyncStateChanged`. `state` is one of
 /// `"syncing" | "synced" | "stale" | "error"`.
 ///
 /// This is the supported in-client replacement for the deprecated
-/// `.remoteUpdate` event (#1120): a `"synced"` change is emitted each time a
+/// `.remoteUpdate` event: a `"synced"` change is emitted each time a
 /// remote Yjs update lands for an open document, so reload-on-remote-write
 /// loaders can subscribe here instead of `.remoteUpdate`.
 ///
 /// `"error"` is emitted when an open document misses the sync handshake budget
 /// (`SyncConfig.handshakeTimeout`) — the client keeps retrying at a capped
 /// backoff, but what the app is rendering has stopped converging, so it can
-/// tell the user instead of showing stale state as if it were current (#3390).
+/// tell the user instead of showing stale state as if it were current.
 /// A document that recovers reports `"synced"` once, so the app can clear the
 /// warning it surfaced.
 public struct DocumentSyncStateChangedEvent: Sendable {
