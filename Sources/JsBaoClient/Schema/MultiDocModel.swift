@@ -353,6 +353,11 @@ final class MultiDocModel: IncludeTarget, @unchecked Sendable {
                 stringsetFieldNames.filter { model.holds(recordId: rec.id, field: $0) == false }, in: &row
             )
             markHeldCleared(&row, model: model)
+            // A stored value the snapshot converted or dropped is listed as
+            // stored, as a query's rows list it (#6304).
+            if let stored = PrimitiveRecord.storedKinds(of: schema.fields, raw: { model.readRaw(recordId: rec.id, field: $0) }) {
+                row[PrimitiveRecord.storedKindsKey] = .object(stored)
+            }
             row["_meta_doc_id"] = .string(docId)
             return Located(docId: docId, row: row)
         }

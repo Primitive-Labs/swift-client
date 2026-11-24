@@ -1,0 +1,66 @@
+[type]
+name = "ledger6025"
+allowLocalOnly = true
+
+[models.line6025]
+class_name = "Line6025"
+removedFields = ["memo"]
+
+[models.line6025.fields.id]
+type = "id"
+auto_assign = true
+
+[models.line6025.fields.code]
+type = "string"
+unique = true
+max_length = 12
+
+[models.line6025.fields.postedAt]
+type = "date"
+default = 2026-03-04T05:06:07.250
+
+[models.line6025.fields.settledAt]
+type = "date"
+default = 2026-03-04T05:06:07+02:30
+
+[models.line6025.fields.cutoff]
+type = "string"
+default = 23:59:58
+
+[models.line6025.fields.tags]
+type = "stringset"
+max_count = 4
+default = ["a", "b\"c"]
+
+[models.line6025.fields.count]
+type = "number"
+default = 3
+
+[models.line6025.fields.tiny]
+type = "number"
+default = 1e-7
+
+[models.line6025.fields.huge]
+type = "number"
+default = 1e21
+
+[models.line6025.fields.wide]
+type = "number"
+default = 123456789012345.6
+
+[models.line6025.fields.small]
+type = "number"
+default = 0.000001
+
+[models.line6025.fields.ok]
+type = "boolean"
+default = false
+
+[models.line6025.fields.touchedAt]
+type = "date"
+auto_stamp = "update"
+
+[models.line6025.fields.note]
+type = "string"
+default = "tab\there\u0001é"
+indexed = false

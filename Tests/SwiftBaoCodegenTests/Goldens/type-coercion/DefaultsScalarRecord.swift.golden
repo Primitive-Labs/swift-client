@@ -49,41 +49,41 @@ public struct DefaultsScalarRecord: PrimitiveModel, PrimitiveRowDecodable, Equat
     public var id: String {
         didSet { _changedFields.insert("id") }
     }
-    public var n_zero: Double? {
-        didSet { _changedFields.insert("n_zero") }
+    public var n_zero: Double {
+        didSet { _changedFields.insert("n_zero"); _suppliedDefaults.remove("n_zero") }
     }
-    public var n_one: Double? {
-        didSet { _changedFields.insert("n_one") }
+    public var n_one: Double {
+        didSet { _changedFields.insert("n_one"); _suppliedDefaults.remove("n_one") }
     }
-    public var n_neg: Double? {
-        didSet { _changedFields.insert("n_neg") }
+    public var n_neg: Double {
+        didSet { _changedFields.insert("n_neg"); _suppliedDefaults.remove("n_neg") }
     }
-    public var n_float: Double? {
-        didSet { _changedFields.insert("n_float") }
+    public var n_float: Double {
+        didSet { _changedFields.insert("n_float"); _suppliedDefaults.remove("n_float") }
     }
-    public var n_sci: Double? {
-        didSet { _changedFields.insert("n_sci") }
+    public var n_sci: Double {
+        didSet { _changedFields.insert("n_sci"); _suppliedDefaults.remove("n_sci") }
     }
-    public var b_true: Bool? {
-        didSet { _changedFields.insert("b_true") }
+    public var b_true: Bool {
+        didSet { _changedFields.insert("b_true"); _suppliedDefaults.remove("b_true") }
     }
-    public var b_false: Bool? {
-        didSet { _changedFields.insert("b_false") }
+    public var b_false: Bool {
+        didSet { _changedFields.insert("b_false"); _suppliedDefaults.remove("b_false") }
     }
-    public var s_bool_like: String? {
-        didSet { _changedFields.insert("s_bool_like") }
+    public var s_bool_like: String {
+        didSet { _changedFields.insert("s_bool_like"); _suppliedDefaults.remove("s_bool_like") }
     }
-    public var s_int_like: String? {
-        didSet { _changedFields.insert("s_int_like") }
+    public var s_int_like: String {
+        didSet { _changedFields.insert("s_int_like"); _suppliedDefaults.remove("s_int_like") }
     }
-    public var s_empty: String? {
-        didSet { _changedFields.insert("s_empty") }
+    public var s_empty: String {
+        didSet { _changedFields.insert("s_empty"); _suppliedDefaults.remove("s_empty") }
     }
-    public var d_iso: String? {
-        didSet { _changedFields.insert("d_iso") }
+    public var d_iso: String {
+        didSet { _changedFields.insert("d_iso"); _suppliedDefaults.remove("d_iso") }
     }
     public var i_literal: String {
-        didSet { _changedFields.insert("i_literal") }
+        didSet { _changedFields.insert("i_literal"); _suppliedDefaults.remove("i_literal") }
     }
 
     public var related: RelatedRecords = .empty
@@ -106,6 +106,15 @@ public struct DefaultsScalarRecord: PrimitiveModel, PrimitiveRowDecodable, Equat
     /// field, whatever this holds.
     /// Not part of the record's persisted/equatable identity.
     public private(set) var _changedFields: Set<String> = []
+
+    /// The fields whose value this model supplied from their `default`
+    /// rather than read or were given (#6304): a field the record held
+    /// no value of its kind for, an initializer parameter left out, a
+    /// decoded key that held none. `primitiveValues()` leaves them out,
+    /// so no write sends a default the model filled in; assigning the
+    /// field, or `markAllChanged()`, makes its value the caller's.
+    /// Not part of the record's persisted/equatable identity.
+    public private(set) var _suppliedDefaults: Set<String> = []
 
     /// Forget the pending field changes without writing them, so a
     /// later `save(in:)` treats this value as unmodified. Mirrors
@@ -131,6 +140,7 @@ public struct DefaultsScalarRecord: PrimitiveModel, PrimitiveRowDecodable, Equat
     /// Every field it writes wins last-writer-wins against a concurrent
     /// remote edit to that field, which is the cost of a full copy.
     public mutating func markAllChanged() {
+        _suppliedDefaults = []
         _changedFields = Set(primitiveValues().keys)
     }
 
@@ -147,23 +157,35 @@ public struct DefaultsScalarRecord: PrimitiveModel, PrimitiveRowDecodable, Equat
         s_int_like: String? = nil,
         s_empty: String? = nil,
         d_iso: String? = nil,
-        i_literal: String
+        i_literal: String? = nil
     ) {
         self.id = id
-        self.n_zero = n_zero
-        self.n_one = n_one
-        self.n_neg = n_neg
-        self.n_float = n_float
-        self.n_sci = n_sci
-        self.b_true = b_true
-        self.b_false = b_false
-        self.s_bool_like = s_bool_like
-        self.s_int_like = s_int_like
-        self.s_empty = s_empty
-        self.d_iso = d_iso
-        self.i_literal = i_literal
+        self.n_zero = n_zero ?? 0
+        self.n_one = n_one ?? 1
+        self.n_neg = n_neg ?? -1
+        self.n_float = n_float ?? 3.14
+        self.n_sci = n_sci ?? 10000000000
+        self.b_true = b_true ?? true
+        self.b_false = b_false ?? false
+        self.s_bool_like = s_bool_like ?? "true"
+        self.s_int_like = s_int_like ?? "42"
+        self.s_empty = s_empty ?? ""
+        self.d_iso = d_iso ?? "2026-01-01T00:00:00.000Z"
+        self.i_literal = i_literal ?? "fixed-id-ulid"
         self.related = .empty
-        self._changedFields = Set(primitiveValues().keys)
+        if n_zero == nil { _suppliedDefaults.insert("n_zero") }
+        if n_one == nil { _suppliedDefaults.insert("n_one") }
+        if n_neg == nil { _suppliedDefaults.insert("n_neg") }
+        if n_float == nil { _suppliedDefaults.insert("n_float") }
+        if n_sci == nil { _suppliedDefaults.insert("n_sci") }
+        if b_true == nil { _suppliedDefaults.insert("b_true") }
+        if b_false == nil { _suppliedDefaults.insert("b_false") }
+        if s_bool_like == nil { _suppliedDefaults.insert("s_bool_like") }
+        if s_int_like == nil { _suppliedDefaults.insert("s_int_like") }
+        if s_empty == nil { _suppliedDefaults.insert("s_empty") }
+        if d_iso == nil { _suppliedDefaults.insert("d_iso") }
+        if i_literal == nil { _suppliedDefaults.insert("i_literal") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     /// Create a record with an auto-generated id. The id is NOT
@@ -183,79 +205,164 @@ public struct DefaultsScalarRecord: PrimitiveModel, PrimitiveRowDecodable, Equat
         s_int_like: String? = nil,
         s_empty: String? = nil,
         d_iso: String? = nil,
-        i_literal: String
+        i_literal: String? = nil
     ) {
         self.id = PrimitiveSchemaRegistry.newId()
-        self.n_zero = n_zero
-        self.n_one = n_one
-        self.n_neg = n_neg
-        self.n_float = n_float
-        self.n_sci = n_sci
-        self.b_true = b_true
-        self.b_false = b_false
-        self.s_bool_like = s_bool_like
-        self.s_int_like = s_int_like
-        self.s_empty = s_empty
-        self.d_iso = d_iso
-        self.i_literal = i_literal
+        self.n_zero = n_zero ?? 0
+        self.n_one = n_one ?? 1
+        self.n_neg = n_neg ?? -1
+        self.n_float = n_float ?? 3.14
+        self.n_sci = n_sci ?? 10000000000
+        self.b_true = b_true ?? true
+        self.b_false = b_false ?? false
+        self.s_bool_like = s_bool_like ?? "true"
+        self.s_int_like = s_int_like ?? "42"
+        self.s_empty = s_empty ?? ""
+        self.d_iso = d_iso ?? "2026-01-01T00:00:00.000Z"
+        self.i_literal = i_literal ?? "fixed-id-ulid"
         self.related = .empty
         self._explicitId = false
-        self._changedFields = Set(primitiveValues().keys)
+        if n_zero == nil { _suppliedDefaults.insert("n_zero") }
+        if n_one == nil { _suppliedDefaults.insert("n_one") }
+        if n_neg == nil { _suppliedDefaults.insert("n_neg") }
+        if n_float == nil { _suppliedDefaults.insert("n_float") }
+        if n_sci == nil { _suppliedDefaults.insert("n_sci") }
+        if b_true == nil { _suppliedDefaults.insert("b_true") }
+        if b_false == nil { _suppliedDefaults.insert("b_false") }
+        if s_bool_like == nil { _suppliedDefaults.insert("s_bool_like") }
+        if s_int_like == nil { _suppliedDefaults.insert("s_int_like") }
+        if s_empty == nil { _suppliedDefaults.insert("s_empty") }
+        if d_iso == nil { _suppliedDefaults.insert("d_iso") }
+        if i_literal == nil { _suppliedDefaults.insert("i_literal") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     public init?(record: PrimitiveRecord) {
+        guard !record.isCleared("n_zero"),
+              !record.isCleared("n_one"),
+              !record.isCleared("n_neg"),
+              !record.isCleared("n_float"),
+              !record.isCleared("n_sci"),
+              !record.isCleared("b_true"),
+              !record.isCleared("b_false"),
+              !record.isCleared("s_bool_like"),
+              !record.isCleared("s_int_like"),
+              !record.isCleared("s_empty"),
+              !record.isCleared("d_iso"),
+              !record.isCleared("i_literal")
+        else { return nil }
+        let _n_zero = record.fittingValue("n_zero", as: .number)?.asNumber
+        let _n_one = record.fittingValue("n_one", as: .number)?.asNumber
+        let _n_neg = record.fittingValue("n_neg", as: .number)?.asNumber
+        let _n_float = record.fittingValue("n_float", as: .number)?.asNumber
+        let _n_sci = record.fittingValue("n_sci", as: .number)?.asNumber
+        let _b_true = record.fittingValue("b_true", as: .boolean)?.asBoolean
+        let _b_false = record.fittingValue("b_false", as: .boolean)?.asBoolean
+        let _s_bool_like = record.fittingValue("s_bool_like", as: .string)?.asString
+        let _s_int_like = record.fittingValue("s_int_like", as: .string)?.asString
+        let _s_empty = record.fittingValue("s_empty", as: .string)?.asString
+        let _d_iso = record.fittingValue("d_iso", as: .date)?.asString
+        let _i_literal = record.fittingValue("i_literal", as: .id)?.asString
         self.id = record.id
-        self.n_zero = record.holds("n_zero") == false ? 0 : record["n_zero"]?.asNumber
-        self.n_one = record.holds("n_one") == false ? 1 : record["n_one"]?.asNumber
-        self.n_neg = record.holds("n_neg") == false ? -1 : record["n_neg"]?.asNumber
-        self.n_float = record.holds("n_float") == false ? 3.14 : record["n_float"]?.asNumber
-        self.n_sci = record.holds("n_sci") == false ? 10000000000 : record["n_sci"]?.asNumber
-        self.b_true = record.holds("b_true") == false ? true : record["b_true"]?.asBoolean
-        self.b_false = record.holds("b_false") == false ? false : record["b_false"]?.asBoolean
-        self.s_bool_like = record.holds("s_bool_like") == false ? "true" : record["s_bool_like"]?.asString
-        self.s_int_like = record.holds("s_int_like") == false ? "42" : record["s_int_like"]?.asString
-        self.s_empty = record.holds("s_empty") == false ? "" : record["s_empty"]?.asString
-        self.d_iso = record.holds("d_iso") == false ? "2026-01-01" : record["d_iso"]?.asDateString
-        self.i_literal = record.holds("i_literal") == false ? "fixed-id-ulid" : record["i_literal"]?.asId
+        self.n_zero = _n_zero ?? 0
+        self.n_one = _n_one ?? 1
+        self.n_neg = _n_neg ?? -1
+        self.n_float = _n_float ?? 3.14
+        self.n_sci = _n_sci ?? 10000000000
+        self.b_true = _b_true ?? true
+        self.b_false = _b_false ?? false
+        self.s_bool_like = _s_bool_like ?? "true"
+        self.s_int_like = _s_int_like ?? "42"
+        self.s_empty = _s_empty ?? ""
+        self.d_iso = _d_iso ?? "2026-01-01T00:00:00.000Z"
+        self.i_literal = _i_literal ?? "fixed-id-ulid"
         self.related = .empty
         self._changedFields = []
+        if _n_zero == nil { _suppliedDefaults.insert("n_zero") }
+        if _n_one == nil { _suppliedDefaults.insert("n_one") }
+        if _n_neg == nil { _suppliedDefaults.insert("n_neg") }
+        if _n_float == nil { _suppliedDefaults.insert("n_float") }
+        if _n_sci == nil { _suppliedDefaults.insert("n_sci") }
+        if _b_true == nil { _suppliedDefaults.insert("b_true") }
+        if _b_false == nil { _suppliedDefaults.insert("b_false") }
+        if _s_bool_like == nil { _suppliedDefaults.insert("s_bool_like") }
+        if _s_int_like == nil { _suppliedDefaults.insert("s_int_like") }
+        if _s_empty == nil { _suppliedDefaults.insert("s_empty") }
+        if _d_iso == nil { _suppliedDefaults.insert("d_iso") }
+        if _i_literal == nil { _suppliedDefaults.insert("i_literal") }
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
     public init?(row: [String: JSONValue]) {
-        guard let id = row["id"]?.stringValue
+        guard let id = row["id"]?.stringValue,
+              !PrimitiveRecord.isCleared("n_zero", in: row),
+              !PrimitiveRecord.isCleared("n_one", in: row),
+              !PrimitiveRecord.isCleared("n_neg", in: row),
+              !PrimitiveRecord.isCleared("n_float", in: row),
+              !PrimitiveRecord.isCleared("n_sci", in: row),
+              !PrimitiveRecord.isCleared("b_true", in: row),
+              !PrimitiveRecord.isCleared("b_false", in: row),
+              !PrimitiveRecord.isCleared("s_bool_like", in: row),
+              !PrimitiveRecord.isCleared("s_int_like", in: row),
+              !PrimitiveRecord.isCleared("s_empty", in: row),
+              !PrimitiveRecord.isCleared("d_iso", in: row),
+              !PrimitiveRecord.isCleared("i_literal", in: row)
         else { return nil }
+        let _n_zero = PrimitiveRecord.fittingValue("n_zero", as: .number, in: row)?.asNumber
+        let _n_one = PrimitiveRecord.fittingValue("n_one", as: .number, in: row)?.asNumber
+        let _n_neg = PrimitiveRecord.fittingValue("n_neg", as: .number, in: row)?.asNumber
+        let _n_float = PrimitiveRecord.fittingValue("n_float", as: .number, in: row)?.asNumber
+        let _n_sci = PrimitiveRecord.fittingValue("n_sci", as: .number, in: row)?.asNumber
+        let _b_true = PrimitiveRecord.fittingValue("b_true", as: .boolean, in: row)?.asBoolean
+        let _b_false = PrimitiveRecord.fittingValue("b_false", as: .boolean, in: row)?.asBoolean
+        let _s_bool_like = PrimitiveRecord.fittingValue("s_bool_like", as: .string, in: row)?.asString
+        let _s_int_like = PrimitiveRecord.fittingValue("s_int_like", as: .string, in: row)?.asString
+        let _s_empty = PrimitiveRecord.fittingValue("s_empty", as: .string, in: row)?.asString
+        let _d_iso = PrimitiveRecord.fittingValue("d_iso", as: .date, in: row)?.asString
+        let _i_literal = PrimitiveRecord.fittingValue("i_literal", as: .id, in: row)?.asString
         self.id = id
-        self.n_zero = PrimitiveRecord.holds("n_zero", in: row) == false ? 0 : row["n_zero"]?.numberValue
-        self.n_one = PrimitiveRecord.holds("n_one", in: row) == false ? 1 : row["n_one"]?.numberValue
-        self.n_neg = PrimitiveRecord.holds("n_neg", in: row) == false ? -1 : row["n_neg"]?.numberValue
-        self.n_float = PrimitiveRecord.holds("n_float", in: row) == false ? 3.14 : row["n_float"]?.numberValue
-        self.n_sci = PrimitiveRecord.holds("n_sci", in: row) == false ? 10000000000 : row["n_sci"]?.numberValue
-        self.b_true = PrimitiveRecord.holds("b_true", in: row) == false ? true : row["b_true"]?.rowBoolValue
-        self.b_false = PrimitiveRecord.holds("b_false", in: row) == false ? false : row["b_false"]?.rowBoolValue
-        self.s_bool_like = PrimitiveRecord.holds("s_bool_like", in: row) == false ? "true" : row["s_bool_like"]?.stringValue
-        self.s_int_like = PrimitiveRecord.holds("s_int_like", in: row) == false ? "42" : row["s_int_like"]?.stringValue
-        self.s_empty = PrimitiveRecord.holds("s_empty", in: row) == false ? "" : row["s_empty"]?.stringValue
-        self.d_iso = PrimitiveRecord.holds("d_iso", in: row) == false ? "2026-01-01" : row["d_iso"]?.stringValue
-        self.i_literal = PrimitiveRecord.holds("i_literal", in: row) == false ? "fixed-id-ulid" : row["i_literal"]?.stringValue
+        self.n_zero = _n_zero ?? 0
+        self.n_one = _n_one ?? 1
+        self.n_neg = _n_neg ?? -1
+        self.n_float = _n_float ?? 3.14
+        self.n_sci = _n_sci ?? 10000000000
+        self.b_true = _b_true ?? true
+        self.b_false = _b_false ?? false
+        self.s_bool_like = _s_bool_like ?? "true"
+        self.s_int_like = _s_int_like ?? "42"
+        self.s_empty = _s_empty ?? ""
+        self.d_iso = _d_iso ?? "2026-01-01T00:00:00.000Z"
+        self.i_literal = _i_literal ?? "fixed-id-ulid"
         self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []
+        if _n_zero == nil { _suppliedDefaults.insert("n_zero") }
+        if _n_one == nil { _suppliedDefaults.insert("n_one") }
+        if _n_neg == nil { _suppliedDefaults.insert("n_neg") }
+        if _n_float == nil { _suppliedDefaults.insert("n_float") }
+        if _n_sci == nil { _suppliedDefaults.insert("n_sci") }
+        if _b_true == nil { _suppliedDefaults.insert("b_true") }
+        if _b_false == nil { _suppliedDefaults.insert("b_false") }
+        if _s_bool_like == nil { _suppliedDefaults.insert("s_bool_like") }
+        if _s_int_like == nil { _suppliedDefaults.insert("s_int_like") }
+        if _s_empty == nil { _suppliedDefaults.insert("s_empty") }
+        if _d_iso == nil { _suppliedDefaults.insert("d_iso") }
+        if _i_literal == nil { _suppliedDefaults.insert("i_literal") }
     }
 
     public func primitiveValues() -> [String: PrimitiveValue] {
         var values: [String: PrimitiveValue] = [:]
-        if let n_zero { values["n_zero"] = .number(n_zero) }
-        if let n_one { values["n_one"] = .number(n_one) }
-        if let n_neg { values["n_neg"] = .number(n_neg) }
-        if let n_float { values["n_float"] = .number(n_float) }
-        if let n_sci { values["n_sci"] = .number(n_sci) }
-        if let b_true { values["b_true"] = .boolean(b_true) }
-        if let b_false { values["b_false"] = .boolean(b_false) }
-        if let s_bool_like { values["s_bool_like"] = .string(s_bool_like) }
-        if let s_int_like { values["s_int_like"] = .string(s_int_like) }
-        if let s_empty { values["s_empty"] = .string(s_empty) }
-        if let d_iso { values["d_iso"] = .date(d_iso) }
-        if let i_literal { values["i_literal"] = .id(i_literal) }
+        if !_suppliedDefaults.contains("n_zero") { values["n_zero"] = .number(n_zero) }
+        if !_suppliedDefaults.contains("n_one") { values["n_one"] = .number(n_one) }
+        if !_suppliedDefaults.contains("n_neg") { values["n_neg"] = .number(n_neg) }
+        if !_suppliedDefaults.contains("n_float") { values["n_float"] = .number(n_float) }
+        if !_suppliedDefaults.contains("n_sci") { values["n_sci"] = .number(n_sci) }
+        if !_suppliedDefaults.contains("b_true") { values["b_true"] = .boolean(b_true) }
+        if !_suppliedDefaults.contains("b_false") { values["b_false"] = .boolean(b_false) }
+        if !_suppliedDefaults.contains("s_bool_like") { values["s_bool_like"] = .string(s_bool_like) }
+        if !_suppliedDefaults.contains("s_int_like") { values["s_int_like"] = .string(s_int_like) }
+        if !_suppliedDefaults.contains("s_empty") { values["s_empty"] = .string(s_empty) }
+        if !_suppliedDefaults.contains("d_iso") { values["d_iso"] = .date(d_iso) }
+        if !_suppliedDefaults.contains("i_literal") { values["i_literal"] = .id(i_literal) }
         return values
     }
 
@@ -265,20 +372,44 @@ public struct DefaultsScalarRecord: PrimitiveModel, PrimitiveRowDecodable, Equat
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try container.decode(String.self, forKey: .id)
-        self.n_zero = try container.decodeIfPresent(Double.self, forKey: .n_zero)
-        self.n_one = try container.decodeIfPresent(Double.self, forKey: .n_one)
-        self.n_neg = try container.decodeIfPresent(Double.self, forKey: .n_neg)
-        self.n_float = try container.decodeIfPresent(Double.self, forKey: .n_float)
-        self.n_sci = try container.decodeIfPresent(Double.self, forKey: .n_sci)
-        self.b_true = try container.decodeIfPresent(Bool.self, forKey: .b_true)
-        self.b_false = try container.decodeIfPresent(Bool.self, forKey: .b_false)
-        self.s_bool_like = try container.decodeIfPresent(String.self, forKey: .s_bool_like)
-        self.s_int_like = try container.decodeIfPresent(String.self, forKey: .s_int_like)
-        self.s_empty = try container.decodeIfPresent(String.self, forKey: .s_empty)
-        self.d_iso = try container.decodeIfPresent(String.self, forKey: .d_iso)
-        self.i_literal = try container.decode(String.self, forKey: .i_literal)
+        let _n_zero = container.fittingValue(forKey: .n_zero, as: .number)?.asNumber
+        self.n_zero = _n_zero ?? 0
+        let _n_one = container.fittingValue(forKey: .n_one, as: .number)?.asNumber
+        self.n_one = _n_one ?? 1
+        let _n_neg = container.fittingValue(forKey: .n_neg, as: .number)?.asNumber
+        self.n_neg = _n_neg ?? -1
+        let _n_float = container.fittingValue(forKey: .n_float, as: .number)?.asNumber
+        self.n_float = _n_float ?? 3.14
+        let _n_sci = container.fittingValue(forKey: .n_sci, as: .number)?.asNumber
+        self.n_sci = _n_sci ?? 10000000000
+        let _b_true = container.fittingValue(forKey: .b_true, as: .boolean)?.asBoolean
+        self.b_true = _b_true ?? true
+        let _b_false = container.fittingValue(forKey: .b_false, as: .boolean)?.asBoolean
+        self.b_false = _b_false ?? false
+        let _s_bool_like = container.fittingValue(forKey: .s_bool_like, as: .string)?.asString
+        self.s_bool_like = _s_bool_like ?? "true"
+        let _s_int_like = container.fittingValue(forKey: .s_int_like, as: .string)?.asString
+        self.s_int_like = _s_int_like ?? "42"
+        let _s_empty = container.fittingValue(forKey: .s_empty, as: .string)?.asString
+        self.s_empty = _s_empty ?? ""
+        let _d_iso = container.fittingValue(forKey: .d_iso, as: .date)?.asString
+        self.d_iso = _d_iso ?? "2026-01-01T00:00:00.000Z"
+        let _i_literal = container.fittingValue(forKey: .i_literal, as: .id)?.asString
+        self.i_literal = _i_literal ?? "fixed-id-ulid"
         self.related = .empty
-        self._changedFields = Set(primitiveValues().keys)
+        if _n_zero == nil { _suppliedDefaults.insert("n_zero") }
+        if _n_one == nil { _suppliedDefaults.insert("n_one") }
+        if _n_neg == nil { _suppliedDefaults.insert("n_neg") }
+        if _n_float == nil { _suppliedDefaults.insert("n_float") }
+        if _n_sci == nil { _suppliedDefaults.insert("n_sci") }
+        if _b_true == nil { _suppliedDefaults.insert("b_true") }
+        if _b_false == nil { _suppliedDefaults.insert("b_false") }
+        if _s_bool_like == nil { _suppliedDefaults.insert("s_bool_like") }
+        if _s_int_like == nil { _suppliedDefaults.insert("s_int_like") }
+        if _s_empty == nil { _suppliedDefaults.insert("s_empty") }
+        if _d_iso == nil { _suppliedDefaults.insert("d_iso") }
+        if _i_literal == nil { _suppliedDefaults.insert("i_literal") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     public enum CodingKeys: String, CodingKey {

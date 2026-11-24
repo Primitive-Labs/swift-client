@@ -4,7 +4,7 @@ import TOMLKit
 /// A db3 field's `ref` to a shared enum (#5545): a plain string enum under
 /// `[defs.<Name>]` in a `schemas/` file, expanded into `type = "string"`,
 /// `enum = [...]` before the field is read; or, when `objects` asks for it
-/// (#5899), to an object def, expanded into a plain `type = "string"` field
+/// (#5899), to an object or list def, expanded into a plain `type = "string"` field
 /// stored as canonical JSON text, the def named beside it. Mirrored by hand
 /// from js-bao's `models/sharedEnums.ts`, sentence for sentence.
 struct SharedEnums {
@@ -12,7 +12,7 @@ struct SharedEnums {
     let dir: String
     /// The other families' keys, for the `<key>.<Name>` pair rule.
     let db3: [String], function: [String], prompt: [String]
-    /// Whether a ref may name an object def too (#5899): the tool's own
+    /// Whether a ref may name an object or list def too (#5899): the tool's own
     /// inputs ask; a reader that does not keeps today's results.
     let objects: Bool
     /// Each readable `schemas/` file's defs, and each unreadable one's first error line, by stem.
@@ -24,7 +24,7 @@ struct SharedEnums {
 
     private struct Refusal: Error { let message: String }
 
-    /// What a ref resolved to: a shared enum and its values, or an object def.
+    /// What a ref resolved to: a shared enum and its values, or an object or list def.
     private enum Resolved {
         case enumeration(SharedEnumRef, [String])
         case object(Db3JSONRef)
@@ -46,7 +46,7 @@ struct SharedEnums {
     var stems: [String] { (Array(defs.keys) + Array(unreadable.keys)).sorted() }
 
     /// What a db3 field may ref, as the refusals name it.
-    private var kinds: String { objects ? "a shared enum or an object def" : "a shared enum" }
+    private var kinds: String { objects ? "a shared enum, an object def or a list def" : "a shared enum" }
 
     /// The def a ref names, with its values when it is a shared enum; throws the refusal's sentence.
     private func resolve(_ ref: TOMLValue) throws -> Resolved {
@@ -91,10 +91,10 @@ struct SharedEnums {
         do {
             return .enumeration(SharedEnumRef(file: file, name: name), try Self.sharedEnumValues(def.table ?? TOMLTable()))
         } catch let what as Refusal {
-            if objects, isObjectDef(file, def.table, seen: ["\(file).\(name)"]) { return .object(Db3JSONRef(file: file, name: name)) }
+            if objects, isJSONDef(file, def.table, seen: ["\(file).\(name)"]) { return .object(Db3JSONRef(file: file, name: name)) }
             if objects {
-                throw Refusal(message: "\(source)#\(name) is neither a shared enum nor an object def: it declares \(what.message); a db3 field refs a def with "
-                    + #"type = "string" and a non-empty enum of distinct strings, or a def with type = "object" (to store an array, wrap it in an object def)."#)
+                throw Refusal(message: "\(source)#\(name) is neither a shared enum, an object def nor a list def: it declares \(what.message); a db3 field refs a def with "
+                    + #"type = "string" and a non-empty enum of distinct strings, a def with type = "object", or a def with type = "array"."#)
             }
             throw Refusal(message: "\(source)#\(name) is not a shared enum: it declares \(what.message); a db3 field refs only a def with type = \"string\" and a non-empty enum of distinct strings.")
         }
@@ -129,14 +129,15 @@ struct SharedEnums {
         return files.count == 1 ? (files[0], parts[0]) : nil
     }
 
-    /// Whether a def's root compiles to an object, as the compiler reads it:
-    /// `type = "object"`, a field table with `fields` and no type, or a root
-    /// ref (with only annotations beside it) to a def that does.
-    private func isObjectDef(_ file: String, _ def: TOMLTable?, seen: Set<String>) -> Bool {
+    /// Whether a def's root compiles to an object or a list, as the compiler
+    /// reads it: `type = "object"`, a field table with `fields` and no type,
+    /// `type = "array"`, or a root ref (with only annotations beside it) to a
+    /// def that does.
+    private func isJSONDef(_ file: String, _ def: TOMLTable?, seen: Set<String>) -> Bool {
         guard let def else { return false }
-        if def["type"]?.string == "object" || (def["type"] == nil && def["fields"] != nil) { return true }
+        if def["type"]?.string == "object" || def["type"]?.string == "array" || (def["type"] == nil && def["fields"] != nil) { return true }
         guard let target = rootRefTarget(file, def), !seen.contains("\(target.file).\(target.name)") else { return false }
-        return isObjectDef(target.file, defs[target.file]?[target.name]?.table, seen: seen.union(["\(target.file).\(target.name)"]))
+        return isJSONDef(target.file, defs[target.file]?[target.name]?.table, seen: seen.union(["\(target.file).\(target.name)"]))
     }
 
     /// The def's values; throws what keeps it from being a shared enum.
@@ -163,7 +164,7 @@ struct SharedEnums {
         return value.int.map(String.init) ?? value.debugDescription
     }
 
-    /// Why each key a db3 field may carry cannot sit beside a ref to an object def.
+    /// Why each key a db3 field may carry cannot sit beside a ref to an object or list def.
     private static let besideObjectRef: [String: String] = [
         "type": "the field is stored as JSON text in a string field",
         "enum": "the def declares the value's shape",
@@ -186,8 +187,8 @@ struct SharedEnums {
     }
 
     /// Expand every field `ref` of a parsed type document in place, and
-    /// answer the shared enum each enum ref named and the object def each
-    /// JSON field's ref named (#5899), by model then field.
+    /// answer the shared enum each enum ref named and the object
+    /// or list def each JSON field's ref named (#5899, #6307), by model then field.
     func expandAll(_ document: TOMLTable) throws -> (enums: [String: [String: SharedEnumRef]], json: [String: [String: Db3JSONRef]]) {
         var named: [String: [String: SharedEnumRef]] = [:]
         var json: [String: [String: Db3JSONRef]] = [:]
@@ -217,11 +218,11 @@ struct SharedEnums {
                     // A JSON field (#5899): stored as a plain string field, its def named beside it for code generators only.
                     if let key = table.keys.first(where: { $0 != "ref" && $0 != "required" }) {
                         let why = Self.besideObjectRef[key] ?? "only required may"
-                        throw CodegenError.sharedEnumRef(message: "\(prefix)\(key) cannot sit beside a ref to an object def: \(why), so remove it.")
+                        throw CodegenError.sharedEnumRef(message: "\(prefix)\(key) cannot sit beside a ref to an object or list def: \(why), so remove it.")
                     }
                     guard typed else {
                         throw CodegenError.sharedEnumRef(message: prefix
-                            + #"a ref to an object def belongs to a db3 type file, one with a [type] table; add [type] to the file, or declare the field type = "string"."#)
+                            + #"a ref to an object or list def belongs to a db3 type file, one with a [type] table; add [type] to the file, or declare the field type = "string"."#)
                     }
                     refs[model, default: [:]][field] = Self.json(ref)
                     table.remove(at: "ref")

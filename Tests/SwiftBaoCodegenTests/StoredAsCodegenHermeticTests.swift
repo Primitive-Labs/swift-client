@@ -144,7 +144,8 @@ final class StoredAsCodegenHermeticTests: XCTestCase {
 
     func testTheEmitterUsesTheStoredNameWhereTheRuntimeReadsAField() throws {
         let swift = try XCTUnwrap(render([("workspace.toml", Self.workspace())])["Task.swift"])
-        XCTAssertTrue(swift.contains("public var dueAt: Double?"), swift)
+        // `dueAt` declares a literal default, so it is read-defaulted (#6304).
+        XCTAssertTrue(swift.contains("public var dueAt: Double {"), swift)
         XCTAssertFalse(swift.contains("var due:"))
         XCTAssertTrue(swift.contains("case id, title, dueAt = \"due\""), swift)
         XCTAssertTrue(swift.contains("\"due\":"), swift)
@@ -152,12 +153,14 @@ final class StoredAsCodegenHermeticTests: XCTestCase {
         XCTAssertTrue(swift.contains("ConstraintDescriptor(name: \"title_due\", fields: [\"title\", \"due\"])"), swift)
         XCTAssertTrue(swift.contains("fieldNames: [\"dueAt\": \"due\"]"), swift)
         XCTAssertTrue(swift.contains("fieldNameTypes: [\"workspace\"]"), swift)
-        XCTAssertTrue(swift.contains("record[\"due\"]?.asNumber"), swift)
-        XCTAssertTrue(swift.contains("record.holds(\"due\")"), swift)
-        XCTAssertTrue(swift.contains("row[\"due\"]?.numberValue"), swift)
-        XCTAssertTrue(swift.contains("_changedFields.insert(\"due\")"), swift)
+        XCTAssertTrue(swift.contains("record.fittingValue(\"due\", as: .number)?.asNumber"), swift)
+        XCTAssertTrue(swift.contains("record.isCleared(\"due\")"), swift)
+        XCTAssertTrue(swift.contains("PrimitiveRecord.fittingValue(\"due\", as: .number, in: row)?.asNumber"), swift)
+        XCTAssertTrue(swift.contains("_changedFields.insert(\"due\"); _suppliedDefaults.remove(\"due\")"), swift)
+        XCTAssertTrue(swift.contains("_suppliedDefaults.insert(\"due\")"), swift)
         XCTAssertFalse(swift.contains("record[\"dueAt\"]"))
         XCTAssertFalse(swift.contains("row[\"dueAt\"]"))
+        XCTAssertFalse(swift.contains("\"dueAt\", as:"), swift)
         // `upsertOn` names the field by its current name; the constraint is the one the server enforces.
         XCTAssertTrue(swift.contains("case dueAt = \"dueAt\""), swift)
         XCTAssertTrue(swift.contains("= \"tasks_due_unique\""), swift)

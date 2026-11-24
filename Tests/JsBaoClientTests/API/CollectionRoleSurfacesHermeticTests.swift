@@ -253,7 +253,7 @@ final class CollectionRoleSurfacesHermeticTests: XCTestCase {
         XCTAssertEqual(access.groups.first?.role, .viewer)
         XCTAssertEqual(access.groups.first?.groupType, "group")
         XCTAssertEqual(access.members.first?.role, .owner)
-        XCTAssertEqual(access.members.first?.permission, "read-write")
+        XCTAssertEqual(access.members.first?.permission, .readWrite)
 
         let (remover, removes) = collections(#"{"success":true}"#)
         _ = try await remover.removeMember(collectionId: "c1", userId: "u2")

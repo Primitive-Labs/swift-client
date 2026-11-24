@@ -67,7 +67,7 @@ final class Db3BlobsLiveTests: XCTestCase {
         let decoded = try await blobs.read(blobId: json.blobId, as: Payload.self, force: true)
         XCTAssertEqual(decoded, payload)
 
-        let url = blobs.downloadUrl(blobId: uploaded.blobId, disposition: .attachment)
+        let url = try blobs.downloadUrl(blobId: uploaded.blobId, disposition: .attachment)
         XCTAssertTrue(url.contains("/api/db3/\(db3Id)/blobs/\(uploaded.blobId)/download"), url)
         let fetched = try await live.authenticatedGet(url, jwt: live.app.ownerJWT)
         XCTAssertEqual(fetched.0, 200)
@@ -95,7 +95,7 @@ final class Db3BlobsLiveTests: XCTestCase {
         XCTAssertEqual(afterDelete.0, 404)
 
         // Deleting the db3 takes its blobs.
-        let kept = blobs.downloadUrl(blobId: json.blobId)
+        let kept = try blobs.downloadUrl(blobId: json.blobId)
         _ = try await owner.db3.delete(db3Id)
         let gone = try await live.authenticatedGet(kept, jwt: live.app.ownerJWT)
         XCTAssertEqual(gone.0, 404)
@@ -197,5 +197,48 @@ final class Db3BlobsLiveTests: XCTestCase {
         owner.setNetworkMode(.online)
         let fetched = try await blobs.read(blobId: unretained.blobId)
         XCTAssertEqual(fetched, Data("not kept".utf8))
+    }
+
+    // MARK: - #6245 behavior 23
+
+    func testDeleteBatchDeletesDecodesAndARefusedBatchKeepsTheQueuedUpload() async throws {
+        let owner = try await live.client("owner", models: [])
+        let db3Id = try await createdOnServer(owner, title: "Batch").id
+        let blobs = owner.db3.blobs(db3Id)
+        let first = try await blobs.upload(data: Data("first".utf8), options: BlobUploadSourceOptions(filename: "first.txt", contentType: "text/plain"))
+        let second = try await blobs.upload(data: Data("second".utf8), options: BlobUploadSourceOptions(filename: "second.txt", contentType: "text/plain"))
+        let kept = try await blobs.upload(data: Data("kept".utf8), options: BlobUploadSourceOptions(filename: "kept.txt", contentType: "text/plain"))
+
+        let info = try await blobs.get(blobId: first.blobId)
+        XCTAssertEqual(info.createdBy, live.app.ownerUserId)
+        XCTAssertNotNil(info.etag)
+        XCTAssertEqual(info.status, "uploaded")
+        let page = try await blobs.list()
+        let listed = page.items.first { $0.blobId == first.blobId }
+        XCTAssertEqual(listed?.createdBy, live.app.ownerUserId)
+        XCTAssertEqual(listed?.etag, info.etag)
+        XCTAssertEqual(listed?.status, "uploaded")
+
+        let result = try await blobs.deleteBatch(blobIds: [first.blobId, second.blobId])
+        XCTAssertEqual(result.deleted, 2)
+        XCTAssertEqual(result.blobIds, [first.blobId, second.blobId])
+        XCTAssertEqual(result.db3Id, db3Id)
+        let serverIds = try await live.serverBlobIds("/db3/\(db3Id)/blobs")
+        XCTAssertEqual(serverIds, [kept.blobId])
+
+        // A refused batch (501 ids) throws and leaves a queued upload of a named id in place.
+        owner.setNetworkMode(.offline)
+        let queued = try await blobs.upload(data: Data("queued".utf8))
+        XCTAssertEqual(queued.bytesTransferred, 0)
+        let paused = await blobs.pauseUploadAsync(blobId: queued.blobId)
+        XCTAssertTrue(paused)
+        owner.setNetworkMode(.online)
+        let tooMany = [queued.blobId, kept.blobId] + (0..<499).map { _ in ULID.generate() }
+        let refused = await db3BlobRefusal { _ = try await blobs.deleteBatch(blobIds: tooMany) }
+        XCTAssertEqual(refused.0, 400)
+        let stillQueued = await blobs.uploadsAsync()
+        XCTAssertEqual(stillQueued.map(\.blobId), [queued.blobId])
+        let afterRefusal = try await live.serverBlobIds("/db3/\(db3Id)/blobs")
+        XCTAssertEqual(afterRefusal, [kept.blobId])
     }
 }

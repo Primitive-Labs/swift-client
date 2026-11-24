@@ -56,17 +56,17 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
     public var boundedName: String? {
         didSet { _changedFields.insert("boundedName") }
     }
-    public var `default`: String? {
-        didSet { _changedFields.insert("default") }
+    public var `default`: String {
+        didSet { _changedFields.insert("default"); _suppliedDefaults.remove("default") }
     }
     public var `where`: String? {
         didSet { _changedFields.insert("where") }
     }
-    public var score: Double? {
-        didSet { _changedFields.insert("score") }
+    public var score: Double {
+        didSet { _changedFields.insert("score"); _suppliedDefaults.remove("score") }
     }
-    public var active: Bool? {
-        didSet { _changedFields.insert("active") }
+    public var active: Bool {
+        didSet { _changedFields.insert("active"); _suppliedDefaults.remove("active") }
     }
 
     public var related: RelatedRecords = .empty
@@ -89,6 +89,15 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
     /// field, whatever this holds.
     /// Not part of the record's persisted/equatable identity.
     public private(set) var _changedFields: Set<String> = []
+
+    /// The fields whose value this model supplied from their `default`
+    /// rather than read or were given (#6304): a field the record held
+    /// no value of its kind for, an initializer parameter left out, a
+    /// decoded key that held none. `primitiveValues()` leaves them out,
+    /// so no write sends a default the model filled in; assigning the
+    /// field, or `markAllChanged()`, makes its value the caller's.
+    /// Not part of the record's persisted/equatable identity.
+    public private(set) var _suppliedDefaults: Set<String> = []
 
     /// Forget the pending field changes without writing them, so a
     /// later `save(in:)` treats this value as unmodified. Mirrors
@@ -114,6 +123,7 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
     /// Every field it writes wins last-writer-wins against a concurrent
     /// remote edit to that field, which is the cost of a full copy.
     public mutating func markAllChanged() {
+        _suppliedDefaults = []
         _changedFields = Set(primitiveValues().keys)
     }
 
@@ -133,12 +143,15 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         self.requiredTags = requiredTags
         self.email = email
         self.boundedName = boundedName
-        self.`default` = `default`
+        self.`default` = `default` ?? "fallback"
         self.`where` = `where`
-        self.score = score
-        self.active = active
+        self.score = score ?? 100
+        self.active = active ?? true
         self.related = .empty
-        self._changedFields = Set(primitiveValues().keys)
+        if `default` == nil { _suppliedDefaults.insert("default") }
+        if score == nil { _suppliedDefaults.insert("score") }
+        if active == nil { _suppliedDefaults.insert("active") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     /// Create a record with an auto-generated id. The id is NOT
@@ -161,47 +174,68 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         self.requiredTags = requiredTags
         self.email = email
         self.boundedName = boundedName
-        self.`default` = `default`
+        self.`default` = `default` ?? "fallback"
         self.`where` = `where`
-        self.score = score
-        self.active = active
+        self.score = score ?? 100
+        self.active = active ?? true
         self.related = .empty
         self._explicitId = false
-        self._changedFields = Set(primitiveValues().keys)
+        if `default` == nil { _suppliedDefaults.insert("default") }
+        if score == nil { _suppliedDefaults.insert("score") }
+        if active == nil { _suppliedDefaults.insert("active") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     public init?(record: PrimitiveRecord) {
-        guard let requiredTags = record["requiredTags"]?.asStringSet
+        guard let requiredTags = record["requiredTags"]?.asStringSet,
+              !record.isCleared("default"),
+              !record.isCleared("score"),
+              !record.isCleared("active")
         else { return nil }
+        let _default = record.fittingValue("default", as: .string)?.asString
+        let _score = record.fittingValue("score", as: .number)?.asNumber
+        let _active = record.fittingValue("active", as: .boolean)?.asBoolean
         self.id = record.id
         self.tags = record["tags"]?.asStringSet
         self.requiredTags = requiredTags
         self.email = record["email"]?.asString
         self.boundedName = record["boundedName"]?.asString
-        self.`default` = record.holds("default") == false ? "fallback" : record["default"]?.asString
+        self.`default` = _default ?? "fallback"
         self.`where` = record["where"]?.asString
-        self.score = record.holds("score") == false ? 100 : record["score"]?.asNumber
-        self.active = record.holds("active") == false ? true : record["active"]?.asBoolean
+        self.score = _score ?? 100
+        self.active = _active ?? true
         self.related = .empty
         self._changedFields = []
+        if _default == nil { _suppliedDefaults.insert("default") }
+        if _score == nil { _suppliedDefaults.insert("score") }
+        if _active == nil { _suppliedDefaults.insert("active") }
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
     public init?(row: [String: JSONValue]) {
         guard let id = row["id"]?.stringValue,
-              let requiredTags = (row["requiredTags"]?.stringArrayValue).map(Set.init)
+              let requiredTags = (row["requiredTags"]?.stringArrayValue).map(Set.init),
+              !PrimitiveRecord.isCleared("default", in: row),
+              !PrimitiveRecord.isCleared("score", in: row),
+              !PrimitiveRecord.isCleared("active", in: row)
         else { return nil }
+        let _default = PrimitiveRecord.fittingValue("default", as: .string, in: row)?.asString
+        let _score = PrimitiveRecord.fittingValue("score", as: .number, in: row)?.asNumber
+        let _active = PrimitiveRecord.fittingValue("active", as: .boolean, in: row)?.asBoolean
         self.id = id
         self.tags = (row["tags"]?.stringArrayValue).map(Set.init)
         self.requiredTags = requiredTags
         self.email = row["email"]?.stringValue
         self.boundedName = row["boundedName"]?.stringValue
-        self.`default` = PrimitiveRecord.holds("default", in: row) == false ? "fallback" : row["default"]?.stringValue
+        self.`default` = _default ?? "fallback"
         self.`where` = row["where"]?.stringValue
-        self.score = PrimitiveRecord.holds("score", in: row) == false ? 100 : row["score"]?.numberValue
-        self.active = PrimitiveRecord.holds("active", in: row) == false ? true : row["active"]?.rowBoolValue
+        self.score = _score ?? 100
+        self.active = _active ?? true
         self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []
+        if _default == nil { _suppliedDefaults.insert("default") }
+        if _score == nil { _suppliedDefaults.insert("score") }
+        if _active == nil { _suppliedDefaults.insert("active") }
     }
 
     public func primitiveValues() -> [String: PrimitiveValue] {
@@ -211,10 +245,10 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         if let tags { values["tags"] = .stringset(tags) }
         if let email { values["email"] = .string(email) }
         if let boundedName { values["boundedName"] = .string(boundedName) }
-        if let `default` { values["default"] = .string(`default`) }
+        if !_suppliedDefaults.contains("default") { values["default"] = .string(`default`) }
         if let `where` { values["where"] = .string(`where`) }
-        if let score { values["score"] = .number(score) }
-        if let active { values["active"] = .boolean(active) }
+        if !_suppliedDefaults.contains("score") { values["score"] = .number(score) }
+        if !_suppliedDefaults.contains("active") { values["active"] = .boolean(active) }
         return values
     }
 
@@ -228,12 +262,18 @@ public struct CrashTestRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         self.requiredTags = try container.decode(Set<String>.self, forKey: .requiredTags)
         self.email = try container.decodeIfPresent(String.self, forKey: .email)
         self.boundedName = try container.decodeIfPresent(String.self, forKey: .boundedName)
-        self.`default` = try container.decodeIfPresent(String.self, forKey: .`default`)
+        let _default = container.fittingValue(forKey: .`default`, as: .string)?.asString
+        self.`default` = _default ?? "fallback"
         self.`where` = try container.decodeIfPresent(String.self, forKey: .`where`)
-        self.score = try container.decodeIfPresent(Double.self, forKey: .score)
-        self.active = try container.decodeIfPresent(Bool.self, forKey: .active)
+        let _score = container.fittingValue(forKey: .score, as: .number)?.asNumber
+        self.score = _score ?? 100
+        let _active = container.fittingValue(forKey: .active, as: .boolean)?.asBoolean
+        self.active = _active ?? true
         self.related = .empty
-        self._changedFields = Set(primitiveValues().keys)
+        if _default == nil { _suppliedDefaults.insert("default") }
+        if _score == nil { _suppliedDefaults.insert("score") }
+        if _active == nil { _suppliedDefaults.insert("active") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     public enum CodingKeys: String, CodingKey {

@@ -72,7 +72,7 @@ final class BlobImageHermeticTests: XCTestCase {
         let sent = BlobDownloadCaptureURLProtocol.requests
         XCTAssertEqual(sent.count, 1)
         XCTAssertEqual(sent.first?.headers["Authorization"], "Bearer image-token")
-        XCTAssertEqual(sent.first?.url, context.downloadUrl(blobId: "B1", disposition: .inline))
+        XCTAssertEqual(sent.first?.url, try context.downloadUrl(blobId: "B1", disposition: .inline))
     }
 
     // MARK: - Behavior 9

@@ -227,10 +227,13 @@ let package = Package(
             // compilations. The session-row fixtures (#3802), the bulk-load
             // chunk fixtures (#4475) and the role-compatibility response
             // fixtures (#4727) and the vector codec and rule fixtures (#5225)
+            // and the db3 tag rule's vectors (#6371)
             // are JSON the JS and Swift suites both read by path, not bundle
             // resources; the vector codegen golden's TOML is read by path the
             // same way, and so are the shared-enum model fixture's TOMLs
-            // (#5896) and the JSON-field model fixture's (#5899), and so is the backend
+            // (#5896), the JSON-field model fixture's (#5899) and the read-defaulted
+            // model fixture's and the read-default parity fixture's
+            // with its object def (#6304), and so is the backend
             // override fixture the JS suite also reads (#6185). `JsBaoSQLiteProbe` is its own executable target too,
             // and the store the earlier bundled SQLite wrote (#5227) is read
             // by path.
@@ -242,6 +245,7 @@ let package = Package(
                 "Fixtures/BundledSQLite",
                 "Fixtures/Db3Enums",
                 "Fixtures/Db3Json",
+                "Fixtures/Db3TagRule",
                 "Fixtures/Db3Vectors",
                 "Fixtures/DocumentIngestChunks",
                 "Fixtures/RoleCompatResponses",
@@ -250,6 +254,9 @@ let package = Package(
                 "Schema/CodegenSharedEnum/schemas",
                 "Schema/CodegenSharedEnum/functions",
                 "Schema/CodegenJson/db3-types",
+                "Schema/CodegenReadDefaults/db3-types",
+                "Schema/CodegenReadDefaultParity/db3-types",
+                "Schema/CodegenReadDefaultParity/schemas",
                 "Schema/CodegenJson/schemas",
             ],
             swiftSettings: experimentalApiSettings

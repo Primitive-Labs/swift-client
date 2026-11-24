@@ -30,8 +30,8 @@ public final class Db3PermissionsAPI: Sendable {
         self.awaitCreate = awaitCreate
     }
 
-    private func path(_ suffix: String) -> String {
-        "/db3/\(URLEncoding.encodeComponent(db3Id))/\(suffix)"
+    private func path(_ suffix: String) throws -> String {
+        "/db3/\(try URLEncoding.pathSegment(db3Id, name: "db3Id"))/\(suffix)"
     }
 
     // MARK: - Users
@@ -70,7 +70,13 @@ public final class Db3PermissionsAPI: Sendable {
     ///   before any request.
     /// - Stability: beta
     public func remove(_ target: DocumentPermissionTarget) async throws {
+        // Every argument is checked before the wait, which can commit a pending create.
+        let target = try removalPath(target)
         try await awaitCreate(db3Id)
+        try await transport.send(method: .delete, path: target)
+    }
+
+    private func removalPath(_ target: DocumentPermissionTarget) throws -> String {
         switch target {
         case let .email(email):
             guard !email.isEmpty else {
@@ -78,12 +84,12 @@ public final class Db3PermissionsAPI: Sendable {
             }
             var query = URLQuery()
             query.append("email", email)
-            try await transport.send(method: .delete, path: path("permissions") + query.queryString)
+            return try path("permissions") + query.queryString
         case let .userId(userId):
             guard !userId.isEmpty else {
                 throw JsBaoError(code: .invalidArgument, message: "client.db3.permissions(id).remove: a userId or an email is required")
             }
-            try await transport.send(method: .delete, path: path("permissions/\(URLEncoding.encodeComponent(userId))"))
+            return try path("permissions/\(URLEncoding.pathSegment(userId, name: "userId"))")
         }
     }
 
@@ -107,11 +113,9 @@ public final class Db3PermissionsAPI: Sendable {
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     /// - Stability: beta
     public func revokePendingInvitation(_ invitationId: String) async throws -> PendingInvitationRevokeResult {
+        let target = try path("pending-invitations/\(URLEncoding.pathSegment(invitationId, name: "invitationId"))")
         try await awaitCreate(db3Id)
-        return try await transport.request(
-            method: .delete,
-            path: path("pending-invitations/\(URLEncoding.encodeComponent(invitationId))")
-        )
+        return try await transport.request(method: .delete, path: target)
     }
 
     // MARK: - Groups
@@ -147,8 +151,9 @@ public final class Db3PermissionsAPI: Sendable {
     /// - Parameter groupId: The group.
     /// - Stability: beta
     public func revokeGroup(_ groupId: String) async throws -> SuccessResult {
+        let target = try path("group-permissions/\(URLEncoding.pathSegment(groupId, name: "groupId"))")
         try await awaitCreate(db3Id)
-        return try await transport.request(method: .delete, path: path("group-permissions/\(URLEncoding.encodeComponent(groupId))"))
+        return try await transport.request(method: .delete, path: target)
     }
 
     // MARK: - Link access
@@ -246,12 +251,9 @@ public final class Db3PermissionsAPI: Sendable {
     ///   - options: The level to grant, and the URL the notification links to.
     /// - Stability: beta
     public func approveAccessRequest(_ requestId: String, options: ApproveAccessRequestOptions? = nil) async throws -> AccessRequestResult {
+        let target = try path("access-requests/\(URLEncoding.pathSegment(requestId, name: "requestId"))/approve")
         try await awaitCreate(db3Id)
-        return try await transport.request(
-            method: .post,
-            path: path("access-requests/\(URLEncoding.encodeComponent(requestId))/approve"),
-            body: options ?? ApproveAccessRequestOptions()
-        )
+        return try await transport.request(method: .post, path: target, body: options ?? ApproveAccessRequestOptions())
     }
 
     /// Deny an access request.
@@ -263,11 +265,8 @@ public final class Db3PermissionsAPI: Sendable {
     ///   - options: The URL the notification links to.
     /// - Stability: beta
     public func denyAccessRequest(_ requestId: String, options: DenyAccessRequestOptions? = nil) async throws -> AccessRequestResult {
+        let target = try path("access-requests/\(URLEncoding.pathSegment(requestId, name: "requestId"))/deny")
         try await awaitCreate(db3Id)
-        return try await transport.request(
-            method: .post,
-            path: path("access-requests/\(URLEncoding.encodeComponent(requestId))/deny"),
-            body: options ?? DenyAccessRequestOptions()
-        )
+        return try await transport.request(method: .post, path: target, body: options ?? DenyAccessRequestOptions())
     }
 }

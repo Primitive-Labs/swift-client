@@ -150,6 +150,13 @@ struct RecordLogMarks: Equatable, Sendable {
     var localOnly = false
     /// A local-only db3's index registrations made on this device, by name.
     var localIndexes: [RecordLogLocalIndex] = []
+    /// A typed local-only db3's installed declarations in install shape
+    /// (#6025): its type's models, as the build that created or last
+    /// upgraded it carried them; `nil` for every other db3.
+    var localDeclarations: [String: JSONValue]? = nil
+    /// A typed local-only db3 whose installed declarations cannot be read
+    /// (#6025): its writes are refused until a build declaring its type recovers them.
+    var localTypeUnreadable = false
     /// The models the copy holds, sorted and distinct: those with a view or a
     /// confirmed row, and those an unjudged entry of any writer touches. An
     /// untyped open declares these.
@@ -165,6 +172,7 @@ struct RecordLogMarks: Equatable, Sendable {
             && a.enums == b.enums && a.enumsKnown == b.enumsKnown
             && a.cleared == b.cleared && a.clearedKnown == b.clearedKnown
             && a.localOnly == b.localOnly && a.localIndexes == b.localIndexes
+            && a.localDeclarations == b.localDeclarations && a.localTypeUnreadable == b.localTypeUnreadable
             && a.cursor == b.cursor && a.open == b.open && a.grant == b.grant && a.entries == b.entries
             && a.constraints == b.constraints && a.permission == b.permission && a.replacing == b.replacing
             && a.replacement == b.replacement && a.receipt == b.receipt && a.segment == b.segment && a.staged == b.staged
@@ -724,7 +732,21 @@ final class SqlRecordLogTables: RecordLogReceiptTables, RecordLogBatchRowTables,
         enums: RecordLogEnumDeclarations?, enumsKnown: Bool,
         cleared: RecordLogClearedDeclarations?, clearedKnown: Bool
     ) {
-        let text = try sql.first("SELECT value FROM record_log_meta WHERE key = ?", [typeKey])?["value"].stringValue
+        typeState(text: try typeEntryText())
+    }
+
+    /// The db3's type entry as stored, one read; `nil` when it has none.
+    func typeEntryText() throws -> String? {
+        try sql.first("SELECT value FROM record_log_meta WHERE key = ?", [typeKey])?["value"].stringValue
+    }
+
+    /// ``typeState()`` of the type entry `text`, already read.
+    func typeState(text: String?) -> (
+        typed: RecordLogTyped, db3Type: RecordLogDb3Type?, declarations: [String: [String: String]]?,
+        vectors: RecordLogVectorDeclarations?, vectorsKnown: Bool,
+        enums: RecordLogEnumDeclarations?, enumsKnown: Bool,
+        cleared: RecordLogClearedDeclarations?, clearedKnown: Bool
+    ) {
         guard let held = text.flatMap({ JSONValue(jsonText: $0) })?.objectValue else { return (.unknown, nil, nil, nil, true, nil, true, nil, true) }
         let typed = RecordLogTyped(rawValue: held["typed"]?.stringValue ?? "") ?? .unknown
         guard typed == .yes, let name = held["name"]?.stringValue else { return (typed, nil, nil, nil, true, nil, true, nil, true) }
@@ -782,6 +804,55 @@ final class SqlRecordLogTables: RecordLogReceiptTables, RecordLogBatchRowTables,
         )
     }
 
+    /// A db3 that lives only on this device's type as its store holds it
+    /// (#6025), from one read of the type entry: `nil` for a db3 that syncs.
+    /// A local-only db3 with no type entry, or one marked untyped, is not
+    /// typed. A typed one whose entry does not parse, or lacks its hash, its
+    /// declarations or their install shape (`local`), is `unreadable`.
+    func heldLocalType() throws -> RecordLogHeldLocalType? {
+        guard try localOnly() else { return nil }
+        return heldLocalType(text: try typeEntryText())
+    }
+
+    /// ``heldLocalType()`` of a local-only db3 whose type entry `text` was already read.
+    func heldLocalType(text: String?) -> RecordLogHeldLocalType {
+        guard let text else { return RecordLogHeldLocalType(typed: false, unreadable: false) }
+        guard let held = JSONValue(jsonText: text)?.objectValue else { return RecordLogHeldLocalType(typed: true, unreadable: true) }
+        guard held["typed"]?.stringValue == "yes" else { return RecordLogHeldLocalType(typed: false, unreadable: false) }
+        let name = held["name"]?.stringValue
+        let hash = held["hash"]?.stringValue
+        let local = held["local"]?.objectValue
+        let kinds = held["models"]?.objectValue?.mapValues { ($0.objectValue ?? [:]).compactMapValues(\.stringValue) }
+        guard let name, let hash, let local, let kinds else {
+            return RecordLogHeldLocalType(typed: true, unreadable: true, name: name, hash: hash)
+        }
+        let declared = RecordLogDeclaredType(
+            name: name, models: kinds, vectors: held["vectors"].flatMap(recordLogVectorDeclarations) ?? [:],
+            enums: held["enums"].flatMap(recordLogEnumDeclarations) ?? [:]
+        )
+        return RecordLogHeldLocalType(typed: true, unreadable: false, name: name, hash: hash, local: local, declared: declared)
+    }
+
+    /// Record a typed local-only db3's type (#6025): its name and hash, the
+    /// forms the device judge and the read paths take (field kinds, vector
+    /// encodings, enforced enums, cleared names) and the install-shape
+    /// declarations themselves (`local`), in one entry.
+    func setLocalType(_ type: RecordLogLocalType) throws {
+        let derived = type.derived
+        let object: [String: JSONValue] = [
+            "typed": "yes", "name": .string(type.name), "hash": .string(type.hash),
+            "models": .object(derived.kinds.mapValues { .object($0.mapValues { .string($0) }) }),
+            "vectors": derived.vectors.isEmpty ? .null : recordLogVectorDeclarationsJSON(derived.vectors),
+            "enums": derived.enums.isEmpty ? .null : recordLogEnumDeclarationsJSON(derived.enums),
+            "cleared": derived.cleared.isEmpty ? .null : recordLogClearedDeclarationsJSON(derived.cleared),
+            "local": .object(type.models),
+        ]
+        try sql.exec(
+            "INSERT INTO record_log_meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            [typeKey, .text(RecordLogJSON.text(.object(object)))]
+        )
+    }
+
     /// Forget the type mark and the local-only owner: the document's local data is removed.
     func forgetType() throws {
         try sql.exec("DELETE FROM record_log_meta WHERE key IN (?, ?)", [typeKey, .text(RecordLogStore.localOwnerKey(docId))])
@@ -794,6 +865,19 @@ final class SqlRecordLogTables: RecordLogReceiptTables, RecordLogBatchRowTables,
 
     /// Whether the db3 lives only on this device.
     func localOnly() throws -> Bool { try state()?["local_only"].intValue == 1 }
+
+    /// Whether the db3 lives only on this device and, for one that does, its
+    /// type entry as stored, from one statement (#6025): a commit of a db3
+    /// that syncs, or of an untyped local-only one, reads no more than it
+    /// did before typed local-only db3s.
+    func localCommitState() throws -> (localOnly: Bool, typeEntry: String?) {
+        let row = try sql.first(
+            "SELECT local_only, CASE WHEN local_only = 1 THEN (SELECT value FROM record_log_meta WHERE key = ?) END AS type_entry "
+                + "FROM record_log_state WHERE doc_id = ?",
+            [typeKey, doc]
+        )
+        return (row?["local_only"].intValue == 1, row?["type_entry"].stringValue)
+    }
 
     func setLocalOnly(_ localOnly: Bool) throws {
         try ensureState()
@@ -1493,6 +1577,13 @@ final class RecordLogStore: @unchecked Sendable {
         try onConnection { sql in try group.read { try body(sql) } }
     }
 
+    /// The db3's type entry as stored (#6025), one read: a typed local-only
+    /// db3's binding compares it with the one its marks were read from, to
+    /// learn of declarations another client of the store installed.
+    func typeEntry() throws -> String? {
+        try reading { _ in try tables.typeEntryText() }
+    }
+
     /// Run a read of the view (``RecordLogViewReader``) on this store's
     /// connection, in one read transaction: a deferred `BEGIN` …
     /// `COMMIT` of its own when nothing is open on the connection, else the
@@ -1948,7 +2039,10 @@ final class RecordLogStore: @unchecked Sendable {
                 [doc, .text(writer)]
             )
         }
-        let type = try tables.typeState()
+        let typeEntry = try tables.typeEntryText()
+        let type = tables.typeState(text: typeEntry)
+        // A typed local-only db3's declarations (#6025), from the type entry already read: nothing more is read.
+        let local = state?["local_only"].intValue == 1 ? tables.heldLocalType(text: typeEntry) : nil
         return RecordLogMarks(
             cursor: try tables.cursor(), open: epochs.open, grant: epochs.grant, entries: epochs.entries,
             constraints: try tables.constraints(),
@@ -1976,6 +2070,8 @@ final class RecordLogStore: @unchecked Sendable {
             clearedKnown: type.clearedKnown,
             localOnly: state?["local_only"].intValue == 1,
             localIndexes: try tables.localIndexes(),
+            localDeclarations: local?.local,
+            localTypeUnreadable: local?.unreadable ?? false,
             models: try modelsHeld(sql),
             knownHead: state?["known_head"].intValue,
             knownHeadAt: state?["known_head"].intValue == nil ? nil : state?["known_head_at"].intValue.map { Int64($0) }
@@ -2653,13 +2749,17 @@ final class RecordLogStore: @unchecked Sendable {
     ///
     /// - Throws: `JsBaoError(.documentEpochBudget)` when both epochs this client
     ///   may write into are full; nothing of the save lands. A db3 that lives
-    ///   only on this device commits through ``commitLocally(_:writer:writes:ts:)``
+    ///   only on this device commits through ``commitLocally(_:writer:writes:ts:held:localBuild:)``
     ///   and throws what it throws; in a store holding a member index it then
     ///   gathers statistics once the view has grown past its mark,
     ///   outside the save.
+    ///
+    /// `localBuild`, for a typed local-only db3 (#6025), is the declarations
+    /// of its type the writing client's build carries (`nil`: none): a build
+    /// that diverged from the installed ones has its writes refused.
     func commitEntries(
         writer: String, writes: [RecordLogWrite],
-        ts: Int64? = nil, listener: RecordLogGroupCommit.Listener? = nil
+        ts: Int64? = nil, listener: RecordLogGroupCommit.Listener? = nil, localBuild: RecordLogLocalType? = nil
     ) throws -> RecordLogCommitReply {
         let documentId = documentId
         let heard: RecordLogGroupCommit.Listener? = listener.map { listener in
@@ -2677,9 +2777,12 @@ final class RecordLogStore: @unchecked Sendable {
         }
         var local = false
         let reply = try save(listener: heard) { sql -> RecordLogCommitReply in
-            if try tables.localOnly() {
+            let commitState = try tables.localCommitState()
+            if commitState.localOnly {
                 local = true
-                return try commitLocally(sql, writer: writer, writes: writes, ts: ts)
+                return try commitLocally(
+                    sql, writer: writer, writes: writes, ts: ts, held: tables.heldLocalType(text: commitState.typeEntry), localBuild: localBuild
+                )
             }
             return try tables.countingEpochs {
                 let rules = rules(writer)
@@ -2718,14 +2821,20 @@ final class RecordLogStore: @unchecked Sendable {
     ///   (`details.scope` `local`, with the room's `constraint`, `conflicting`
     ///   and `current`); nothing of the save lands.
     private func commitLocally(
-        _ sql: RecordLogSql, writer: String, writes: [RecordLogWrite], ts: Int64?
+        _ sql: RecordLogSql, writer: String, writes: [RecordLogWrite], ts: Int64?, held: RecordLogHeldLocalType,
+        localBuild: RecordLogLocalType? = nil
     ) throws -> RecordLogCommitReply {
         let rules = rules(writer)
         var reply = RecordLogCommitReply(entries: [], changed: [], cursor: 0, acknowledged: [], settled: [], settlements: [:])
         var touched: [RecordLogRecordKey] = []
-        for write in writes {
+        // A typed local-only db3's installed declarations (#6025), from the
+        // type entry read in this transaction with the local-only mark; an
+        // untyped one reads nothing more.
+        let localType = try localDeclaredType(held, localBuild)
+        for sent in writes {
+            let write = try localType.map { try judgeLocalType(sent, $0) } ?? sent
             guard let m = write.mutations.first else { continue }
-            let judged = try judgeLocally(sql, write)
+            let judged = try judgeLocally(sql, write, local: localType?.local)
             let entry = try rules.write(
                 m, also: Array(write.mutations.dropFirst()), upsertOn: write.upsertOn,
                 ts: ts ?? Int64(Date().timeIntervalSince1970 * 1000)
@@ -2746,6 +2855,54 @@ final class RecordLogStore: @unchecked Sendable {
         return reply
     }
 
+    /// The declarations a typed local-only db3's writes are judged by, as its
+    /// store holds them now (#6025), or `nil` for an untyped one. Whatever
+    /// build wrote them, the installed declarations judge: an older build's
+    /// writes meet a newer build's rules once installed.
+    ///
+    /// - Throws: `.db3TypeRefused` (`details["scope"]` `local`) when the
+    ///   declarations cannot be read (`unreadable`), or the writer's `build`
+    ///   diverged from them (`diverged`).
+    private func localDeclaredType(
+        _ held: RecordLogHeldLocalType, _ build: RecordLogLocalType?
+    ) throws -> (declared: RecordLogDeclaredType, local: [String: JSONValue])? {
+        guard held.typed else { return nil }
+        let documentId = documentId
+        guard !held.unreadable, let name = held.name, let hash = held.hash, let local = held.local, let declared = held.declared else {
+            throw JsBaoError(
+                code: .db3TypeRefused,
+                message: "the db3 '\(documentId)' lives only on this device and its type's declarations cannot be read, so the write was "
+                    + "refused; a build that declares its type recovers them when it opens the db3",
+                details: ["documentId": .string(documentId), "scope": "local", "unreadable": true]
+            )
+        }
+        if let build, build.name == name, build.hash != hash,
+           recordLogClassifyDeclarations(installed: (hash, local), build: build) == .diverged {
+            throw JsBaoError(
+                code: .db3TypeRefused,
+                message: "the db3 '\(documentId)' holds declarations of type '\(name)' that this build's neither contain nor extend, so the "
+                    + "write was refused; a build whose declarations contain both writes it",
+                details: ["documentId": .string(documentId), "scope": "local", "diverged": true]
+            )
+        }
+        return (declared, local)
+    }
+
+    /// One write of a typed local-only db3, judged by its installed
+    /// declarations as the room judges an entry on a typed db3 (#6025): the
+    /// names the type hides are stripped, then a model it does not declare, a
+    /// value of the wrong kind, a malformed vector or a value outside an
+    /// enforced enum is refused. Answers the write as it commits.
+    private func judgeLocalType(
+        _ write: RecordLogWrite, _ type: (declared: RecordLogDeclaredType, local: [String: JSONValue])
+    ) throws -> RecordLogWrite {
+        let mutations = recordLogWithoutHiddenNames(write.mutations, type.local)
+        if let problem = recordLogDeclaredTypeProblem(mutations, type.declared) {
+            throw JsBaoError(code: problem.code, message: problem.message, details: ["documentId": .string(documentId), "scope": "local"])
+        }
+        return RecordLogWrite(mutations: mutations, upsertOn: write.upsertOn)
+    }
+
     /// Judge one write of a local-only db3 against the confirmed rows, as the
     /// room judges an entry: an upsert lands on the live record
     /// holding its value; `ifNotExists` fails on a live record, a `condition`
@@ -2754,15 +2911,25 @@ final class RecordLogStore: @unchecked Sendable {
     /// checked against the store's unique constraints. Answers its changes,
     /// whole rows, and the upsert's alias when it landed on another record.
     ///
-    /// - Throws: the room's refusal, as ``commitLocally(_:writer:writes:ts:)`` says.
+    /// `local`, a typed local-only db3's installed declarations (#6025): the
+    /// names they hide read as unset in a condition, and a refusal's current
+    /// record leaves them out, as a read does.
+    ///
+    /// - Throws: the room's refusal, as ``commitLocally(_:writer:writes:ts:held:localBuild:)`` says.
     private func judgeLocally(
-        _ sql: RecordLogSql, _ write: RecordLogWrite
+        _ sql: RecordLogSql, _ write: RecordLogWrite, local: [String: JSONValue]? = nil
     ) throws -> (changes: [RecordLogChange], alias: RecordLogAlias?) {
         let documentId = documentId
         func refused(_ code: JsBaoErrorCode, _ message: String, _ extra: [String: JSONValue] = [:]) -> JsBaoError {
             var details: [String: JSONValue] = ["documentId": .string(documentId), "scope": "local"]
             details.merge(extra) { _, new in new }
             return JsBaoError(code: code, message: "Cannot save to the db3 '\(documentId)': \(message).", details: details)
+        }
+        /// `row` of `model` without the names the installed declarations hide.
+        func visible(_ model: String, _ row: RecordLogRow?) -> RecordLogRow? {
+            guard let local, var row else { return row }
+            for name in recordLogLocalHidden(local[model]) { row.removeValue(forKey: name) }
+            return row
         }
         let confirmed = try tables.confirmed()
         let constraints = try tables.constraints()
@@ -2783,7 +2950,8 @@ final class RecordLogStore: @unchecked Sendable {
             guard sent.kind == .increment || sent.carriesGuard else { continue }
             let place = at == 0 ? "" : "write \(at + 1) of the transaction: "
             let record = "\(target.model) id=\(target.id)"
-            let row = try confirmed.row(target.key)
+            // The record as a read sees it: the names the installed declarations hide are unset (#6025).
+            let row = visible(target.model, try confirmed.row(target.key))
             let current: [String: JSONValue] = ["current": RecordLogCurrentRecord(model: target.model, id: target.id, row: row).json]
             if sent.kind == .increment, !created.contains(target.key), row == nil {
                 throw refused(.db3RecordNotFound, "\(place)\(record) has no live record to increment", current)
@@ -2815,7 +2983,7 @@ final class RecordLogStore: @unchecked Sendable {
                let field = (mutation.fields ?? [:]).keys.sorted().first(where: { !recordLogNumeric(row[$0]).isFinite }) {
                 let place = at == 0 ? "" : "write \(at + 1) of the transaction: "
                 throw refused(.documentEntryInvalid, "\(place)increment of `\(field)` overflows", [
-                    "current": RecordLogCurrentRecord(model: key.model, id: key.id, row: after[key]).json,
+                    "current": RecordLogCurrentRecord(model: key.model, id: key.id, row: visible(key.model, after[key])).json,
                 ])
             }
             after[key] = row
@@ -3373,12 +3541,24 @@ final class RecordLogStore: @unchecked Sendable {
     /// it changes, and no write lands between the check and the constraint.
     /// Answers `moved` (nothing written) when another change came first, and
     /// `duplicates` (nothing written) naming up to `unique.limit` shared keys.
+    /// With `typeHash` (a typed local-only db3, #6025: the hash of the
+    /// installed declarations the change was derived from) it is also
+    /// `moved` when the store's installed declarations are no longer those
+    /// (another client of the store installed a build meanwhile), so a change
+    /// planned under older declarations never replaces the constraints the
+    /// newer ones give. With `indexes`, the db3's cached index list is
+    /// replaced in the same transaction when the change is written (#6025),
+    /// so it is never one planned under other declarations; nothing is built
+    /// or dropped here (a ``syncIndexes(_:)`` with no list follows).
     func changeLocalIndexes(
         from: [RecordLogLocalIndex], to: [RecordLogLocalIndex], constraints: [RecordLogConstraint],
-        unique: (model: String, fields: [String], limit: Int)? = nil
+        unique: (model: String, fields: [String], limit: Int)? = nil, typeHash: String?? = nil, indexes: [RecordLogIndexEntry]? = nil
     ) throws -> RecordLogLocalIndexChange {
         try command { sql in
             if RecordLogLocalIndex.text(try tables.localIndexes()) != RecordLogLocalIndex.text(from) {
+                return .moved(try marksOn(sql))
+            }
+            if let typeHash, try tables.typeState().db3Type?.hash != typeHash {
                 return .moved(try marksOn(sql))
             }
             if let unique {
@@ -3387,8 +3567,202 @@ final class RecordLogStore: @unchecked Sendable {
             }
             try tables.setLocalIndexes(to)
             try tables.setConstraints(constraints)
+            if let indexes { try RecordLogIndexes.cache(sql, documentId: documentId, indexes, logger: logger) }
             return .changed(try marksOn(sql))
         }
+    }
+
+    /// Mark a db3 as living only on this device and, for a typed one whose
+    /// store holds no type yet, record `type`'s declarations with the mark,
+    /// in one transaction (#6025): an interrupted create leaves either an
+    /// untyped local-only copy or the whole type.
+    @discardableResult
+    func markLocalOnly(type: RecordLogLocalType?) throws -> RecordLogMarks {
+        try command { sql in
+            try tables.setLocalOnly(true)
+            if let type, try tables.heldLocalType()?.typed != true { try tables.setLocalType(type) }
+            return try marksOn(sql)
+        }
+    }
+
+    /// Install `build`'s declarations on a typed local-only db3 (#6025), in
+    /// one transaction, judged against the declarations installed now:
+    /// nothing to do for the same hash (or declarations that judge alike),
+    /// for an older build (`subset`) and for a `diverged` one. A superset, or
+    /// any build of the type when the installed declarations cannot be read,
+    /// is installed only once the copy's records and registrations pass the
+    /// room's install check (`refused` with the faults otherwise): its type
+    /// entry, the registrations the clearing rules keep, and the constraints
+    /// its declarations and those registrations give.
+    func installLocalType(_ build: RecordLogLocalType) throws -> RecordLogLocalTypeInstall {
+        try command { sql in
+            guard let held = try tables.heldLocalType(), held.typed else { return .untyped }
+            if !held.unreadable {
+                guard held.name == build.name, let hash = held.hash, let local = held.local else { return .diverged }
+                switch recordLogClassifyDeclarations(installed: (hash, local), build: build) {
+                case .same: return .same
+                case .subset: return .subset
+                case .diverged: return .diverged
+                case .superset: break
+                }
+            }
+            // The room's clearing rules over the copy's registrations: one over a cleared field alone goes, others refuse.
+            var kept: [RecordLogLocalIndex] = []
+            var reasons: [Db3TypeRefusalReason] = []
+            for registration in try tables.localIndexes() {
+                let hidden = Set(recordLogLocalHidden(build.models[registration.model]))
+                guard let field = registration.fields.first(where: hidden.contains) else {
+                    kept.append(registration)
+                    continue
+                }
+                if registration.kind != .vector && registration.fields.count < 2 { continue }
+                let what = registration.kind == .vector ? "a vector index"
+                    : registration.kind == .text ? "a text index over several fields" : "an index over several fields"
+                reasons.append(Db3TypeRefusalReason(
+                    path: "models.\(registration.model).fields.\(field)",
+                    reason: "is named by \(what), \(registration.name) (\(registration.fields.joined(separator: ", "))), registered on this db3: "
+                        + "drop it with client.db3.indexes.drop(db3Id, \"\(registration.name)\"), then open the db3 again"
+                ))
+                kept.append(registration)
+            }
+            reasons.append(contentsOf: try localTypeFaults(sql, build.models, installed: held.unreadable ? nil : held.local))
+            if !reasons.isEmpty { return .refused(reasons: reasons, unreadable: held.unreadable) }
+            try tables.setLocalType(build)
+            try tables.setLocalIndexes(kept)
+            let schemas = recordLogLocalSchemas(build.models)
+            try tables.setConstraints(RecordLogLocalOnly.constraints(schemas, kept))
+            // The index list the new declarations give, so no index over a field they clear is wanted from here (#6025).
+            try RecordLogIndexes.cache(
+                sql, documentId: documentId, RecordLogLocalOnly.entries(RecordLogLocalOnly.indexList(schemas, kept)), logger: logger
+            )
+            return .installed(from: held.unreadable ? nil : held.hash)
+        }
+    }
+
+    /// Per declared kind, the SQL that holds for a stored non-null value the
+    /// kind does not take (#6025), over `json_type` at `at`.
+    private static let localKindFaults: [String: @Sendable (String) -> String] = [
+        "string": { "json_type(_data, \($0)) <> 'text'" },
+        "id": { "json_type(_data, \($0)) <> 'text'" },
+        "number": { "json_type(_data, \($0)) NOT IN ('integer', 'real')" },
+        "boolean": { "json_type(_data, \($0)) NOT IN ('true', 'false')" },
+        "date": { "json_type(_data, \($0)) NOT IN ('text', 'integer', 'real')" },
+        "stringset": { "json_type(_data, \($0)) <> 'array'" },
+    ]
+
+    /// What keeps `models` from being installed on this local-only db3, as
+    /// the room's install check finds it in a db3's live records (js-bao's
+    /// `localTypeFaults`): records of a model they do not declare (when they
+    /// declare any), non-null values of a declared field its kind does not
+    /// take, values outside an enforced enum, and keys more than one record
+    /// holds under a unique constraint. A field `installed` does not declare
+    /// as the same vector becomes one only while no live record holds a
+    /// value in it; with no `installed` (unreadable declarations) every value
+    /// a vector field holds must be its encoding's canonical base64. Each
+    /// fault names its path, how many records or keys, and up to three samples.
+    private func localTypeFaults(
+        _ sql: RecordLogSql, _ models: [String: JSONValue], installed: [String: JSONValue]?
+    ) throws -> [Db3TypeRefusalReason] {
+        var reasons: [Db3TypeRefusalReason] = []
+        let safe = { (name: String) in RecordLogSchema.isValidIdentifier(name) }
+        func value(_ row: Format2SqlRow, _ column: String) -> JSONValue {
+            RecordLogJSON.parse(row[column].stringValue ?? "null") ?? .null
+        }
+        if !models.isEmpty {
+            for row in try sql.rows(
+                "SELECT _type AS m, COUNT(*) AS n FROM record_log_view WHERE doc_id = ? GROUP BY _type ORDER BY _type", [doc]
+            ) {
+                guard let model = row["m"].stringValue, models[model] == nil else { continue }
+                let rows = row["n"].intValue ?? 0
+                reasons.append(Db3TypeRefusalReason(
+                    path: "models.\(model)", reason: "holds \(rows) live \(rows == 1 ? "record" : "records"), and the type does not declare \(model)",
+                    rows: rows
+                ))
+            }
+        }
+        for model in models.keys.sorted() {
+            for (field, options) in recordLogLocalFields(models[model]).sorted(by: { $0.key < $1.key }) where field != "id" && safe(field) {
+                let at = "'$.\(field)'"
+                let present = "doc_id = ? AND _type = ? AND json_type(_data, \(at)) IS NOT NULL AND json_type(_data, \(at)) <> 'null'"
+                let bindings: [Format2SqlValue] = [doc, .text(model)]
+                if let vector = recordLogLocalVectorEncoding(options) {
+                    if let installed, let held = recordLogLocalVectorEncoding(recordLogLocalFields(installed[model])[field] ?? [:]), held == vector {
+                        continue
+                    }
+                    let found = try sql.rows(
+                        "SELECT _id AS id, json_type(_data, \(at)) AS t, json_quote(json_extract(_data, \(at))) AS v FROM record_log_view "
+                            + "WHERE \(present) ORDER BY _id",
+                        bindings
+                    )
+                    // Recovering unreadable declarations: every held value must be the encoding's canonical base64.
+                    let faulty = installed != nil ? found : found.filter { row in
+                        guard row["t"].stringValue == "text", case .string(let text) = value(row, "v") else { return true }
+                        return !VectorCodec.isCanonical(text, bytes: VectorCodec.byteLength(vector))
+                    }
+                    if faulty.isEmpty { continue }
+                    let holds = "\(faulty.count) live \(faulty.count == 1 ? "record holds" : "records hold")"
+                    reasons.append(Db3TypeRefusalReason(
+                        path: "models.\(model).fields.\(field)",
+                        reason: installed != nil
+                            ? "changes from not a vector to a vector of \(VectorCodec.describeField(vector)) while \(holds) a value; null the field on every live \(model) first"
+                            : "is declared a vector of \(VectorCodec.describeField(vector)) while \(holds) a value of another encoding; null the field on every live \(model) first",
+                        rows: faulty.count, samples: faulty.prefix(3).map { [.string($0["id"].stringValue ?? ""), value($0, "v")] }
+                    ))
+                    continue
+                }
+                if let kind = options["type"]?.stringValue, let wrong = Self.localKindFaults[kind] {
+                    let where_ = "\(present) AND \(wrong(at))"
+                    let rows = try sql.first("SELECT COUNT(*) AS n FROM record_log_view WHERE \(where_)", bindings)?["n"].intValue ?? 0
+                    if rows > 0 {
+                        let samples = try sql.rows(
+                            "SELECT _id AS id, json_quote(json_extract(_data, \(at))) AS v FROM record_log_view WHERE \(where_) ORDER BY _id LIMIT 3", bindings
+                        ).map { [JSONValue.string($0["id"].stringValue ?? ""), value($0, "v")] }
+                        reasons.append(Db3TypeRefusalReason(
+                            path: "models.\(model).fields.\(field)",
+                            reason: "is declared \(kind), but \(rows) live \(model) hold \(rows == 1 ? "a value" : "values") of another kind",
+                            rows: rows, samples: samples
+                        ))
+                        continue
+                    }
+                }
+                if let values = recordLogLocalEnforcedValues(field, options) {
+                    let where_ = "\(present) AND NOT (json_type(_data, \(at)) = 'text' AND json_extract(_data, \(at)) IN (SELECT value FROM json_each(?)))"
+                    let set: [Format2SqlValue] = bindings + [.text(RecordLogJSON.text(.array(values.map { .string($0) })))]
+                    let rows = try sql.first("SELECT COUNT(*) AS n FROM record_log_view WHERE \(where_)", set)?["n"].intValue ?? 0
+                    if rows > 0 {
+                        let samples = try sql.rows(
+                            "SELECT _id AS id, json_quote(json_extract(_data, \(at))) AS v FROM record_log_view WHERE \(where_) ORDER BY _id LIMIT 3", set
+                        ).map { [JSONValue.string($0["id"].stringValue ?? ""), value($0, "v")] }
+                        let shown = values.count > 20
+                            ? values.prefix(20).joined(separator: ", ") + " … and \(values.count - 20) more" : values.joined(separator: ", ")
+                        reasons.append(Db3TypeRefusalReason(
+                            path: "models.\(model).fields.\(field)", reason: "\(rows) live \(model) hold a value outside the enum (\(shown))",
+                            rows: rows, samples: samples
+                        ))
+                    }
+                }
+            }
+        }
+        for constraint in RecordLogLocalOnly.declaredConstraints(recordLogLocalSchemas(models)) {
+            guard constraint.fields.allSatisfy({ $0 == "id" || safe($0) }) else { continue }
+            let columns = constraint.fields.map { "json_extract(_data, '$.\($0)')" }
+            let grouped = "SELECT \(columns.enumerated().map { "json_quote(\($0.element)) AS k\($0.offset)" }.joined(separator: ", ")) "
+                + "FROM record_log_view WHERE doc_id = ? AND _type = ? AND \(columns.map { "\($0) IS NOT NULL" }.joined(separator: " AND ")) "
+                + "GROUP BY \(columns.joined(separator: ", ")) HAVING COUNT(*) > 1"
+            let bindings: [Format2SqlValue] = [doc, .text(constraint.model)]
+            let duplicates = try sql.first("SELECT COUNT(*) AS n FROM (\(grouped))", bindings)?["n"].intValue ?? 0
+            if duplicates == 0 { continue }
+            let samples = try sql.rows("\(grouped) ORDER BY \(columns.joined(separator: ", ")) LIMIT 3", bindings).map { row in
+                constraint.fields.indices.map { value(row, "k\($0)") }
+            }
+            reasons.append(Db3TypeRefusalReason(
+                path: "models.\(constraint.model).constraints.\(constraint.name)",
+                reason: "\(duplicates) \(duplicates == 1 ? "key is" : "keys are") held by more than one live \(constraint.model) "
+                    + "(\(constraint.fields.joined(separator: ", ")))",
+                duplicates: duplicates, samples: samples
+            ))
+        }
+        return reasons
     }
 
     /// Up to `limit` keys over `fields` that records of `model` in the view

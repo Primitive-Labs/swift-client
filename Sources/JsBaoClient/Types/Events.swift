@@ -68,6 +68,7 @@ public enum DocumentPermission: String, Sendable, Codable {
     case owner
     case readWrite = "read-write"
     case reader
+    @available(*, deprecated, message: "No answer sends admin: a console administrator's access is owner.")
     case admin
 }
 

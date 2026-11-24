@@ -52,6 +52,24 @@ enum URLEncoding {
     static func encodeComponent(_ value: String) -> String {
         value.addingPercentEncoding(withAllowedCharacters: unreserved) ?? value
     }
+
+    /// `value` percent-encoded as one segment of a `db3/…` route path, or
+    /// `.invalidArgument` (`details["parameter"]` names `name`) when it is
+    /// exactly `.` or `..`. Those are dot segments URL parsing removes:
+    /// `db3/<id>/blobs/..` would reach `db3/<id>/`, the route that deletes
+    /// the db3. Every `db3/…` path the client builds takes each segment it
+    /// interpolates from here; a source-scan unit test fails on one that
+    /// does not.
+    static func pathSegment(_ value: String, name: String) throws -> String {
+        if value == "." || value == ".." {
+            throw JsBaoError(
+                code: .invalidArgument,
+                message: "\(name) cannot be '.' or '..': a db3 path segment of only dots would reach a different route",
+                details: ["parameter": .string(name), "value": .string(value)]
+            )
+        }
+        return encodeComponent(value)
+    }
 }
 
 // MARK: - URLQuery

@@ -1018,6 +1018,16 @@ enum RecordLogIndexes {
         }
     }
 
+    /// Replace `documentId`'s cached index list with `entries` in the
+    /// caller's transaction, building and dropping nothing (#6025): a
+    /// local-only db3's list is written in the same transaction as the
+    /// registrations and declarations it follows, and a later
+    /// ``sync(documentId:_:deviceIndexes:logger:transaction:)`` with no list
+    /// makes the store's indexes what it wants.
+    static func cache(_ sql: RecordLogSql, documentId: String, _ entries: [RecordLogIndexEntry], logger: Logger?) throws {
+        try replace(sql, documentId: documentId, entries, logger: logger)
+    }
+
     /// Replace `documentId`'s cached rows with `entries`, and its skipped
     /// entries with those ``skipReason(_:localOnly:documentId:logger:)``
     /// skips, in the caller's transaction.

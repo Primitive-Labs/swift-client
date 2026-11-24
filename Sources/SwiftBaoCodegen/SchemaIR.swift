@@ -142,3 +142,12 @@ struct ParsedRelationship {
     var rawType: String                 // refersTo | hasMany | hasManyThrough
     var properties: [(String, String)]  // ordered (key, value) pairs
 }
+
+/// One db3 type the registration barrel declares: its name, whether its
+/// type file archives it, and, for a type that allows local-only db3s, the
+/// declarations the build embeds.
+struct BarrelDb3Type: Equatable {
+    var name: String
+    var archived: Bool
+    var localOnly: LocalOnlyTypeDeclarations?
+}

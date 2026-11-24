@@ -2,12 +2,14 @@ import XCTest
 @testable import JsBaoClient
 import YSwift
 
-/// #5896 phase 4 — a generated model reads a defaulted field as js-bao's
-/// getter reads it on a db3 (record-log) document: a record that does not
-/// hold the field reads the field's literal `default`; a record that holds it
-/// as `null` (a field cleared in either client) reads `nil`; a stored value
-/// reads as itself. The fill is a read only: nothing is marked changed, and a
-/// later save does not write the default.
+/// #5896 phase 4, as #6304 phase 2 changed it — a generated model reads a
+/// read-defaulted field (a scalar field whose `default` is a literal of its
+/// type) as js-bao's getter reads it: a record that does not hold the field,
+/// holds it as `null` (a field cleared in either client) or holds a value of
+/// another kind reads the field's literal `default`; a stored value of the
+/// field's kind reads as itself. A string set's default is filled only where
+/// a db3 record does not hold the set, as before. The fill is a read only:
+/// nothing is marked changed, and a later save does not write the default.
 ///
 /// `EnumCardRecord` is the committed model swift-bao-codegen writes for the
 /// board fixture's `cards` model. Each record is read through the real paths:
@@ -165,12 +167,12 @@ final class DefaultedFieldReadHermeticTests: XCTestCase {
         }
     }
 
-    // MARK: - Behaviors 35, 36 and the explicit-null edge case: a cleared field
+    // MARK: - A field cleared to null (#6304)
 
     /// Clearing a field through the Swift client stores `null` on a db3
-    /// document, and js-bao's getter returns a stored `null` as it is: the
-    /// field reads `nil`, not its default.
-    func testAFieldClearedThroughTheSwiftClientReadsNil() async throws {
+    /// document, and a read-defaulted field holding `null` reads its default,
+    /// as js-bao's getter reads it. The stored `null` is kept.
+    func testAFieldClearedThroughTheSwiftClientReadsItsDefault() async throws {
         let client = try await client()
         _ = try client.codegen.save(Self.schema, id: "c3", values: [
             "title": .string("T"), "points": .number(8), "ratio": .number(2), "done": .boolean(true),
@@ -185,58 +187,54 @@ final class DefaultedFieldReadHermeticTests: XCTestCase {
         XCTAssertEqual(try reads(client, id: "c3").map(\.0), ["find", "query", "findByUnique", "record"])
         for (path, read) in try reads(client, id: "c3") {
             let card = try XCTUnwrap(read, path)
-            XCTAssertNil(card.title, path)
-            XCTAssertNil(card.points, path)
-            XCTAssertNil(card.ratio, path)
-            XCTAssertNil(card.done, path)
-            XCTAssertNil(card.phase, path)
-            XCTAssertNil(card.phaseRaw, path)
+            XCTAssertEqual(card.title, "Untitled", path)
+            XCTAssertEqual(card.points, 3, path)
+            XCTAssertEqual(card.ratio, 0.5, path)
+            XCTAssertEqual(card.done, false, path)
+            XCTAssertEqual(card.phase, .open, path)
+            XCTAssertEqual(card.phaseRaw, "open", path)
             XCTAssertEqual(card.rank, 5, path)
             XCTAssertEqual(card._changedFields, [], path)
         }
+        XCTAssertEqual(try stored(client, id: "c3")["points"], .null, "the read stores nothing")
     }
 
-    /// A record that holds a required defaulted field as `null` fails the
-    /// row, as a required field without a default does.
-    func testARequiredDefaultedFieldHeldAsNullFailsTheRow() async throws {
+    /// Edge case E4 (#6304): a record that holds a required defaulted field
+    /// as `null` reads the default and is not dropped.
+    func testARequiredDefaultedFieldHeldAsNullReadsItsDefault() async throws {
         let client = try await client()
         try storeWithout(client, id: "c4", ["rank": .null, "note": .string("c4")])
         XCTAssertEqual(try stored(client, id: "c4")["rank"], .null)
         let reads = try reads(client, id: "c4")
         XCTAssertEqual(reads.map(\.0), ["find", "query", "findByUnique", "record"])
         for (path, read) in reads {
-            XCTAssertNil(read, path)
+            XCTAssertEqual(try XCTUnwrap(read, path).rank, 1, path)
         }
     }
 
-    // MARK: - Clearing a field the record does not hold
+    // MARK: - Assigning nil to a defaulted shared enum (#6304)
 
-    /// A field read as its default and then cleared is stored as `null`, so
-    /// the next read is `nil` on every path, not the default again; js-bao
-    /// writes a touched field with no value as `null` too. A defaulted field
-    /// the save left alone is still not written.
-    func testClearingAFieldReadAsItsDefaultStoresNull() async throws {
+    /// A ref'd field with a default reads its default when it holds no
+    /// value, so its typed accessor takes `nil` as a required one does: the
+    /// stored string is left as it is and nothing is marked changed. A
+    /// defaulted field the save left alone is still not written.
+    func testAssigningNilToADefaultedSharedEnumLeavesItsValue() async throws {
         let client = try await client()
-        try storeWithout(client, id: "c6", ["note": .string("c6")])
+        try storeWithout(client, id: "c6", ["note": .string("c6"), "phase": .string("closed")])
         var card = try XCTUnwrap(EnumCardRecord(record: try record(client, id: "c6")))
         XCTAssertEqual(card.points, 3)
-        XCTAssertEqual(card.phase, .open)
-        card.points = nil
+        XCTAssertEqual(card.phase, .closed)
         card.phase = nil
-        XCTAssertEqual(card._changedFields, ["points", "phase"])
+        XCTAssertEqual(card.phase, .closed)
+        XCTAssertEqual(card.phaseRaw, "closed")
+        XCTAssertEqual(card._changedFields, [])
+        card.phase = .open
+        XCTAssertEqual(card._changedFields, ["phase"])
         _ = try card.save(in: Self.db3Id)
         let row = try stored(client, id: "c6")
-        XCTAssertEqual(row["points"], .null, "the clear is stored")
-        XCTAssertEqual(row["phase"], .null, "the clear is stored")
+        XCTAssertEqual(row["phase"], .string("open"))
         XCTAssertNil(row["title"], "a defaulted field the save did not assign is not written")
-        for (path, read) in try reads(client, id: "c6") {
-            let read = try XCTUnwrap(read, path)
-            XCTAssertNil(read.points, path)
-            XCTAssertNil(read.phase, path)
-            XCTAssertNil(read.phaseRaw, path)
-            XCTAssertEqual(read.title, "Untitled", path)
-            XCTAssertEqual(read.rank, 1, path)
-        }
+        XCTAssertNil(row["points"], "a defaulted field the save did not assign is not written")
     }
 
     // MARK: - A captured row
@@ -256,7 +254,7 @@ final class DefaultedFieldReadHermeticTests: XCTestCase {
                 XCTAssertEqual(card.title, "Untitled", "\(when), \(path)")
                 XCTAssertEqual(card.rank, 1, "\(when), \(path)")
                 XCTAssertEqual(card.phase, .open, "\(when), \(path)")
-                XCTAssertNil(card.points, "\(when), \(path): a stored null is not filled")
+                XCTAssertEqual(card.points, 3, "\(when), \(path): a stored null reads the default")
             }
         }
         try check("with the reading client as the default")
@@ -361,7 +359,7 @@ final class DefaultedFieldReadHermeticTests: XCTestCase {
     /// A record a query includes is the parent's db3's, so a model built
     /// from it reads its defaults as one read directly does: a field it does
     /// not hold reads the default (a required one too, so the included model
-    /// is not dropped), and a field held as `null` reads `nil`. This holds for
+    /// is not dropped), and so does a scalar field held as `null`. This holds for
     /// `refersTo` and `hasMany` legs and for a nested include.
     func testAnIncludedRecordReadsItsDefaultsAsADirectReadDoes() async throws {
         let client = try await client()
@@ -397,8 +395,8 @@ final class DefaultedFieldReadHermeticTests: XCTestCase {
         try checkFilled(children.first, "hasMany")
 
         let next = try XCTUnwrap(linked?.related.one("next", as: EnumCardRecord.self), "nested")
-        XCTAssertNil(next.points, "nested: a field held as null is not filled")
-        XCTAssertNil(next.phase, "nested: a field held as null is not filled")
+        XCTAssertEqual(next.points, 3, "nested: a scalar field held as null reads its default")
+        XCTAssertEqual(next.phase, .open, "nested: a scalar field held as null reads its default")
         XCTAssertEqual(next.title, "Untitled", "nested")
         XCTAssertEqual(next.rank, 1, "nested")
     }
@@ -432,15 +430,18 @@ final class DefaultedFieldReadHermeticTests: XCTestCase {
     /// A card's fields as the fixture writes a read: empty as `null`, `phase`
     /// as its stored string, `tags` as its sorted members.
     private func parityReads(_ card: EnumCardRecord) -> [String: JSONValue] {
-        [
-            "title": card.title.map(JSONValue.string) ?? .null,
-            "points": card.points.map(JSONValue.number) ?? .null,
-            "ratio": card.ratio.map(JSONValue.number) ?? .null,
-            "done": card.done.map(JSONValue.bool) ?? .null,
-            "phase": card.phaseRaw.map(JSONValue.string) ?? .null,
+        func string(_ value: String?) -> JSONValue { value.map(JSONValue.string) ?? .null }
+        func number(_ value: Double?) -> JSONValue { value.map(JSONValue.number) ?? .null }
+        func bool(_ value: Bool?) -> JSONValue { value.map(JSONValue.bool) ?? .null }
+        return [
+            "title": string(card.title),
+            "points": number(card.points),
+            "ratio": number(card.ratio),
+            "done": bool(card.done),
+            "phase": string(card.phaseRaw),
             "rank": .number(card.rank),
             "tags": .array((card.tags ?? []).sorted().map(JSONValue.string)),
-            "note": card.note.map(JSONValue.string) ?? .null,
+            "note": string(card.note),
         ]
     }
 
@@ -497,12 +498,11 @@ final class DefaultedFieldReadHermeticTests: XCTestCase {
 
     // MARK: - Y.Map documents
 
-    /// On a Y.Map (format 1) document js-bao's getter returns what the
-    /// record's map holds, with no default for a field it lacks, and a
-    /// cleared field is removed from the map, so a missing key may be one a
-    /// client cleared. The generated model reads such a record as js-bao
-    /// does: the stored value, or `nil`.
-    func testAYMapRecordReadsWhatItsMapHolds() throws {
+    /// On a Y.Map (format 1) document js-bao's getter answers a scalar
+    /// field's literal default where the record's map has no value of its
+    /// kind (#6304), and the generated model reads such a record the same
+    /// way: the stored value, or the default.
+    func testAYMapRecordReadsWhatItsMapHoldsOrTheDefault() throws {
         SchemaSync.clearCache()
         let doc = YDocument()
         var plain = Self.schema
@@ -516,12 +516,12 @@ final class DefaultedFieldReadHermeticTests: XCTestCase {
         _ = try writer.create(id: "y2", values: ["rank": .number(2), "points": .number(8)])
         let model = DynamicModel(doc: doc, schema: Self.schema)
         let lacking = try XCTUnwrap(EnumCardRecord(record: try XCTUnwrap(model.find(id: "y1"))))
-        XCTAssertNil(lacking.points)
-        XCTAssertNil(lacking.title)
+        XCTAssertEqual(lacking.points, 3)
+        XCTAssertEqual(lacking.title, "Untitled")
         let holding = try XCTUnwrap(EnumCardRecord(record: try XCTUnwrap(model.find(id: "y2"))))
         XCTAssertEqual(holding.points, 8)
         let rows = try model.query(nil)
-        XCTAssertNil(EnumCardRecord(row: try XCTUnwrap(rows.first { $0["id"]?.stringValue == "y1" }))?.points)
+        XCTAssertEqual(EnumCardRecord(row: try XCTUnwrap(rows.first { $0["id"]?.stringValue == "y1" }))?.points, 3)
         XCTAssertEqual(EnumCardRecord(row: try XCTUnwrap(rows.first { $0["id"]?.stringValue == "y2" }))?.points, 8)
     }
 }

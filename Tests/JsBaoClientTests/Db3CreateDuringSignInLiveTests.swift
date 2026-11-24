@@ -59,9 +59,10 @@ final class Db3CreateDuringSignInLiveTests: XCTestCase {
             // the socket connects as the new user meanwhile.
             let hold = CloseHold()
             hold.install(x)
+            // Opened on every way out, so a teardown's close never waits on it.
+            defer { hold.release.open() }
             x.updateToken(member.jwt, cause: "otpVerify")
-            let rebind = Task { await x.rebindUserScopedStorage() }
-            await hold.reached.wait()
+            try await settles(within: 15, "the sign-in's own rebind reaching the close (run \(run))") { await hold.reached.wait() }
             try await x.connect()
             try await waitForConnection(client: x, timeout: 10)
 
@@ -69,7 +70,7 @@ final class Db3CreateDuringSignInLiveTests: XCTestCase {
             try await Task.sleep(nanoseconds: 200_000_000)
             hold.release.open()
             x.db3CloseHoldForTest = nil
-            try await settles(within: 15, "the rebind (run \(run))") { _ = await rebind.value }
+            try await settles(within: 15, "the rebind (run \(run))") { await x.rebindUserScopedStorage() }
             let info = try await create.value
 
             let subscription = try x.db3.subscribe(info.id)
@@ -97,14 +98,15 @@ final class Db3CreateDuringSignInLiveTests: XCTestCase {
 
         let hold = CloseHold()
         hold.install(x)
+        // Opened on every way out, so a teardown's close never waits on it.
+        defer { hold.release.open() }
         x.updateToken(member.jwt, cause: "otpVerify")
-        let rebind = Task { await x.rebindUserScopedStorage() }
-        await hold.reached.wait()
+        try await settles(within: 15, "the sign-in's own rebind reaching the close") { await hold.reached.wait() }
         let create = Task { try await x.db3.create(title: "scratch", localOnly: true) }
         try await Task.sleep(nanoseconds: 200_000_000)
         hold.release.open()
         x.db3CloseHoldForTest = nil
-        try await settles(within: 15, "the rebind") { _ = await rebind.value }
+        try await settles(within: 15, "the rebind") { await x.rebindUserScopedStorage() }
         let info = try await create.value
         XCTAssertEqual(info.localOnly, true)
 
@@ -136,18 +138,17 @@ final class Db3CreateDuringSignInLiveTests: XCTestCase {
 
         let hold = CloseHold()
         hold.install(x)
+        // Opened on every way out, so a teardown's close never waits on it.
+        defer { hold.release.open() }
         x.updateToken(member.jwt, cause: "otpVerify")
-        let rebind = Task { await x.rebindUserScopedStorage() }
-        await hold.reached.wait()
+        try await settles(within: 15, "the sign-in's own rebind reaching the close") { await hold.reached.wait() }
         let create = Task { try await x.db3.create(title: "member's \(name)", localOnly: localOnly) }
         try await eventually(timeout: 10, description: "the create waiting for the release") { x.db3IdentityRelease.waiting > 0 }
 
         x.updateToken(further.jwt, cause: "otpVerify")
-        let furtherRebind = Task { await x.rebindUserScopedStorage() }
         hold.release.open()
         x.db3CloseHoldForTest = nil
-        try await settles(within: 15, "the member's rebind") { _ = await rebind.value }
-        try await settles(within: 15, "the further user's rebind") { _ = await furtherRebind.value }
+        try await settles(within: 15, "both rebinds") { await x.rebindUserScopedStorage() }
         try await settles(within: 15, "the overtaken create") { _ = try? await create.value }
         let error: Error?
         do { _ = try await create.value; error = nil } catch let caught { error = caught }

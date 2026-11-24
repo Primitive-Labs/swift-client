@@ -1,0 +1,153 @@
+{
+  "description": "The db3 tag rule (#6371): 1 to 48 characters, each an ASCII letter, a digit, _ or -, and not __ROOT_TAG__. Each row is a tag exactly as given and whether a db3 add or create accepts it. The server check, the JS client, CLI and Swift client mirrors all read this file.",
+  "rows": [
+    {
+      "tag": "a",
+      "valid": true
+    },
+    {
+      "tag": "team_a-1",
+      "valid": true
+    },
+    {
+      "tag": "A",
+      "valid": true
+    },
+    {
+      "tag": "Z9",
+      "valid": true
+    },
+    {
+      "tag": "0",
+      "valid": true
+    },
+    {
+      "tag": "_",
+      "valid": true
+    },
+    {
+      "tag": "-",
+      "valid": true
+    },
+    {
+      "tag": "...",
+      "valid": false
+    },
+    {
+      "tag": "snake_case",
+      "valid": true
+    },
+    {
+      "tag": "kebab-case",
+      "valid": true
+    },
+    {
+      "tag": "MixedCase42",
+      "valid": true
+    },
+    {
+      "tag": "__root_tag__",
+      "valid": true
+    },
+    {
+      "tag": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "valid": true
+    },
+    {
+      "tag": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "valid": false
+    },
+    {
+      "tag": "",
+      "valid": false
+    },
+    {
+      "tag": " ",
+      "valid": false
+    },
+    {
+      "tag": " x ",
+      "valid": false
+    },
+    {
+      "tag": "x ",
+      "valid": false
+    },
+    {
+      "tag": " x",
+      "valid": false
+    },
+    {
+      "tag": "my tag",
+      "valid": false
+    },
+    {
+      "tag": "a.b",
+      "valid": false
+    },
+    {
+      "tag": ".",
+      "valid": false
+    },
+    {
+      "tag": "..",
+      "valid": false
+    },
+    {
+      "tag": "é",
+      "valid": false
+    },
+    {
+      "tag": "✓",
+      "valid": false
+    },
+    {
+      "tag": "100%",
+      "valid": false
+    },
+    {
+      "tag": "a/b",
+      "valid": false
+    },
+    {
+      "tag": "a#b",
+      "valid": false
+    },
+    {
+      "tag": "a:b",
+      "valid": false
+    },
+    {
+      "tag": "src:doc-1",
+      "valid": false
+    },
+    {
+      "tag": "tab\tx",
+      "valid": false
+    },
+    {
+      "tag": "line\n",
+      "valid": false
+    },
+    {
+      "tag": "\nline",
+      "valid": false
+    },
+    {
+      "tag": "Ａ",
+      "valid": false
+    },
+    {
+      "tag": "__ROOT_TAG__",
+      "valid": false
+    },
+    {
+      "tag": "a+b",
+      "valid": false
+    },
+    {
+      "tag": "a~b",
+      "valid": false
+    }
+  ]
+}

@@ -55,6 +55,7 @@ extension JsBaoClient {
             typeOpens: { [weak self] id, type in self?.db3KnownTypes.opens(id, type: type) ?? true },
             isKnownType: { [weak self] type in self?.db3KnownTypes.isKnown(type) ?? true },
             allowUnknownType: { [weak self] id in self?.db3KnownTypes.allow(id) },
+            localTypeStanding: { [weak self] id in self?.recordLogBinding(id)?.localTypeStanding },
             logger: logger
         )
     }
@@ -258,12 +259,16 @@ extension JsBaoClient {
     /// keep it creates nothing: the call throws the storage's refusal. Made
     /// during an identity change, it is kept once the change settled, unless
     /// the change signed the caller out.
-    func createLocalOnlyDb3(_ db3Id: String, title: String, tags: [String]?, metadata: JSONValue?) async throws -> Db3Info {
+    ///
+    /// `type` (#6025), a type the build carries local-only declarations for,
+    /// is kept on the metadata row and its declarations are installed in the
+    /// store with the local-only mark.
+    func createLocalOnlyDb3(_ db3Id: String, title: String, tags: [String]?, metadata: JSONValue?, type: String? = nil) async throws -> Db3Info {
         let userId = try await db3CreateUserSettled()
         if let refusal = await db3StorageRefusal(db3Id) { throw refusal }
         let entry = try await documentManager.createLocalDocument(
             documentId: db3Id, title: title, localOnly: true, tags: tags, docMetadata: metadata,
-            documentFormat: RecordLogTransport.documentFormat, db3Create: true
+            documentFormat: RecordLogTransport.documentFormat, db3Create: true, db3Type: type
         )
         noteDb3(db3Id)
         do {
@@ -282,7 +287,7 @@ extension JsBaoClient {
         let createdAt = entry.createdAt ?? ISO8601DateFormatter().string(from: Date())
         return Db3Info(
             id: db3Id, title: title, createdBy: userId, createdAt: createdAt, modifiedAt: createdAt, custodian: "user:\(userId)",
-            sync: false, type: nil, tags: tags ?? [], metadata: metadata, permission: nil, accessSource: nil, grantedAt: nil,
+            sync: false, type: type, tags: tags ?? [], metadata: metadata, permission: nil, accessSource: nil, grantedAt: nil,
             localOnly: true
         )
     }
@@ -323,7 +328,7 @@ extension JsBaoClient {
         let now = ISO8601DateFormatter().string(from: Date())
         return Db3Info(
             id: db3Id, title: title, createdBy: userId, createdAt: meta?.createdAt ?? now, modifiedAt: now,
-            custodian: "user:\(userId)", sync: false, type: nil, tags: meta?.tags ?? [], metadata: meta?.docMetadata,
+            custodian: "user:\(userId)", sync: false, type: meta?.db3Type.flatMap { $0.isEmpty ? nil : $0 }, tags: meta?.tags ?? [], metadata: meta?.docMetadata,
             permission: nil, accessSource: nil, grantedAt: nil, localOnly: true
         )
     }
@@ -547,9 +552,10 @@ extension JsBaoClient {
     func db3PermissionOf(_ documentId: String) -> Db3Permission? {
         let meta = documentManager.getLocalMetadata(documentId)
         switch meta?.lastKnownPermission ?? meta?.permission {
-        case "owner": return .owner
-        case "admin": return .admin
-        case "read-write": return .readWrite
+        // A stored `admin` (no answer sends it) reads as `owner`, and the
+        // legacy `write` / `read` as `read-write` / `reader`, as the JS client does.
+        case "owner", "admin": return .owner
+        case "read-write", "write": return .readWrite
         case "reader", "read": return .reader
         default: return nil
         }
@@ -558,7 +564,8 @@ extension JsBaoClient {
     /// A bound db3's marks, read from its store now; `nil` until its models
     /// are attached to the binding, when no query can read it yet, and while
     /// the binding is the previous user's (another user's token was applied
-    /// and `rebindUserScopedStorage()` has not released it yet).
+    /// and the client's rebind of its user-scoped storage has not released it
+    /// yet).
     func db3SyncMarks(_ documentId: String) -> Db3SyncMarks? {
         guard !db3IdentityOutgoing,
               let binding = recordLogBinding(documentId), !binding.isClosed, binding.attached else { return nil }
@@ -683,8 +690,8 @@ extension JsBaoClient {
     }
 
     /// Whether the db3s bound here are a previous user's: the signed-in user
-    /// is not the one the user-scoped storage was bound for, and
-    /// `rebindUserScopedStorage()` has not run since.
+    /// is not the one the user-scoped storage was bound for, and the client's
+    /// rebind of it has not run since.
     var db3IdentityOutgoing: Bool {
         let scoped = documentManager.userId
         guard !scoped.isEmpty, let signedIn = authController.getUserId(), !signedIn.isEmpty else { return false }

@@ -37,9 +37,10 @@ public final class Db3IngestsAPI: @unchecked Sendable {
         self.awaitCreate = awaitCreate
     }
 
-    private func path(_ db3Id: String, _ sessionId: String? = nil, _ verb: String? = nil) -> String {
-        var path = "/db3/\(URLEncoding.encodeComponent(db3Id))/ingest"
-        if let sessionId { path += "/\(URLEncoding.encodeComponent(sessionId))" }
+    private func path(_ db3Id: String, _ sessionId: String? = nil, _ verb: String? = nil) throws -> String {
+        let db3 = try URLEncoding.pathSegment(db3Id, name: "db3Id")
+        var path = "/db3/\(db3)/ingest"
+        if let sessionId { path += "/\(try URLEncoding.pathSegment(sessionId, name: "sessionId"))" }
         if let verb { path += "/\(verb)" }
         return path
     }
@@ -88,11 +89,12 @@ public final class Db3IngestsAPI: @unchecked Sendable {
         sessionId: String,
         chunk: DocumentIngestChunk
     ) async throws -> DocumentIngestChunkUploadResult {
+        let target = try path(db3Id, sessionId, "chunks")
         try await awaitCreate(db3Id)
         let boundary = DocumentIngestMultipart.boundary()
         return try await transport.request(
             method: .post,
-            path: path(db3Id, sessionId, "chunks"),
+            path: target,
             bodyData: DocumentIngestMultipart.body(chunk: chunk, boundary: boundary),
             options: DocumentIngestMultipart.options(boundary: boundary)
         )
@@ -105,8 +107,9 @@ public final class Db3IngestsAPI: @unchecked Sendable {
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     /// - Stability: beta
     public func commit(db3Id: String, sessionId: String) async throws -> DocumentIngestSession {
+        let target = try path(db3Id, sessionId, "commit")
         try await awaitCreate(db3Id)
-        return try await transport.request(method: .post, path: path(db3Id, sessionId, "commit"))
+        return try await transport.request(method: .post, path: target)
     }
 
     /// Give up on a session and sweep what it uploaded. A session that has
@@ -116,8 +119,9 @@ public final class Db3IngestsAPI: @unchecked Sendable {
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     /// - Stability: beta
     public func abort(db3Id: String, sessionId: String) async throws -> DocumentIngestSession {
+        let target = try path(db3Id, sessionId, "abort")
         try await awaitCreate(db3Id)
-        return try await transport.request(method: .post, path: path(db3Id, sessionId, "abort"))
+        return try await transport.request(method: .post, path: target)
     }
 
     /// One session's state and progress.
@@ -126,8 +130,9 @@ public final class Db3IngestsAPI: @unchecked Sendable {
     /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
     /// - Stability: beta
     public func get(db3Id: String, sessionId: String) async throws -> DocumentIngestSession {
+        let target = try path(db3Id, sessionId)
         try await awaitCreate(db3Id)
-        return try await transport.request(method: .get, path: path(db3Id, sessionId))
+        return try await transport.request(method: .get, path: target)
     }
 
     /// A db3's bulk-load sessions, newest first.

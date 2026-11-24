@@ -1,0 +1,10 @@
+{
+  "journal6025": {
+    "hash": "4a297f2a90c8fe394830bd0798d8af49b9bb53338a51521942767de5094b2e19",
+    "modelsJSON": "{\"entry6025\":{\"cleared\":[\"legacy\",\"old\"],\"constraints\":{\"title_due\":{\"fields\":[\"title\",\"due\"],\"type\":\"unique\"}},\"fields\":{\"due\":{\"default\":\"2026-01-01\",\"type\":\"date\"},\"embedding\":{\"dims\":3,\"element\":\"f32\",\"type\":\"vector\"},\"status\":{\"default\":\"open\",\"enforceEnum\":true,\"enum\":[\"open\",\"doing\",\"done\"],\"type\":\"string\"},\"title\":{\"indexed\":true,\"required\":true,\"type\":\"string\"},\"weight\":{\"default\":1.5,\"type\":\"number\"}}},\"tag6025\":{\"fields\":{\"label\":{\"indexed\":true,\"type\":\"string\"}}}}"
+  },
+  "ledger6025": {
+    "hash": "631f002254949082d2939b0b1e77ed3ec9c001f4f34025a8efb4bc41dca5f004",
+    "modelsJSON": "{\"line6025\":{\"cleared\":[\"memo\"],\"fields\":{\"code\":{\"maxLength\":12,\"type\":\"string\",\"unique\":true},\"count\":{\"default\":3,\"type\":\"number\"},\"cutoff\":{\"default\":\"23:59:58.000\",\"type\":\"string\"},\"huge\":{\"default\":1e+21,\"type\":\"number\"},\"id\":{\"autoAssign\":true,\"type\":\"id\"},\"note\":{\"default\":\"tab\\there\\u0001é\",\"type\":\"string\"},\"ok\":{\"default\":false,\"type\":\"boolean\"},\"postedAt\":{\"default\":\"2026-03-04T05:06:07.250\",\"type\":\"date\"},\"settledAt\":{\"default\":\"2026-03-04T05:06:07.000+02:30\",\"type\":\"date\"},\"small\":{\"default\":0.000001,\"type\":\"number\"},\"tags\":{\"default\":[\"a\",\"b\\\"c\"],\"maxCount\":4,\"type\":\"stringset\"},\"tiny\":{\"default\":1e-7,\"type\":\"number\"},\"touchedAt\":{\"autoStamp\":\"update\",\"type\":\"date\"},\"wide\":{\"default\":123456789012345.6,\"type\":\"number\"}}}}"
+  }
+}

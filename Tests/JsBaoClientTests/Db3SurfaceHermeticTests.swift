@@ -76,7 +76,8 @@ final class Db3SurfaceHermeticTests: XCTestCase {
         )
         let permission = try ClientSourceText.slice(api, from: "permission: \"reader\"", to: ";")
         XCTAssertEqual(
-            [Db3Permission.reader, .readWrite, .owner, .admin, .refused].map(\.rawValue),
+            // `admin` is deprecated in Swift and gone from the JS union (#6309).
+            [Db3Permission.reader, .readWrite, .owner, .refused].map(\.rawValue),
             ["reader"] + quoted(permission)
         )
         XCTAssertEqual(Db3RowsEvent.Origin.allCases.map(\.rawValue), ["local", "remote", "sibling"])
@@ -176,12 +177,13 @@ final class Db3SurfaceHermeticTests: XCTestCase {
         let _: (Data, BlobUploadSourceOptions) async throws -> BlobUploadFileResult = blobs.uploadFile(data:options:)
         let _: (Int?, String?) async throws -> DocumentBlobListResult = blobs.list(limit:cursor:)
         let _: (String) async throws -> BlobInfo = blobs.get(blobId:)
-        let _: (String, BlobDisposition?, String?) -> String = blobs.downloadUrl(blobId:disposition:attachmentFilename:)
+        // #6371: throws `.invalidArgument` for a db3 or blob id of exactly `.` or `..`.
+        let _: (String, BlobDisposition?, String?) throws -> String = blobs.downloadUrl(blobId:disposition:attachmentFilename:)
         let _: (String) async throws -> BlobDeleteResult = blobs.delete(blobId:)
         let _: (String, Bool, BlobDisposition?) async throws -> Data = blobs.read(blobId:force:disposition:)
         let _: (String, String.Type, Bool, BlobDisposition?) async throws -> String = blobs.read(blobId:as:force:disposition:)
         let _: (String, [String].Type, Bool, BlobDisposition?) async throws -> [String] = blobs.read(blobId:as:force:disposition:)
-        let _: ([String], Int) async -> Void = blobs.prefetch(blobIds:concurrency:)
+        let _: ([String], Int) async throws -> Void = blobs.prefetch(blobIds:concurrency:)
         let _: () async -> [BlobUploadStatus] = blobs.uploadsAsync
         let _: (String) async -> Bool = blobs.pauseUploadAsync(blobId:)
         let _: (String) async -> Bool = blobs.resumeUploadAsync(blobId:)

@@ -20,6 +20,298 @@ true: the mirror has no tags. Corrected in #2367.)
 
 ## Unreleased
 
+### Changed (breaking): db3 tags follow one rule, and db3 paths refuse `.` and `..` (beta)
+
+A db3 tag is 1 to 48 characters, each one of `A-Z`, `a-z`, `0-9`, `_` and
+`-`, taken exactly as given, and is not `__ROOT_TAG__`. `client.db3.create`
+(both overloads, `localOnly: true` included) and `getOrCreateWithAlias` throw
+`.invalidArgument` (`details["tag"]`) for any other tag before any request;
+the server answers a db3 add or create carrying one `400 INVALID_TAG`. Tags a
+db3 already carries still read, list and filter.
+
+Every `client.db3` call, the db3 blob context and the index-model calls throw
+`.invalidArgument` (`details["parameter"]`) when an id, name or key is exactly
+`.` or `..`, before any request, queued upload or cache change: as a path
+segment it would reach another route. `Db3BlobContext.downloadUrl(blobId:…)`
+now `throws`, and `Db3BlobContext.prefetch(blobIds:concurrency:)` is now
+`async throws`, so a call to either needs `try`.
+
+Migration: add `try` before `downloadUrl` and before `prefetch` on a db3 blob
+context; rename a tag that breaks the rule (remove it, then add the new one).
+Document tags are unchanged.
+### Fixed: every change of user rebinds the local storage
+
+A process launched with one user's session, signed out and signed in as
+another user, used to keep its storage bound to the first user, so every
+`client.db3.subscribe(...).available()` of the new user waited until a
+relaunch. The client now rebinds its user-scoped storage itself on every
+token change that switches the user, as the JS client does: an interactive
+sign-in (`otpVerify`, `magicLinkVerify`, passkey, OAuth and Apple sign-in,
+`handleSignInCallback`), `updateToken(_:cause:)` and a sign-out alike.
+
+- The interactive sign-ins return once the rebind ran, so a subscription made
+  right after one is the new user's, also when the sign-in lands while the
+  client is still starting.
+- After `updateToken` of another user, a db3 subscription made right away is
+  the new user's: it opens once the rebind ran. This holds also on a client
+  started signed out, and while that client is still starting. The
+  subscriptions made before the change end with `DB3_DISPOSED`
+  (`identity-changed`), as before.
+- A token cleared other than by `logout()` (`updateToken(nil)` whatever cause
+  it names, a rejected refresh) releases the previous user's db3s, as
+  `logout()` does.
+- Users changing in quick succession (A, then B, then C) leave the storage
+  bound to the latest user: the rebinds run in order, and an older one never
+  binds its user over a newer one's.
+- `rebindUserScopedStorage()` is no longer needed. Calling it is harmless: it
+  waits for the rebind in progress and does nothing more.
+### Added: delete or patch the db3 records matching a filter
+
+`client.db3.deleteWhere(_:model:filter:limit:cursor:requestId:)` deletes the
+records of one model that match a query filter, and
+`client.db3.patchWhere(_:model:filter:data:limit:cursor:requestId:)` merges
+one `data` object into them, in beta. Each call changes up to `limit` records
+(1,000 by default and at most) in id order as one write, under the rules a
+single write meets, and answers a `Db3WriteWhereResult` with `changed`,
+`hasMore` and a `nextCursor` to pass back as `cursor`. A page whose write would
+pass 1 MiB is cut short with `cutBy == "entryBytes"`, and one whose stored
+records would pass 16 MiB with `cutBy == "rowBytes"`.
+
+```swift
+var cursor: String?
+repeat {
+    let page = try await client.db3.deleteWhere(db3Id, model: "Txn", filter: ["accountId": .string(accountId)], cursor: cursor)
+    cursor = page.nextCursor
+} while cursor != nil
+```
+
+### Breaking: a field with a default is non-optional in generated models
+
+A `string`, `number`, `boolean`, `date` or `id` field that declares a literal
+`default` is now a non-optional property, and every read answers the default
+where the stored record has no value of the field's kind:
+
+```toml
+[models.institution.fields.disconnectPending]
+type = "boolean"
+default = false
+```
+
+```swift
+let pending: Bool = institution.disconnectPending   // was Bool?
+```
+
+- `init?(record:)`, `init?(row:)` and `init(from:)` read the default when the
+  record or the JSON lacks the field, holds `null`, or holds a value of another
+  kind (`"5"` in a number field, `1` in a boolean field, a string that is not
+  an ISO date in a date field). The kind is judged as stored, before any
+  conversion, so a stored `1` in a boolean field that used to read `true` on
+  a db3 now reads the default. On a Y.Map document a stored `0` or `1` in a
+  boolean field still reads `false` or `true`, and any other number reads the
+  default. A query row reads as its record does: a Y.Map row lists, under
+  `_meta_stored`, a stored value its columns hold converted (another number
+  in a boolean field, an epoch number in a date field). `init(from:)` no
+  longer throws for such a field.
+- The read stores nothing. A stored `null` stays `null`, and a filter on the
+  default (`{ done: false }`) still does not match a record that only reads it.
+- A field without a default, a generator default (`"$now"`), a string default
+  that starts with `$` (an escaped `"$$..."` included), a string set's default
+  and a JSON field keep their optional types and reads.
+- A ref'd field with a default has a non-optional `<field>Raw`. Its typed
+  accessor stays optional, and assigning `nil` to it leaves the value as it is.
+- Both initializers keep the parameter as `T? = nil`. Leaving it out, or
+  passing `nil`, stores the default, and a create saved from that value writes
+  it.
+- A `date` default is read whole, as the web client and the server read it:
+  `"2026-04-05 13:14:15Z"` is that instant, no longer midnight, and a default
+  with text after its date (`"2026-04-05 1:00 PM"`) is no date literal, so
+  its field stays optional.
+
+#### Migrating
+
+- **Unwraps stop compiling.** `if let`, `guard let`, `!` and `?.` on such a
+  property are compile errors, and `??` warns. Drop them:
+  `institution.baseCurrency ?? "USD"` becomes `institution.baseCurrency`.
+- **Assigning `nil` stops compiling.** A typed write can no longer store
+  `null` in such a field. Write the default, or a value, instead. The
+  record's `subscript` (`record["field"] = nil`) still stores `null`, which
+  reads as the default.
+- **A default the model supplied is never written over a record.** When a
+  value was read without the field, decoded from JSON that lacked it, or built
+  with the parameter left out, saving it over an existing record leaves that
+  record's stored value as it was. The model lists such fields in
+  `_suppliedDefaults`, and `primitiveValues()` leaves them out, a required
+  field included, so `save(in:upsertOn:)` on a unique key the model supplied
+  is refused as a missing key instead of matching the record that holds the
+  default. Assigning the field makes the value yours. `markAllChanged()` is an explicit whole-record
+  write, so it writes every field the value carries, a supplied default
+  included.
+- **Clear a field in two steps.** A build generated while a field had a
+  default does not build records (`init?(record:)` and `init?(row:)` answer
+  `nil`) from a db3 that holds a clear of that field. The server refuses a
+  push that clears a field with a default (`cleared-field-defaulted`). Push
+  the field without its `default`, ship the build generated from that, and
+  only then clear it.
+
+### Breaking: permission levels in results are enums
+
+A result that carried a permission level as `String` now reads it as an enum
+with the levels the server sends, and an `.unknown` case that keeps a level this
+client does not know instead of failing the decode:
+
+```swift
+for grant in try await client.documents.listGroupPermissions(documentId: documentId) {
+    switch grant.permission {
+    case .readWrite: print("\(grant.groupId) can edit")
+    case .reader: print("\(grant.groupId) can read")
+    case .unknown(let level): print("\(grant.groupId) holds \(level)")
+    }
+}
+```
+
+- `DocumentGrantLevel` (`.readWrite`, `.reader`): `DocumentGroupPermissionEntry`,
+  `DirectPermissionGrant`, `DeferredPermissionGrant`, `PendingInvitationEntry`,
+  `DeferredDocumentGrant` and `DocumentAccessRequest.requestedPermission` /
+  `grantedPermission`.
+- `DocumentAccessLevel` (`.owner`, `.readWrite`, `.reader`):
+  `GroupDocumentInfo.permission`, now optional because the server can send
+  `null`; `DocumentInfo.permission`, `DocumentPermissionEntry.permission` and
+  `DocumentAccessResult.permission` and `Db3Info.permission` (what `db3.get`
+  and `db3.listMine` answer), which were `DocumentPermission` (so they no
+  longer list `.admin`); and `CollectionDocumentInfo.permission`, as
+  `CollectionDocumentPermission` is now an alias of `DocumentAccessLevel`.
+- `DocumentLinkAccessLevel` (`.reader`, `.readWrite`) and the deprecated
+  `CollectionPermission` (`.reader`, `.readWrite`) gain the `.unknown` case, so
+  `DocumentInfo.linkAccess`, `LinkAccessResult.linkAccess` and the collection
+  results that carry `CollectionPermission` keep an unknown level too. Their
+  `init(rawValue:)` no longer returns an optional.
+- `DatabaseAccessLevel` (`.owner`, `.manager`): `GroupDatabaseInfo.permission`.
+- `CollectionAccessLevel` (`.reader`, `.readWrite`): the deprecated `permission`
+  of `CollectionGroupPermissionInfo`, `CollectionMemberInfo`,
+  `CollectionGroupMemberAdd` and `CollectionMemberEntry`.
+
+Read `.rawValue` for the wire string. `DocumentPermission.admin` and
+`Db3Permission.admin` are deprecated: no answer or event sends `admin`, and a
+db3 whose cached level is `admin` reports `.owner`.
+### Added: a db3 JSON field can be a list (beta)
+
+A db3 field may `ref` a `schemas/` list def (`type = "array"`), and the record
+stores the array itself as canonical JSON text (`["a","b"]`), with no wrapper
+object. `primitive functions codegen --lang swift` declares the def's type as a
+Swift array (`[String]`, or `[Address]` for items that ref an object def), and
+`swift-bao-codegen` types the model's property by it. A save validates the
+value against the def and throws `Db3JSONValueError` with kind `.schema` at
+the item's path (`value[1]`) when it does not match; a list def's binding
+refuses a value whose root is not an array with kind `.root`. Stored text
+whose root is not the def's kind reads `nil`, is logged once, and stays in
+`<field>Raw`. An app build older than this release reads a list field as
+`nil`.
+
+### Added: a db3 JSON field can be a map with typed values (beta)
+
+A `schemas/` def a db3 field refs may give `additionalProperties` a schema,
+such as `additionalProperties = { type = "number" }`. `primitive functions
+codegen --lang swift` declares the def's type as a dictionary
+(`[String: Double]`), or, beside declared `properties`, as a struct whose
+catch-all holds values of that type; a key `required` names that
+`properties` does not declare is a stored property of the value type. A save
+validates every undeclared key's value against the schema and throws
+`Db3JSONValueError` with kind `.schema` at `value.<key>` when it does not
+match.
+### Added: db3 blob batch delete and uploader in metadata (beta)
+
+`client.db3.blobs(db3Id).deleteBatch(blobIds:)` deletes up to 500 of a db3's
+blobs in one request and returns the new `Db3BlobBatchDeleteResult`
+(`deleted`, `blobIds`, `db3Id`). An id that is not a blob of the db3 is skipped
+and counted. Once the server accepts, a named upload queued for this db3 is
+cancelled and this db3's local copy of each id goes; a refused batch throws and
+changes nothing on the device.
+
+`client.db3.blobs(db3Id).delete(blobId:)` now cancels only an upload of the id
+queued for this db3, as the batch does. An upload of the id queued for another
+db3 stays queued; before, it was cancelled too.
+
+`BlobInfo` gains three optional fields: `createdBy` (the uploading member's
+user id; `nil` for a signed upload and for a document blob), `etag` (the tag
+the blob's download answers; `nil` for a document blob) and `status`.
+### Added: `client.db3.parallel(_:)` sends several db3 requests in one call (beta)
+
+`client.db3.parallel(_:)` sends up to 10 `.batch` and `.batchRead` requests,
+each on a different db3, in one round trip. They are separate requests, not one
+bigger batch: nothing is atomic or ordered between them, and each is authorized
+and answered as its single call is. Each result carries its `status` and its
+`answer`: `.batch`, `.batchRead`, or `.refused` with the error envelope, in its
+place.
+
+```swift
+let response = try await client.db3.parallel([
+    .batchRead(projects, [.query(model: "Project", limit: 20)]),
+    .batch(me, [.create(model: "Visit", data: ["at": 1])]),
+])
+```
+
+### Changed: `appVersion.onStatusChange` also fires on a policy change
+
+The handler is now called whenever what the client reports changes: the
+status, this platform's policy entry, or a server refusal. A raised `latest`
+that keeps the status at `updateAvailable` now reaches the handler with
+`.updateAvailable`, so a dismissed banner can come back for the newer version;
+read `getPolicy()` in the handler for the entry. A handler that assumed each
+call carries a different status from the last one should compare for itself.
+
+After a server refusal that comes within 60 seconds of the previous one, the
+client now waits 1 second before it refetches the policy (it was 5), doubling
+to at most 60. After 60 seconds with no refusal, the next refusal refetches at
+once.
+
+### Added: typed local-only databases
+
+- A db3 type whose file says `[type] allowLocalOnly = true` can type a db3
+  that lives only on this device:
+  `client.db3.create(title:type:localOnly: true)`. `swift-bao-codegen`
+  embeds the type's declarations and their hash in
+  `GeneratedModels.db3Types` (a new `PrimitiveDb3Types.LocalOnlyDeclarations`
+  and a `DeclaredType(name:archived:localOnly:)` initializer), and
+  `register(on:)` registers them. Nothing is sent; the answer and
+  `stored()` carry `type`. A type the build carries no such declarations
+  for is still refused `.localOnlyUnsupportedOption`; in a
+  `--known-types-only` build an unknown or archived type is refused
+  `.invalidArgument` (`unknown-type`) first. Codegen stops on an opted-in
+  type file that declares a trigger, `autoPopulatedFields` or `timestamps`.
+- Its writes, through generated models, transactions and `DocumentRecords`
+  alike, are judged on the device by the declarations it holds, with the
+  server's codes, at the commit; its constraints and declared indexes come
+  from them.
+- When a newer build opens it, the newer declarations are installed if they
+  only add and its records pass them. Otherwise nothing is installed and
+  `client.db3.state(id).error` is `DB3_TYPE_REFUSED` with `reasons`. An
+  older build keeps the installed declarations. A build whose declarations
+  diverged from them can read the db3, but its writes are refused
+  `.db3TypeRefused` (`details["diverged"]`); so is every write to a copy
+  whose declarations cannot be read (`details["unreadable"]`), until a build
+  that declares its type opens it.
+- When another client of the same store installs newer declarations, an
+  already-open client judges its next write by them at the commit, and its
+  next read leaves out the fields they clear. A write condition reads a
+  cleared field as unset. No index of any kind is registered over a field
+  the installed declarations clear (`.db3IndexInvalid`), and the db3's index
+  list changes only in the same store transaction as the declarations it
+  follows, so another client's install is never undone by an index change
+  made under older ones.
+- In a `knownTypesOnly` build, a typed local-only db3 whose type the build
+  was not generated with is refused `DB3_TYPE_UNKNOWN_TO_CLIENT`, as a
+  synced one is; `allowUnknownType` on subscribe opens it under its
+  installed declarations.
+- `JsBaoErrorCode` gains `.db3TypeRefused`; `Db3StateError` gains `reasons`
+  (`[Db3TypeRefusalReason]`) and an initializer that takes them.
+### Changed: a db3 batch carries up to 1000 operations
+
+`client.db3.batch` and `batchRead` now take up to 1000 operations in one call,
+where they took 100; past that the server refuses the call with
+`BATCH_TOO_LARGE`. The writes between two reads are still one entry of at most
+1 MiB of JSON, so a batch of larger records is refused first for its bytes,
+with `DOCUMENT_ENTRY_TOO_LARGE` (413).
+
 ### Added: typed filters, sorts and aggregate rows on generated models
 
 A model `swift-bao-codegen` writes now has `fields`, one token per field, and

@@ -1,8 +1,9 @@
 import Foundation
 
-/// When a refusal's fetch runs. The first refusal fetches at once. A refusal
-/// that follows a release within `window` waits `initialDelay`, doubling with
-/// each such refusal to at most `maxDelay`; a longer gap starts over.
+/// When a refusal's fetch runs, on the JavaScript client's schedule. The
+/// first refusal fetches at once. A refusal within `window` of the previous
+/// one waits `initialDelay`, doubling with each such refusal to at most
+/// `maxDelay`; a longer gap starts over.
 ///
 /// The bound exists because the policy route reads the app row directly while
 /// the server's refusal reads a cache that can be up to a minute stale: after
@@ -10,25 +11,22 @@ import Foundation
 /// refused again, and without a bound it would loop at network speed.
 struct RefusalFetchBackoff: Sendable {
     static let window: TimeInterval = 60
-    static let initialDelay: TimeInterval = 5
+    static let initialDelay: TimeInterval = 1
     static let maxDelay: TimeInterval = 60
 
-    private var lastReleaseAt: Date?
+    private var lastRefusalAt: Date?
     private var nextDelay = RefusalFetchBackoff.initialDelay
 
     /// The delay before the fetch of a refusal that arrives at `now`.
     mutating func delay(forRefusalAt now: Date) -> TimeInterval {
-        guard let lastReleaseAt, now.timeIntervalSince(lastReleaseAt) < Self.window else {
+        defer { lastRefusalAt = now }
+        guard let lastRefusalAt, now.timeIntervalSince(lastRefusalAt) < Self.window else {
             nextDelay = Self.initialDelay
             return 0
         }
         let delay = nextDelay
         nextDelay = min(nextDelay * 2, Self.maxDelay)
         return delay
-    }
-
-    mutating func noteRelease(at now: Date) {
-        lastReleaseAt = now
     }
 }
 
@@ -81,8 +79,11 @@ final class AppVersionController: @unchecked Sendable {
     private var policy: ClientVersionPolicyRecord?
     private var refused = false
     private var status: AppVersionStatus = .unknown
+    /// This platform's entry and the refusal as last reported, beside `status`.
+    private var reportedEntry: ClientPlatformVersions?
+    private var reportedRefused = false
     private var handlers: [UUID: Handler] = [:]
-    /// Status changes not yet delivered, in the order they were committed.
+    /// Reported changes not yet delivered, in the order they were committed.
     /// Drained by one thread at a time (`draining`), outside the lock.
     private var pendingChanges: [AppVersionStatus] = []
     private var draining = false
@@ -200,7 +201,8 @@ final class AppVersionController: @unchecked Sendable {
         return reportedStatus
     }
 
-    /// Call `handler` with each new status. Also an ask.
+    /// Call `handler` with the status each time the status, this platform's
+    /// entry or the refusal changes. Also an ask.
     func onStatusChange(_ handler: @escaping Handler) -> EventSubscription {
         let id = UUID()
         lock.withLock {
@@ -430,7 +432,6 @@ final class AppVersionController: @unchecked Sendable {
             )
             if refused, computed != .updateRequired {
                 refused = false
-                backoff.noteRelease(at: now())
                 release = onRelease ?? {}
             }
             publishLocked()
@@ -447,15 +448,21 @@ final class AppVersionController: @unchecked Sendable {
 
     // MARK: - Reporting
 
-    /// Commit the status to report now and, when it changed, queue the change
-    /// for delivery in this same critical section, so changes reach
-    /// subscribers in the order they were committed.
+    /// Commit what to report now (the status, this platform's entry and the
+    /// refusal) and, when any of it changed, queue the status for delivery in
+    /// this same critical section, so changes reach subscribers in the order
+    /// they were committed. The JavaScript client calls its listeners on the
+    /// same changes, so a raised `latest` that keeps the status reaches both.
     private func publishLocked() {
         let next: AppVersionStatus = refused
             ? .updateRequired
             : ClientVersionRules.clientVersionStatus(version: identity.version, platform: identity.platform, policy: policy)
-        guard next != status else { return }
+        // Without a version there is nothing to compare, so no entry is reported.
+        let entry = identity.version == nil ? nil : identity.platform.flatMap { policy?.clients[$0] }
+        guard next != status || entry != reportedEntry || refused != reportedRefused else { return }
         status = next
+        reportedEntry = entry
+        reportedRefused = refused
         pendingChanges.append(next)
     }
 

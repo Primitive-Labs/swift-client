@@ -76,11 +76,11 @@ final class RoleCompatBaseline4727HermeticTests: XCTestCase {
         let groupDocuments: [GroupDocumentInfo] = try await client.groups.listDocuments(
             groupType: "team", groupId: baseline
         )
-        _ = groupDocuments.first?.permission as String?
+        _ = groupDocuments.first?.permission as DocumentAccessLevel?
         let groupDatabases: [GroupDatabaseInfo] = try await client.groups.listDatabases(
             groupType: "team", groupId: baseline
         )
-        _ = groupDatabases.first?.permission as String?
+        _ = groupDatabases.first?.permission as DatabaseAccessLevel?
 
         let granted: DocumentGroupPermissionEntry = try await client.documents.grantGroupPermission(
             documentId: "doc-1",

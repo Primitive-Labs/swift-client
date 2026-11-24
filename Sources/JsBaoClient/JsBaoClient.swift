@@ -483,6 +483,11 @@ public final class JsBaoClient: @unchecked Sendable {
     /// socket, awaited with its id: a test holds an identity release while a
     /// subscribe or a sign-out races it. Internal; never set in production code.
     var db3CloseHoldForTest: (@Sendable (String) async -> Void)?
+    /// Test seam inside a rebind of the user-scoped storage, awaited with the
+    /// user it is binding once it has read them and before it applies
+    /// anything: a test holds one rebind while the user changes again.
+    /// Internal; never set in production code.
+    var userScopeRebindHoldForTest: (@Sendable (String) async -> Void)?
     /// The identity changes in progress, and the db3s each is releasing.
     let db3IdentityRelease = Db3IdentityRelease()
     /// Test seam told each time the client reads a db3's index list, with its
@@ -641,6 +646,35 @@ public final class JsBaoClient: @unchecked Sendable {
     /// through the internal init. Never set in production code.
     private let storageBindHoldForTest: (@Sendable () async -> Void)?
 
+    /// Test seam: awaited in `setupStorage()`'s task once the restored user is
+    /// bound and their stored db3s are bound, just before storage is marked
+    /// ready, so a test can hold the client in its "bound to the restored
+    /// user, not ready yet" window. Set only through the internal init. Never
+    /// set in production code.
+    private let storageReadyHoldForTest: (@Sendable () async -> Void)?
+
+    /// The rebinds of the user-scoped storage in progress, one per change of
+    /// signed-in user (`signedInUserChanged`), by id. Guarded by `lock`.
+    private var userScopeRebinds: [UUID: Task<Void, Never>] = [:]
+    /// The rebinds that finished before they were recorded in
+    /// `userScopeRebinds`. Guarded by `lock`.
+    private var userScopeRebindsFinishedEarly: Set<UUID> = []
+    /// How many times the user-scoped storage was bound to a user (start-up or
+    /// a rebind to another user). Guarded by `lock`.
+    private var userScopeBinds = 0
+    /// How many changes of signed-in user started a rebind. A rebind whose
+    /// change is no longer the latest leaves the work to the later one.
+    /// Guarded by `lock`.
+    private var userScopeChanges = 0
+    /// The latest rebind's storage step. Each one runs after the one before
+    /// it, so an older rebind never applies its user over a newer one's.
+    /// Guarded by `lock`.
+    private var userScopeRebindTail: Task<Bool, Never>?
+    /// Start-up began binding the user-scoped storage: a change of user from
+    /// now on is one the rebind applies, even to storage bound to nobody.
+    /// Guarded by `lock`.
+    private var userScopeStartupBindBegun = false
+
     // MARK: - Initialization
 
     /// Public entry point. Delegates to the internal designated init with no
@@ -656,12 +690,14 @@ public final class JsBaoClient: @unchecked Sendable {
     /// false no monitor is started (parity with the bundled consumer).
     /// `storageSetupHoldForTest` holds the storage setup task before it binds
     /// anything, and `storageBindHoldForTest` holds it after the provider is
-    /// attached and before the user is bound; tests only.
+    /// attached and before the user is bound, and `storageReadyHoldForTest`
+    /// holds it after the user is bound and before storage is ready; tests only.
     internal init(
         options: JsBaoClientOptions,
         connectivityMonitor injectedMonitor: ConnectivityMonitor?,
         storageSetupHoldForTest: (@Sendable () async -> Void)? = nil,
         storageBindHoldForTest: (@Sendable () async -> Void)? = nil,
+        storageReadyHoldForTest: (@Sendable () async -> Void)? = nil,
         bundleVersionForTest: (@Sendable () -> Any?)? = nil
     ) {
         // The version and platform this client reports, from its options, the
@@ -685,6 +721,7 @@ public final class JsBaoClient: @unchecked Sendable {
         self.options = options
         self.storageSetupHoldForTest = storageSetupHoldForTest
         self.storageBindHoldForTest = storageBindHoldForTest
+        self.storageReadyHoldForTest = storageReadyHoldForTest
         // The root every component's logger is scoped from, so a runtime
         // `setLogLevel(_:)` reaches all of them.
         let logger = createLogger(level: options.logLevel, scope: "JsBaoClient")
@@ -908,9 +945,19 @@ public final class JsBaoClient: @unchecked Sendable {
         // already reads the new user's epoch with every token it takes; this
         // ends the previous user's waits and transfers without waiting for
         // the queue's next step, whichever path changed the user.
+        //
+        // The user-scoped storage follows the signed-in user the same way,
+        // whichever path changed it (a sign-in, `updateToken`, a sign-out):
+        // without the rebind every db3 stays the previous user's and none
+        // opens until a relaunch. Every interactive sign-in waits for it
+        // before it returns.
         let blobManager = self.blobManager
-        authController.setIdentityChangedHandler {
+        authController.setIdentityChangedHandler { [weak self] _, byLogout in
             Task { await blobManager.syncIdentity() }
+            self?.signedInUserChanged(byLogout: byLogout)
+        }
+        authController.setSignedInHandler { [weak self] in
+            await self?.userScopeRebindsSettled()
         }
     }
 
@@ -6844,6 +6891,7 @@ public final class JsBaoClient: @unchecked Sendable {
             // HERE, before the auto-connect below, so the answer reaches the
             // first task rather than the second.
             await ensureReceiveLimitForKnownDocuments()
+            if let hold = storageReadyHoldForTest { await hold() }
 
             // Storage init is fully settled — token restored (or none) and
             // the user-scoped state (documentManager.userId + metadata)
@@ -6876,12 +6924,13 @@ public final class JsBaoClient: @unchecked Sendable {
     }
 
     /// Snapshot the current auth user into the user-scoped managers and load
-    /// that user's local metadata. Shared by `setupStorage()` (initial bind)
-    /// and `rebindUserScopedStorage()` (post-sign-in rebind).
+    /// that user's local metadata, at start-up (`setupStorage()`).
     private func bindCurrentUserScopedStorage() async {
+        lock.withLock { userScopeStartupBindBegun = true }
         await kvCache.setUserId(authController.getUserId())
         if let userId = authController.getUserId() {
             documentManager.userId = userId
+            lock.withLock { userScopeBinds += 1 }
             try? await offlineStore.ensureMetadataDb(appId: options.appId, userId: userId)
             await documentManager.loadLocalMetadata()
         }
@@ -6918,54 +6967,165 @@ public final class JsBaoClient: @unchecked Sendable {
         Task { [weak self] in await self?.flushOutboundUpdates(documentId: documentId) }
     }
 
-    /// Re-scope the user-owned managers to the currently authenticated user,
-    /// clearing the previously-bound user's in-memory metadata first. When the
-    /// user is unchanged this only reloads local metadata a logout dropped,
-    /// and is otherwise a no-op.
+    /// Wait until the user-scoped storage is the signed-in user's.
     ///
-    /// `setupStorage()` binds document/metadata storage to whoever init
-    /// restored. A later sign-in (`otpVerify`) updates only `AuthController`,
-    /// so without this the client would keep serving the restored user's local
-    /// document state under the new identity — the returned client would
-    /// authenticate as B while retaining A's local documents. Call
-    /// after a sign-in that may land a different user than init restored, once
-    /// `waitForStorageReady()` confirms the initial bind has finished.
+    /// The client rebinds its document and metadata storage itself every time
+    /// the signed-in user changes, whichever way the token changed: an
+    /// interactive sign-in (which waits for the rebind before it returns),
+    /// `updateToken(_:cause:)`, or a sign-out. Calling this is never required
+    /// and is harmless: it returns once the rebinds in progress finished, and
+    /// does nothing more.
+    ///
+    /// ```swift
+    /// client.updateToken(jwt, cause: "external")
+    /// await client.rebindUserScopedStorage()   // optional: the storage is the new user's
+    /// ```
     /// - Stability: production
     public func rebindUserScopedStorage() async {
-        let newUserId = authController.getUserId() ?? ""
-        // Another user: the previous user's db3s are unbound before anything
-        // of the new identity is applied (their subscriptions end), and a db3
-        // open or bind waits until the new user's storage is in place.
-        guard documentManager.userId == newUserId else {
-            let db3Release = beginDb3IdentityRelease()
-            forgetDb3Identity()
-            await _db3Lifecycle.releaseAll(unbind: true)
-            // The record-log store is reset when another user than its owner signs in.
-            await checkRecordLogOwnerAtSignIn()
-            await documentManager.resetInMemoryUserState(userId: newUserId)
-            await kvCache.setUserId(authController.getUserId())
-            if !newUserId.isEmpty {
-                try? await offlineStore.ensureMetadataDb(appId: options.appId, userId: newUserId)
-                await documentManager.loadLocalMetadata()
+        await userScopeRebindsSettled()
+    }
+
+    /// Wait for every rebind of the user-scoped storage started so far.
+    func userScopeRebindsSettled() async {
+        let running = lock.withLock { Array(userScopeRebinds.values) }
+        for rebind in running { await rebind.value }
+    }
+
+    /// The signed-in user changed: another user's token was applied, or the
+    /// token was cleared. Starts the rebind of the user-scoped storage, as the
+    /// JS client does from `applyTokenEffects`.
+    ///
+    /// When the rebind will move the storage to another user — it is bound to
+    /// a user other than the one signed in now, or bound to nobody once
+    /// start-up's bind began — the db3 identity moves on before the token's
+    /// application returns: the db3 states are forgotten, so a db3
+    /// subscription made after it is the new user's, and the subscriptions
+    /// made before end (`identity-changed`) when the rebind releases them.
+    /// While storage is still starting, opens are not held at the release gate
+    /// here: the start-up bind of the stored db3s waits on it, and the rebind
+    /// runs only once storage is ready. A `logout()` releases the user's db3s
+    /// itself, awaited by the logout, so the token it clears starts nothing;
+    /// `byLogout` is the auth controller's word for that, never the cause.
+    ///
+    /// The rebinds' storage steps run one after the other, in the order of the
+    /// changes: an older one never applies its user over a newer one's.
+    private func signedInUserChanged(byLogout: Bool) {
+        guard !lock.withLock({ isDestroyed }) else { return }
+        let userId = authController.getUserId() ?? ""
+        if userId.isEmpty && byLogout { return }
+        let scoped = documentManager.userId
+        let ready = storageReadyLock.withLock { storageReady }
+        let startupBound = lock.withLock { userScopeStartupBindBegun }
+        let switching = scoped != userId && (!scoped.isEmpty || ready || startupBound)
+        let release: Int? = switching && ready ? beginDb3IdentityRelease() : nil
+        if switching { forgetDb3Identity() }
+        let id = UUID()
+        let storageStep: Task<Bool, Never> = lock.withLock {
+            userScopeChanges += 1
+            let change = userScopeChanges
+            let bindsAtChange = userScopeBinds
+            let before = userScopeRebindTail
+            let step = Task<Bool, Never> { [weak self] in
+                _ = await before?.value
+                guard let self else { return false }
+                return await self.rebindUserScope(
+                    change: change, heldRelease: release, forgot: switching, bindsAtChange: bindsAtChange
+                )
             }
-            releaseHeldOutboundClassifications()
-            db3IdentityRelease.end(db3Release)
-            await bindStoredDb3s()
-            return
+            userScopeRebindTail = step
+            return step
         }
-        // The same user keeps the record-log store, with its unsent writes.
+        let rebind = Task { [weak self] in
+            // The stored db3s are bound outside the serialized step: a bind
+            // waits at the release gate, which a later change may hold until
+            // its own step, queued behind this one, ran.
+            if await storageStep.value, let self { await self.bindStoredDb3s() }
+            guard let self else { return }
+            self.lock.withLock {
+                if self.userScopeRebinds.removeValue(forKey: id) == nil { self.userScopeRebindsFinishedEarly.insert(id) }
+            }
+        }
+        lock.withLock {
+            // One that already finished is not waited for.
+            if userScopeRebindsFinishedEarly.remove(id) == nil { userScopeRebinds[id] = rebind }
+        }
+    }
+
+    /// Rebind the user-scoped storage to the user signed in now, once storage
+    /// is ready and every earlier rebind's step ran. `change` is the change
+    /// of user that started it, `heldRelease` the release
+    /// `signedInUserChanged` began, `forgot` whether it forgot the db3 states,
+    /// and `bindsAtChange` the count of binds then: a bind since (start-up's)
+    /// already bound this user. Answers whether the signed-in user's stored
+    /// db3s are to be bound now.
+    ///
+    /// A later change of user started its own rebind, which runs after this
+    /// one and reads the user signed in then: this one leaves it the work.
+    /// Another user than the storage is bound for: the previous user's db3s
+    /// are released and unbound (the subscriptions made before the change
+    /// end), the record-log store is reset when its owner is not the new user,
+    /// and the in-memory metadata is the new user's. Signed out (not by
+    /// `logout()`): the previous user's db3s are released and their pending
+    /// creates stop retrying; the storage stays theirs, so their next sign-in
+    /// reloads it. The same user (a sign-in after a logout): the metadata a
+    /// logout dropped is reloaded.
+    private func rebindUserScope(change: Int, heldRelease: Int?, forgot: Bool, bindsAtChange: Int) async -> Bool {
+        await awaitStorageReady()
+        let superseded = { [self] in lock.withLock { userScopeChanges != change } }
+        guard !lock.withLock({ isDestroyed }), !superseded() else {
+            if let heldRelease { db3IdentityRelease.end(heldRelease) }
+            return false
+        }
+        let userId = authController.getUserId() ?? ""
+        let scoped = documentManager.userId
+        guard scoped != userId else {
+            if let heldRelease { db3IdentityRelease.end(heldRelease) }
+            guard !userId.isEmpty, lock.withLock({ userScopeBinds }) == bindsAtChange else { return false }
+            // The same user keeps the record-log store, with its unsent writes.
+            await checkRecordLogOwnerAtSignIn()
+            // A logout in this process dropped in-memory user-scoped state the
+            // store still holds (#2874): reload it here, or their pending
+            // creates would stay uncommitted until the app relaunched.
+            // `loadLocalMetadata()` is additive and idempotent.
+            if documentManager.needsLocalMetadataReload {
+                await documentManager.loadLocalMetadata()
+                releaseHeldOutboundClassifications()
+            }
+            // A logout unbound this user's db3s: bind them again.
+            return true
+        }
+        // The previous user's db3s are unbound before anything of the new
+        // identity is applied, and a db3 open or bind waits until the new
+        // user's storage is in place.
+        let release = heldRelease ?? beginDb3IdentityRelease()
+        if !forgot { forgetDb3Identity() }
+        await _db3Lifecycle.releaseAll(unbind: true, keepingFrom: _db3Lifecycle.currentIdentity)
+        // Read again: a further change may have landed during the release.
+        let newUserId = authController.getUserId() ?? ""
+        if let hold = userScopeRebindHoldForTest { await hold(newUserId) }
+        // A further change during the release: its own rebind, queued behind
+        // this one, binds the user signed in then.
+        if superseded() {
+            db3IdentityRelease.end(release)
+            return false
+        }
+        guard !newUserId.isEmpty else {
+            // A signed-out user's failed create may not retry under the next
+            // session's transport.
+            documentManager.resetUserScopedStateForLogout()
+            db3IdentityRelease.end(release)
+            return false
+        }
+        // The record-log store is reset when another user than its owner signs in.
         await checkRecordLogOwnerAtSignIn()
-        // Same user, but a logout in this process dropped in-memory
-        // user-scoped state the store still holds (#2874): reload it here,
-        // or their pending creates would stay uncommitted until the app
-        // relaunched. `loadLocalMetadata()` is additive and idempotent, so
-        // re-running it for an unchanged user is safe.
-        if documentManager.needsLocalMetadataReload {
-            await documentManager.loadLocalMetadata()
-            releaseHeldOutboundClassifications()
-        }
-        // A logout unbound this user's db3s: bind them again.
-        await bindStoredDb3s()
+        await documentManager.resetInMemoryUserState(userId: newUserId)
+        lock.withLock { userScopeBinds += 1 }
+        await kvCache.setUserId(newUserId)
+        try? await offlineStore.ensureMetadataDb(appId: options.appId, userId: newUserId)
+        await documentManager.loadLocalMetadata()
+        releaseHeldOutboundClassifications()
+        db3IdentityRelease.end(release)
+        return true
     }
 
     /// Wait until storage initialization has fully completed — token restored

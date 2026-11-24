@@ -30,6 +30,9 @@ protocol LocalRecordDelegate: AnyObject, Sendable {
     /// `nil` when the store cannot tell a field never written from one
     /// cleared, or holds no such record.
     func holds(id: String, field: String) throws -> Bool?
+    /// Whether the document's held revision clears `field`, so every record
+    /// reads it as unset.
+    func clears(field: String) -> Bool
 
     // Writes
     /// One local write. `upsertOn` names the field a create travels as an

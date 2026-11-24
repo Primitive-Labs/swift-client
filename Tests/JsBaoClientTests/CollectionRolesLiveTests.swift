@@ -226,7 +226,7 @@ final class CollectionRolesLiveTests: XCTestCase {
         let access = try await ownerClient.collections.getAccess(collectionId: id)
         let grant = try XCTUnwrap(access.groups.first { $0.groupId == groupId })
         XCTAssertEqual(grant.role, .viewer)
-        XCTAssertEqual(grant.permission, "reader")
+        XCTAssertEqual(grant.permission, .reader)
         XCTAssertEqual(access.members.first { $0.userId == editor.userId }?.role, .editor)
 
         let revoked = try await ownerClient.collections.revokeGroupPermission(

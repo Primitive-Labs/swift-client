@@ -151,7 +151,7 @@ final class Db3BlobOfflineLiveTests: XCTestCase {
         // Two blobs another client uploaded: one prefetched here, one not.
         let prefetched = try await other.db3.blobs(db3Id).upload(data: Data("prefetched".utf8))
         let uncached = try await other.db3.blobs(db3Id).upload(data: Data("uncached".utf8))
-        await blobs.prefetch(blobIds: [prefetched.blobId])
+        try await blobs.prefetch(blobIds: [prefetched.blobId])
 
         owner.setNetworkMode(.offline)
         let served = try await blobs.read(blobId: mine.blobId)
@@ -170,7 +170,7 @@ final class Db3BlobOfflineLiveTests: XCTestCase {
             XCTAssertEqual(error.details?["blobId"], .string(uncached.blobId))
             XCTAssertTrue(error.message.contains(uncached.blobId), error.message)
         }
-        await blobs.prefetch(blobIds: [uncached.blobId])
+        try await blobs.prefetch(blobIds: [uncached.blobId])
         let stillUncached = await isOffline { _ = try await blobs.read(blobId: uncached.blobId) }
         XCTAssertTrue(stillUncached)
 

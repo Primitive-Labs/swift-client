@@ -27,6 +27,20 @@ ref = "schemas.common.ShipNeedsKind"
 [models.json_orders.fields.invoice]
 ref = "billing-v2.ShipInvoice"
 
+# List fields (#6307).
+[models.json_orders.fields.tags]
+ref = "ShipTags"
+
+[models.json_orders.fields.stops]
+ref = "common.ShipStops"
+
+# Map fields (#6307).
+[models.json_orders.fields.weights]
+ref = "ShipWeights"
+
+[models.json_orders.fields.keyed]
+ref = "ShipKeyed"
+
 # A required JSON field.
 [models.json_receipts]
 class_name = "JsonReceiptRecord"

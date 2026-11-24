@@ -45,8 +45,8 @@ public struct UserRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hash
     public var email: String {
         didSet { _changedFields.insert("email") }
     }
-    public var name: String? {
-        didSet { _changedFields.insert("name") }
+    public var name: String {
+        didSet { _changedFields.insert("name"); _suppliedDefaults.remove("name") }
     }
     public var tenantId: String {
         didSet { _changedFields.insert("tenantId") }
@@ -54,8 +54,8 @@ public struct UserRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hash
     public var createdAt: String? {
         didSet { _changedFields.insert("createdAt") }
     }
-    public var active: Bool? {
-        didSet { _changedFields.insert("active") }
+    public var active: Bool {
+        didSet { _changedFields.insert("active"); _suppliedDefaults.remove("active") }
     }
 
     public var related: RelatedRecords = .empty
@@ -78,6 +78,15 @@ public struct UserRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hash
     /// field, whatever this holds.
     /// Not part of the record's persisted/equatable identity.
     public private(set) var _changedFields: Set<String> = []
+
+    /// The fields whose value this model supplied from their `default`
+    /// rather than read or were given (#6304): a field the record held
+    /// no value of its kind for, an initializer parameter left out, a
+    /// decoded key that held none. `primitiveValues()` leaves them out,
+    /// so no write sends a default the model filled in; assigning the
+    /// field, or `markAllChanged()`, makes its value the caller's.
+    /// Not part of the record's persisted/equatable identity.
+    public private(set) var _suppliedDefaults: Set<String> = []
 
     /// Forget the pending field changes without writing them, so a
     /// later `save(in:)` treats this value as unmodified. Mirrors
@@ -103,6 +112,7 @@ public struct UserRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hash
     /// Every field it writes wins last-writer-wins against a concurrent
     /// remote edit to that field, which is the cost of a full copy.
     public mutating func markAllChanged() {
+        _suppliedDefaults = []
         _changedFields = Set(primitiveValues().keys)
     }
 
@@ -116,12 +126,14 @@ public struct UserRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hash
     ) {
         self.id = id
         self.email = email
-        self.name = name
+        self.name = name ?? "guest"
         self.tenantId = tenantId
         self.createdAt = createdAt
-        self.active = active
+        self.active = active ?? true
         self.related = .empty
-        self._changedFields = Set(primitiveValues().keys)
+        if name == nil { _suppliedDefaults.insert("name") }
+        if active == nil { _suppliedDefaults.insert("active") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     /// Create a record with an auto-generated id. The id is NOT
@@ -138,51 +150,65 @@ public struct UserRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hash
     ) {
         self.id = PrimitiveSchemaRegistry.newId()
         self.email = email
-        self.name = name
+        self.name = name ?? "guest"
         self.tenantId = tenantId
         self.createdAt = createdAt
-        self.active = active
+        self.active = active ?? true
         self.related = .empty
         self._explicitId = false
-        self._changedFields = Set(primitiveValues().keys)
+        if name == nil { _suppliedDefaults.insert("name") }
+        if active == nil { _suppliedDefaults.insert("active") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     public init?(record: PrimitiveRecord) {
-        guard let email = record["email"]?.asString
+        guard let email = record["email"]?.asString,
+              !record.isCleared("name"),
+              !record.isCleared("active")
         else { return nil }
+        let _name = record.fittingValue("name", as: .string)?.asString
+        let _active = record.fittingValue("active", as: .boolean)?.asBoolean
         self.id = record.id
         self.email = email
-        self.name = record.holds("name") == false ? "guest" : record["name"]?.asString
+        self.name = _name ?? "guest"
         self.tenantId = record["tenantId"]?.asId
         self.createdAt = record["createdAt"]?.asDateString
-        self.active = record.holds("active") == false ? true : record["active"]?.asBoolean
+        self.active = _active ?? true
         self.related = .empty
         self._changedFields = []
+        if _name == nil { _suppliedDefaults.insert("name") }
+        if _active == nil { _suppliedDefaults.insert("active") }
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
     public init?(row: [String: JSONValue]) {
         guard let id = row["id"]?.stringValue,
-              let email = row["email"]?.stringValue
+              let email = row["email"]?.stringValue,
+              !PrimitiveRecord.isCleared("name", in: row),
+              !PrimitiveRecord.isCleared("active", in: row)
         else { return nil }
+        let _name = PrimitiveRecord.fittingValue("name", as: .string, in: row)?.asString
+        let _active = PrimitiveRecord.fittingValue("active", as: .boolean, in: row)?.asBoolean
         self.id = id
         self.email = email
-        self.name = PrimitiveRecord.holds("name", in: row) == false ? "guest" : row["name"]?.stringValue
+        self.name = _name ?? "guest"
         self.tenantId = row["tenantId"]?.stringValue
         self.createdAt = row["createdAt"]?.stringValue
-        self.active = PrimitiveRecord.holds("active", in: row) == false ? true : row["active"]?.rowBoolValue
+        self.active = _active ?? true
         self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []
+        if _name == nil { _suppliedDefaults.insert("name") }
+        if _active == nil { _suppliedDefaults.insert("active") }
     }
 
     public func primitiveValues() -> [String: PrimitiveValue] {
         var values: [String: PrimitiveValue] = [
             "email": .string(email),
         ]
-        if let name { values["name"] = .string(name) }
+        if !_suppliedDefaults.contains("name") { values["name"] = .string(name) }
         if let tenantId { values["tenantId"] = .id(tenantId) }
         if let createdAt { values["createdAt"] = .date(createdAt) }
-        if let active { values["active"] = .boolean(active) }
+        if !_suppliedDefaults.contains("active") { values["active"] = .boolean(active) }
         return values
     }
 
@@ -193,12 +219,16 @@ public struct UserRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hash
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try container.decode(String.self, forKey: .id)
         self.email = try container.decode(String.self, forKey: .email)
-        self.name = try container.decodeIfPresent(String.self, forKey: .name)
+        let _name = container.fittingValue(forKey: .name, as: .string)?.asString
+        self.name = _name ?? "guest"
         self.tenantId = try container.decode(String.self, forKey: .tenantId)
         self.createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt)
-        self.active = try container.decodeIfPresent(Bool.self, forKey: .active)
+        let _active = container.fittingValue(forKey: .active, as: .boolean)?.asBoolean
+        self.active = _active ?? true
         self.related = .empty
-        self._changedFields = Set(primitiveValues().keys)
+        if _name == nil { _suppliedDefaults.insert("name") }
+        if _active == nil { _suppliedDefaults.insert("active") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     public enum CodingKeys: String, CodingKey {

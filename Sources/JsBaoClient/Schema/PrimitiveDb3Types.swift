@@ -1,7 +1,8 @@
 import Foundation
 
 /// The db3 types a build was generated with, as `swift-bao-codegen
-/// --known-types-only` writes them into `GeneratedModels.db3Types`.
+/// --known-types-only` writes them into `GeneratedModels.db3Types`, and the
+/// local-only declarations of each type that allows local-only db3s.
 ///
 /// Registered on a client (`GeneratedModels.register(on:)` does it), the
 /// setting makes the client refuse to create a db3 of a type the build was
@@ -13,16 +14,50 @@ import Foundation
 /// GeneratedModels.register(on: client) // registers GeneratedModels.db3Types too
 /// ```
 public struct PrimitiveDb3Types: Sendable, Equatable {
+    /// The declarations a build carries for a db3 type that allows
+    /// local-only db3s (`[type] allowLocalOnly = true`), as `swift-bao-codegen`
+    /// writes them: the type's models in install shape, as JSON, and their
+    /// content hash. A db3 created with `localOnly: true` and the type is
+    /// judged by them on this device.
+    public struct LocalOnlyDeclarations: Sendable, Equatable {
+        /// The content hash of the declarations: the revision hash the
+        /// server answers for the same pushed type file.
+        public let hash: String
+        /// The type's models in install shape, as JSON text.
+        public let modelsJSON: String
+
+        public init(hash: String, modelsJSON: String) {
+            self.hash = hash
+            self.modelsJSON = modelsJSON
+        }
+    }
+
     /// One db3 type the build declares.
     public struct DeclaredType: Sendable, Equatable {
         /// The type's name: its `[type] name`, else its file stem.
         public let name: String
         /// Whether its type file says `archived = true`: no new db3 of it is created.
         public let archived: Bool
+        /// The type's local-only declarations, when its type file allows
+        /// local-only db3s; `nil` otherwise.
+        public let localOnly: LocalOnlyDeclarations?
 
         public init(name: String, archived: Bool = false) {
             self.name = name
             self.archived = archived
+            self.localOnly = nil
+        }
+
+        /// A type that allows local-only db3s, with the declarations its
+        /// build carries.
+        ///
+        /// ```swift
+        /// PrimitiveDb3Types.DeclaredType(name: "journal", localOnly: .init(hash: hash, modelsJSON: models))
+        /// ```
+        public init(name: String, archived: Bool = false, localOnly: LocalOnlyDeclarations) {
+            self.name = name
+            self.archived = archived
+            self.localOnly = localOnly
         }
     }
 
@@ -46,6 +81,8 @@ final class Db3KnownTypeRegistry: @unchecked Sendable {
     private var names: Set<String> = []
     private var archived: Set<String> = []
     private var allowed: Set<String> = []
+    /// The local-only declarations registered per type name (#6025), read once.
+    private var localOnly: [String: RecordLogLocalType] = [:]
 
     /// The most names a refusal's `details["knownTypes"]` lists.
     static let listed = 50
@@ -56,8 +93,16 @@ final class Db3KnownTypeRegistry: @unchecked Sendable {
             for type in types.types where !type.name.isEmpty {
                 names.insert(type.name)
                 if type.archived { archived.insert(type.name) }
+                if let declarations = type.localOnly, let parsed = RecordLogLocalType(name: type.name, declarations: declarations) {
+                    localOnly[type.name] = parsed
+                }
             }
         }
+    }
+
+    /// The build's local-only declarations for `type`, or `nil` when it carries none.
+    func localOnly(of type: String) -> RecordLogLocalType? {
+        lock.withLock { localOnly[type] }
     }
 
     /// Whether the setting is on.
@@ -117,6 +162,8 @@ extension JsBaoClient {
     /// - Stability: beta
     public func registerDb3Types(_ types: PrimitiveDb3Types) {
         db3KnownTypes.register(types)
+        // A typed local-only copy already bound is reconciled with the declarations now registered.
+        if types.types.contains(where: { $0.localOnly != nil }) { reconcileLocalTypes() }
         // A stored copy start-up already bound under a type the build does
         // not know is refused (unbound) now, so it is not readable under it.
         guard types.knownTypesOnly, let lifecycle = _db3Lifecycle else { return }

@@ -902,7 +902,10 @@ public final class DocumentManager: @unchecked Sendable {
             guard let self else { return }
             do {
                 let info = try await fetchDocumentInfo(documentId)
-                await self.cachePermission(documentId: documentId, permission: info.permission)
+                // A level this client does not know leaves the seeded or
+                // cached permission in place.
+                guard let permission = DocumentPermission(info.permission) else { return }
+                await self.cachePermission(documentId: documentId, permission: permission)
             } catch {
                 // Background refresh: a failure leaves the seeded or cached
                 // permission in place, exactly as JS's `.catch` does.
@@ -3851,7 +3854,7 @@ public final class DocumentManager: @unchecked Sendable {
             pendingCreates.removeAll()
             // The persisted records outlive this reset, so the in-memory set
             // is now behind what is on disk. Nothing else re-reads it for an
-            // unchanged user (`rebindUserScopedStorage` short-circuits on a
+            // unchanged user (the client's rebind short-circuits on a
             // matching id), which would strand those creates until the process
             // restarted — so say out loud that a reload is owed.
             localMetadataReloadPending = true

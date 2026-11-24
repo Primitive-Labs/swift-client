@@ -13,7 +13,8 @@ func createTestClient(
     autoNetwork: Bool = false,
     logLevel: LogLevel = .warn,
     analyticsAutoEvents: AnalyticsAutoEventsConfig = AnalyticsAutoEventsConfig(),
-    deviceIndexes: Db3DeviceIndexes = .all
+    deviceIndexes: Db3DeviceIndexes = .all,
+    storageReadyHoldForTest: (@Sendable () async -> Void)? = nil
 ) -> JsBaoClient {
     JsBaoClient(options: JsBaoClientOptions(
         apiUrl: TestConfig.httpUrl,
@@ -28,7 +29,7 @@ func createTestClient(
         autoNetwork: autoNetwork,
         analyticsAutoEvents: analyticsAutoEvents,
         deviceIndexes: deviceIndexes
-    ))
+    ), connectivityMonitor: nil, storageReadyHoldForTest: storageReadyHoldForTest)
 }
 
 /// Wait for the client to reach "connected" status.

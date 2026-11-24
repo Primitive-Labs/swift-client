@@ -68,8 +68,8 @@ struct Db3IndexModelHttp: Sendable {
     /// How long a request may take (`nil`: the transport's own).
     var timeout: TimeInterval? = nil
 
-    static func path(_ db3Id: String, _ name: String) -> String {
-        "/db3/\(URLEncoding.encodeComponent(db3Id))/indexes/\(URLEncoding.encodeComponent(name))/model"
+    static func path(_ db3Id: String, _ name: String) throws -> String {
+        "/db3/\(try URLEncoding.pathSegment(db3Id, name: "db3Id"))/indexes/\(try URLEncoding.pathSegment(name, name: "name"))/model"
     }
 
     /// One request; a non-2xx answer is the route's `HttpError`.

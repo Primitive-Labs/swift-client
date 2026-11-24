@@ -140,13 +140,13 @@ final class Db3PermissionsLiveTests: XCTestCase {
 
         let entry = try await sharing.grantGroup(GrantGroupPermissionParams(groupId: group.groupId, permission: "reader"))
         XCTAssertEqual(entry.groupId, group.groupId)
-        XCTAssertEqual(entry.permission, "reader")
+        XCTAssertEqual(entry.permission, .reader)
         XCTAssertEqual(entry.documentId, db3Id)
         let again = try await sharing.grantGroup(GrantGroupPermissionParams(groupId: group.groupId, permission: "read-write"))
-        XCTAssertEqual(again.permission, "read-write")
+        XCTAssertEqual(again.permission, .readWrite)
         let groups = try await sharing.listGroups()
         XCTAssertEqual(groups.map(\.groupId), [group.groupId])
-        XCTAssertEqual(groups.first?.permission, "read-write")
+        XCTAssertEqual(groups.first?.permission, .readWrite)
 
         let viaGroup = try await memberClient.db3.get(db3Id)
         XCTAssertEqual(viaGroup.accessSource, .group)

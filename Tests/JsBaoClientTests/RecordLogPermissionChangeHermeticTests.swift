@@ -57,7 +57,8 @@ final class RecordLogPermissionChangeHermeticTests: XCTestCase {
     }
 
     func testAWriteCapableUpdateLiftsTheReadMarkAndTheNextCommitLands() async throws {
-        for permission in [DocumentPermission.readWrite, .admin, .owner] {
+        // `admin` is deprecated (#6309); a stored one still lifts the mark.
+        for permission in [DocumentPermission.readWrite, DocumentPermission(rawValue: "admin")!, .owner] {
             let binding = try await binding()
             try binding.applyPermissionChange(.reader)
             try binding.applyPermissionChange(permission)

@@ -64,7 +64,8 @@ public struct Db3StoredEntry: Sendable, Equatable {
     /// `allowUnknownType`; `nil` otherwise.
     /// - Stability: beta
     public internal(set) var knownType: Bool? = nil
-    /// The copy's type, when ``knownType`` is `false`.
+    /// The copy's type, when ``knownType`` is `false`, and for a typed db3
+    /// that lives only on this device.
     /// - Stability: beta
     public internal(set) var type: String? = nil
 
@@ -437,8 +438,8 @@ public final class Db3API: @unchecked Sendable {
 
     // MARK: - Lifecycle
 
-    private static func path(_ db3Id: String, _ rest: String = "") -> String {
-        "/db3/\(URLEncoding.encodeComponent(db3Id))\(rest)"
+    private static func path(_ db3Id: String, _ rest: String = "") throws -> String {
+        "/db3/\(try URLEncoding.pathSegment(db3Id, name: "db3Id"))\(rest)"
     }
 
     /// Create a db3 and answer it.
@@ -546,6 +547,7 @@ public final class Db3API: @unchecked Sendable {
         metadata: JSONValue? = nil,
         allowUnknownType: Bool
     ) async throws -> Db3Info {
+        if let refusal = Self.tagRefusal(method: "client.db3.create", tags: tags) { throw refusal }
         if let refusal = client?.db3KnownTypes.refusal(
             method: "client.db3.create", type: type, allowUnknownType: allowUnknownType, archivedRefuses: true
         ) {
@@ -607,20 +609,33 @@ public final class Db3API: @unchecked Sendable {
     /// `true` keeps the db3 on this device only, `false` creates it as that
     /// call does.
     ///
+    /// With `type`, the type's file must say `[type] allowLocalOnly = true`
+    /// and the build must carry its declarations (`GeneratedModels.register(on:)`
+    /// registers them): the db3's writes are then judged by them on this
+    /// device, as a room judges a typed db3's, and its indexes and unique
+    /// constraints follow from them. The type's create setting and the
+    /// server's archive state do not apply.
+    ///
     /// ```swift
     /// let scratch = try await client.db3.create(title: "Scratch", localOnly: true)
+    /// let journal = try await client.db3.create(title: "Journal", type: "journal", localOnly: true)
     /// ```
     ///
     /// - Parameters:
     ///   - title: The db3's title.
-    ///   - type: A db3 type of this app; refused with `localOnly`.
+    ///   - type: A db3 type of this app that allows local-only db3s, whose
+    ///     declarations this build carries.
     ///   - sync: `false` for a server-only db3; refused with `localOnly`.
     ///   - custodian: Who holds it; refused with `localOnly`.
     ///   - tags: Its tags.
     ///   - metadata: An opaque metadata blob (at most 4 KB).
     ///   - localOnly: Keep the db3 on this device only.
-    /// - Throws: `.localOnlyUnsupportedOption` for `localOnly` with `type`,
-    ///   `sync: false` or `custodian`, before anything is created;
+    /// - Throws: in a build generated with `--known-types-only`,
+    ///   `.invalidArgument` (`details["reason"]` `unknown-type`) for a type
+    ///   the build was not generated with or archived in it; then
+    ///   `.localOnlyUnsupportedOption` for `localOnly` with a type the build
+    ///   carries no local-only declarations for, `sync: false` or
+    ///   `custodian`; each before anything is created;
     ///   `.invalidArgument` with no signed-in user, or `identity-changed` as
     ///   for the synced create; `.format2StorageUnavailable`
     ///   on a client whose storage cannot keep a db3 (an in-memory provider).
@@ -634,6 +649,7 @@ public final class Db3API: @unchecked Sendable {
         metadata: JSONValue? = nil,
         localOnly: Bool
     ) async throws -> Db3Info {
+        if let refusal = Self.tagRefusal(method: "client.db3.create", tags: tags) { throw refusal }
         guard localOnly else {
             return try await create(title: title, type: type, sync: sync, custodian: custodian, tags: tags, metadata: metadata)
         }
@@ -642,13 +658,21 @@ public final class Db3API: @unchecked Sendable {
 
     /// A db3 kept on this device only: created under an id minted
     /// here, answered at once, and never sent to the server. What only the
-    /// server can hold (a type, sync off, a custodian) is refused before
-    /// anything is created.
+    /// server can hold (sync off, a custodian, a type the build carries no
+    /// local-only declarations for) is refused before anything is created.
     private func createLocalOnly(
         title: String, type: String?, sync: Bool?, custodian: String?, tags: [String]?, metadata: JSONValue?
     ) async throws -> Db3Info {
         var unsupported: [String] = []
-        if type != nil { unsupported.append("type") }
+        if let type {
+            // A `--known-types-only` build refuses a type it does not know, or archived in it, first.
+            if let refusal = client?.db3KnownTypes.refusal(
+                method: "client.db3.create", type: type, allowUnknownType: false, archivedRefuses: true
+            ) {
+                throw refusal
+            }
+            if client?.db3KnownTypes.localOnly(of: type) == nil { unsupported.append("type") }
+        }
         if sync == false { unsupported.append("sync: false") }
         if custodian != nil { unsupported.append("custodian") }
         guard unsupported.isEmpty else {
@@ -662,7 +686,20 @@ public final class Db3API: @unchecked Sendable {
         guard let client, !(client.authController.getUserId() ?? "").isEmpty else {
             throw JsBaoError(code: .invalidArgument, message: "client.db3.create: there is no signed-in user to hold the db3")
         }
-        return try await client.createLocalOnlyDb3(ULID.generate(), title: title, tags: tags, metadata: metadata)
+        return try await client.createLocalOnlyDb3(ULID.generate(), title: title, tags: tags, metadata: metadata, type: type)
+    }
+
+    /// The refusal of a db3 create whose `tags` break the db3 tag rule
+    /// (``Db3TagRule``): `.invalidArgument`, `details["tag"]` the first such
+    /// tag, before anything is sent or kept. `nil` when every tag meets it.
+    static func tagRefusal(method: String, tags: [String]?) -> JsBaoError? {
+        guard let tags else { return nil }
+        for tag in tags {
+            if let violation = Db3TagRule.violation(tag) {
+                return JsBaoError(code: .invalidArgument, message: "\(method): \(violation)", details: ["tag": .string(tag)])
+            }
+        }
+        return nil
     }
 
     /// A refused create's `Db3CreateFailedEvent`; `id` names a client-minted id.
@@ -999,6 +1036,7 @@ public final class Db3API: @unchecked Sendable {
     ///   `untypedDb3Create = "admins"` for an untyped db3).
     /// - Stability: beta
     public func getOrCreateWithAlias(_ options: Db3GetOrCreateWithAliasOptions) async throws -> Db3GetOrCreateWithAliasResult {
+        if let refusal = Self.tagRefusal(method: "client.db3.getOrCreateWithAlias", tags: options.tags) { throw refusal }
         if let refusal = client?.db3KnownTypes.refusal(
             method: "client.db3.getOrCreateWithAlias", type: options.type, allowUnknownType: options.allowUnknownType, archivedRefuses: false
         ) {
@@ -1268,7 +1306,7 @@ public final class Db3API: @unchecked Sendable {
     /// ```swift
     /// let blobs = client.db3.blobs(db3Id)
     /// let uploaded = try await blobs.upload(data: data, options: BlobUploadSourceOptions(filename: "notes.txt"))
-    /// let url = blobs.downloadUrl(blobId: uploaded.blobId, disposition: .inline)
+    /// let url = try blobs.downloadUrl(blobId: uploaded.blobId, disposition: .inline)
     /// ```
     ///
     /// - Parameter db3Id: The db3.
@@ -1313,8 +1351,9 @@ public final class Db3API: @unchecked Sendable {
 
     /// Apply creates, patches, deletes, upserts and increments across models,
     /// with reads among them, in one request: in order, in one transaction,
-    /// all of them or none (at most 100 operations). A read sees the writes
-    /// before it and not those after it, and is answered in `reads` at its
+    /// all of them or none (at most 1000 operations, and at most 1 MiB of JSON
+    /// for the writes between two reads, which larger records reach first).
+    /// A read sees the writes before it and not those after it, and is answered in `reads` at its
     /// index. With `atomic: false` each operation is applied on its own,
     /// `results` reports each write and a refused read is `.refused`. Needs
     /// write access; a caller who may only read uses ``batchRead(_:_:atomic:)``.
@@ -1334,7 +1373,8 @@ public final class Db3API: @unchecked Sendable {
     ///   - db3Id: The db3.
     ///   - operations: The operations, in order.
     ///   - options: `atomic`, and a `requestId` naming the whole request.
-    /// - Throws: `HttpError` with the refusal's code (`BATCH_TOO_LARGE` past 100 operations,
+    /// - Throws: `HttpError` with the refusal's code (`BATCH_TOO_LARGE` past 1000 operations,
+    ///   `DOCUMENT_ENTRY_TOO_LARGE` past 1 MiB of writes as one entry,
     ///   `DB3_CONDITION_NOT_MET`, `DB3_PAGE_TOO_LARGE`, …) and `details.index` naming the operation.
     /// - Stability: beta
     public func batch(_ db3Id: String, _ operations: [Db3BatchOperation], options: Db3BatchOptions = Db3BatchOptions()) async throws -> Db3BatchResult {
@@ -1375,6 +1415,162 @@ public final class Db3API: @unchecked Sendable {
             path: Self.path(db3Id, "/records/batch-read"),
             body: BatchReadBody(operations: operations, atomic: atomic)
         )
+    }
+
+    private struct WriteWhereBody: Encodable, Sendable {
+        let filter: [String: JSONValue]
+        let data: [String: JSONValue]?
+        let limit: Int?
+        let cursor: String?
+        let requestId: String?
+    }
+
+    /// Delete the records of `model` that match `filter`, up to `limit`
+    /// (1,000 by default and at most), as one write. Records are taken in id
+    /// order, a `$search` in the filter included. While the answer's
+    /// `hasMore` is true, pass its `nextCursor` back as `cursor` to continue.
+    /// The page is all or nothing: a record the db3 refuses refuses the call,
+    /// and nothing is deleted. A page whose write would pass 1 MiB is cut to
+    /// the records that fit and answers `cutBy: "entryBytes"`; one whose
+    /// stored records would pass 16 MiB is cut the same way and answers
+    /// `cutBy: "rowBytes"`. `[:]` matches every record. Needs write access.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    ///
+    /// ```swift
+    /// var cursor: String?
+    /// repeat {
+    ///     let page = try await client.db3.deleteWhere(db3Id, model: "Txn", filter: ["accountId": "a1"], cursor: cursor)
+    ///     cursor = page.nextCursor
+    /// } while cursor != nil
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - db3Id: The db3.
+    ///   - model: The model.
+    ///   - filter: A filter in the query filter grammar.
+    ///   - limit: The most records this call changes, 1 to 1,000; omitted, 1,000.
+    ///   - cursor: The `nextCursor` of the previous answer for the same filter.
+    ///   - requestId: A ULID naming this call: a retry with it answers the first answer and writes nothing.
+    /// - Throws: `HttpError` with the refusal's code (`DB3_TRIGGER_REFUSED`,
+    ///   `DB3_MODEL_NOT_DECLARED`, `DOCUMENT_ENTRY_TOO_LARGE` for a record that
+    ///   alone passes 1 MiB, or 16 MiB stored, …) and `details.recordId`
+    ///   naming the record.
+    /// - Stability: beta
+    public func deleteWhere(
+        _ db3Id: String, model: String, filter: [String: JSONValue],
+        limit: Int? = nil, cursor: String? = nil, requestId: String? = nil
+    ) async throws -> Db3WriteWhereResult {
+        let target = try Self.path(db3Id, "/records/\(URLEncoding.pathSegment(model, name: "model"))/delete-where")
+        try await awaitCreate(db3Id)
+        return try await transport.request(
+            method: .post,
+            path: target,
+            body: WriteWhereBody(filter: filter, data: nil, limit: limit, cursor: cursor, requestId: requestId)
+        )
+    }
+
+    /// Merge `data` into each record of `model` that matches `filter`, up to
+    /// `limit`, as one write, paging and refusing as
+    /// ``deleteWhere(_:model:filter:limit:cursor:requestId:)`` does; the
+    /// db3's hook rules (`timestamps`, `set`, `refuse`) run for each record.
+    /// When `data` leaves the records matching, the cursor is what ends the
+    /// loop: always pass `nextCursor` back.
+    ///
+    /// Waits first for a pending create of the db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    ///
+    /// ```swift
+    /// let page = try await client.db3.patchWhere(db3Id, model: "Txn", filter: ["accountId": "a1"], data: ["reviewed": true])
+    /// print(page.changed, page.hasMore)
+    /// ```
+    ///
+    /// - Parameters:
+    ///   - db3Id: The db3.
+    ///   - model: The model.
+    ///   - filter: A filter in the query filter grammar.
+    ///   - data: The fields to merge into each record, not empty.
+    ///   - limit: The most records this call changes, 1 to 1,000; omitted, 1,000.
+    ///   - cursor: The `nextCursor` of the previous answer for the same filter.
+    ///   - requestId: A ULID naming this call: a retry with it answers the first answer and writes nothing.
+    /// - Throws: `HttpError` with the refusal's code, as `deleteWhere` does.
+    /// - Stability: beta
+    public func patchWhere(
+        _ db3Id: String, model: String, filter: [String: JSONValue], data: [String: JSONValue],
+        limit: Int? = nil, cursor: String? = nil, requestId: String? = nil
+    ) async throws -> Db3WriteWhereResult {
+        let target = try Self.path(db3Id, "/records/\(URLEncoding.pathSegment(model, name: "model"))/patch-where")
+        try await awaitCreate(db3Id)
+        return try await transport.request(
+            method: .post,
+            path: target,
+            body: WriteWhereBody(filter: filter, data: data, limit: limit, cursor: cursor, requestId: requestId)
+        )
+    }
+
+    private struct ParallelBody: Encodable, Sendable {
+        let requests: [Db3ParallelRequest]
+    }
+
+    private struct ParallelWire: Decodable, Sendable {
+        struct Item: Decodable, Sendable {
+            let status: Int
+            let body: JSONValue
+        }
+        let results: [Item]
+    }
+
+    /// Send up to 10 separate `batch` and `batchRead` requests, each on a
+    /// different db3, in one call. They are not one batch: nothing is atomic
+    /// or ordered between them, they run concurrently, and each is authorized
+    /// and answered exactly as its single call would be. Answers one result
+    /// per request, in order; a request the server refused is `.refused` in
+    /// its place, and the call throws only for the envelope (no requests,
+    /// more than 10, a db3 named twice) or a failure of the call itself. With
+    /// N requests each db3 answers within an even share of the 8 MiB answer
+    /// limit; a `batch` carrying a `requestId` can be retried by sending the
+    /// whole call again.
+    ///
+    /// Waits first for a pending create of each db3 to commit: throws `.pendingCreate`
+    /// offline or after 30 seconds, or the create's refusal (see ``Db3API``).
+    ///
+    /// ```swift
+    /// let response = try await client.db3.parallel([
+    ///     .batchRead(projects, [.query(model: "Project", limit: 20)]),
+    ///     .batch(me, [.create(model: "Visit", data: ["at": 1])]),
+    /// ])
+    /// if case .refused(let refusal) = response.results[1].answer { print(refusal.code ?? "") }
+    /// ```
+    ///
+    /// - Parameter requests: The requests, each on its own db3.
+    /// - Throws: `HttpError` for the envelope's refusal (`DB3_PARALLEL_INVALID`,
+    ///   `DB3_PARALLEL_DUPLICATE_DB3`) or the caller's authentication.
+    /// - Stability: beta
+    public func parallel(_ requests: [Db3ParallelRequest]) async throws -> Db3ParallelResponse {
+        for request in requests { try await awaitCreate(request.db3Id) }
+        let wire: ParallelWire = try await transport.request(
+            method: .post,
+            path: "/db3/records/parallel",
+            body: ParallelBody(requests: requests)
+        )
+        let decoder = JSONDecoder()
+        let results = try wire.results.enumerated().map { at, item -> Db3ParallelResult in
+            let data = try JSONEncoder().encode(item.body)
+            if item.status >= 400 {
+                return Db3ParallelResult(status: item.status, answer: .refused(try decoder.decode(Db3ParallelRefusal.self, from: data)))
+            }
+            guard at < requests.count else {
+                return Db3ParallelResult(status: item.status, answer: .refused(Db3ParallelRefusal(error: "an answer with no request", status: item.status, code: nil, details: nil)))
+            }
+            switch requests[at] {
+            case .batch:
+                return Db3ParallelResult(status: item.status, answer: .batch(try decoder.decode(Db3BatchResult.self, from: data)))
+            case .batchRead:
+                return Db3ParallelResult(status: item.status, answer: .batchRead(try decoder.decode(Db3BatchReadResponse.self, from: data)))
+            }
+        }
+        return Db3ParallelResponse(results: results)
     }
 }
 
@@ -2068,8 +2264,8 @@ public final class Db3IndexesAPI: Sendable {
     private struct Listed: Decodable, Sendable { let indexes: [Db3Index] }
     private struct Registered: Decodable, Sendable { let index: Db3Index }
 
-    private static func path(_ db3Id: String) -> String {
-        "/db3/\(URLEncoding.encodeComponent(db3Id))/indexes"
+    private static func path(_ db3Id: String) throws -> String {
+        "/db3/\(try URLEncoding.pathSegment(db3Id, name: "db3Id"))/indexes"
     }
 
     /// Every index on the db3's records, sorted by name. Needs read access.
@@ -2119,8 +2315,9 @@ public final class Db3IndexesAPI: Sendable {
     /// - Stability: beta
     public func drop(_ db3Id: String, name: String) async throws {
         if let local = await localDoor(db3Id) { return try await local.drop(db3Id, name) }
+        let target = "\(try Self.path(db3Id))/\(try URLEncoding.pathSegment(name, name: "name"))"
         try await awaitCreate(db3Id)
-        try await transport.send(method: .delete, path: "\(Self.path(db3Id))/\(URLEncoding.encodeComponent(name))")
+        try await transport.send(method: .delete, path: target)
         try await applyLocally(db3Id)
     }
 
@@ -2256,6 +2453,7 @@ public final class Db3IndexesAPI: Sendable {
     ///   - name: The vector index's name, as ``list(_:)`` answers it.
     public func fetchModel(_ db3Id: String, name: String) async throws -> Db3IndexModel {
         try await refuseLocalOnlyModel(db3Id, "client.db3.indexes.fetchModel")
+        try Self.checkModelSegments(db3Id, name)
         try await awaitCreate(db3Id)
         let fetched = try await models.fetch(db3Id, name)
         guard let trainedAt = RecordLogVectorModelCheck.date(fetched.trainedAt) else {
@@ -2289,6 +2487,7 @@ public final class Db3IndexesAPI: Sendable {
     /// - Returns: The index as it now is, listing its `annModel`.
     public func uploadModel(_ db3Id: String, name: String, bytes: Data, upload: Db3IndexModelUpload) async throws -> Db3Index {
         try await refuseLocalOnlyModel(db3Id, "client.db3.indexes.uploadModel")
+        try Self.checkModelSegments(db3Id, name)
         try await awaitCreate(db3Id)
         let index = try await models.upload(db3Id, name, bytes: bytes, Db3IndexModelHttp.Metadata(
             generation: upload.generation, revision: upload.revision, rows: upload.rows,
@@ -2319,10 +2518,19 @@ public final class Db3IndexesAPI: Sendable {
     @discardableResult
     public func deleteModel(_ db3Id: String, name: String) async throws -> Db3IndexModelDeletion {
         try await refuseLocalOnlyModel(db3Id, "client.db3.indexes.deleteModel")
+        try Self.checkModelSegments(db3Id, name)
         try await awaitCreate(db3Id)
         let deleted = try await models.delete(db3Id, name)
         try await applyLocally(db3Id)
         return Db3IndexModelDeletion(ok: deleted.ok, name: deleted.name, revision: deleted.revision)
+    }
+
+    /// Refuse a dot-only db3 id or index name (`.invalidArgument`) before the
+    /// wait for a pending create, which can commit it: the model routes build
+    /// both into their path.
+    private static func checkModelSegments(_ db3Id: String, _ name: String) throws {
+        _ = try URLEncoding.pathSegment(db3Id, name: "db3Id")
+        _ = try URLEncoding.pathSegment(name, name: "name")
     }
 
     /// `date` as the model routes carry it: ISO 8601 with milliseconds, in UTC, as JavaScript's `toISOString()` writes it.
@@ -2373,14 +2581,15 @@ public final class Db3AliasesAPI: @unchecked Sendable {
     ///   on this device; `HttpError` 409 `NOT_A_DB3`, 404 `DB3_NOT_FOUND`.
     /// - Stability: beta
     public func set(_ params: SetAliasParams) async throws -> DocumentAliasInfo {
+        let scope = try URLEncoding.pathSegment(params.scope.rawValue, name: "scope")
+        let encodedKey = try URLEncoding.pathSegment(params.aliasKey, name: "aliasKey")
         try await awaitCreate(params.documentId)
-        let encodedKey = URLEncoding.encodeComponent(params.aliasKey)
         var body: [String: JSONValue] = ["documentId": .string(params.documentId)]
         if let userId = params.userId { body["userId"] = .string(userId) }
         if params.mustNotExist == true { body["mustNotExist"] = .bool(true) }
         return try await transport.request(
             method: .put,
-            path: "/db3-aliases/\(params.scope.rawValue)/\(encodedKey)",
+            path: "/db3-aliases/\(scope)/\(encodedKey)",
             body: JSONValue.object(body)
         )
     }
@@ -2393,8 +2602,9 @@ public final class Db3AliasesAPI: @unchecked Sendable {
     ///   that is not a db3, 403 `DOC_ACCESS_DENIED` when the caller cannot read it.
     /// - Stability: beta
     public func resolve(_ params: AliasRef) async throws -> Db3AliasResolution? {
-        let encodedKey = URLEncoding.encodeComponent(params.aliasKey)
-        var path = "/db3-aliases/\(params.scope.rawValue)/\(encodedKey)"
+        let scope = try URLEncoding.pathSegment(params.scope.rawValue, name: "scope")
+        let encodedKey = try URLEncoding.pathSegment(params.aliasKey, name: "aliasKey")
+        var path = "/db3-aliases/\(scope)/\(encodedKey)"
         if params.scope == .user, let userId = params.userId {
             var query = URLQuery()
             query.append("userId", userId)
@@ -2415,8 +2625,9 @@ public final class Db3AliasesAPI: @unchecked Sendable {
     ///   that is not a db3, which is kept.
     /// - Stability: beta
     public func delete(_ params: AliasRef) async throws {
-        let encodedKey = URLEncoding.encodeComponent(params.aliasKey)
-        var path = "/db3-aliases/\(params.scope.rawValue)/\(encodedKey)"
+        let scope = try URLEncoding.pathSegment(params.scope.rawValue, name: "scope")
+        let encodedKey = try URLEncoding.pathSegment(params.aliasKey, name: "aliasKey")
+        var path = "/db3-aliases/\(scope)/\(encodedKey)"
         if params.scope == .user, let userId = params.userId {
             var query = URLQuery()
             query.append("userId", userId)
@@ -2542,10 +2753,11 @@ extension Db3API {
     ///   ``Db3ClearError/clearApplyPending(_:)`` as above.
     /// - Stability: experimental
     public func clearModel(_ db3Id: String, model: String, drop: Bool = false) async throws -> Db3ClearResult {
+        let target = try Self.path(db3Id, "/records/\(URLEncoding.pathSegment(model, name: "model"))/clear")
         try await awaitCreate(db3Id)
         let result: Db3ClearResult = try await transport.request(
             method: .post,
-            path: Self.path(db3Id, "/records/\(URLEncoding.encodeComponent(model))/clear"),
+            path: target,
             body: drop ? JSONValue.object(["drop": true]) : JSONValue.object([:])
         )
         try await db3AwaitClearApplied(result, db3Id: db3Id, cursor: client?.db3AppliedCursor(db3Id))

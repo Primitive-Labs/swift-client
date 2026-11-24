@@ -31,14 +31,14 @@ public struct GreetingRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
     public var id: String {
         didSet { _changedFields.insert("id") }
     }
-    public var rocket: String? {
-        didSet { _changedFields.insert("rocket") }
+    public var rocket: String {
+        didSet { _changedFields.insert("rocket"); _suppliedDefaults.remove("rocket") }
     }
-    public var japanese: String? {
-        didSet { _changedFields.insert("japanese") }
+    public var japanese: String {
+        didSet { _changedFields.insert("japanese"); _suppliedDefaults.remove("japanese") }
     }
-    public var accented: String? {
-        didSet { _changedFields.insert("accented") }
+    public var accented: String {
+        didSet { _changedFields.insert("accented"); _suppliedDefaults.remove("accented") }
     }
 
     public var related: RelatedRecords = .empty
@@ -61,6 +61,15 @@ public struct GreetingRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
     /// field, whatever this holds.
     /// Not part of the record's persisted/equatable identity.
     public private(set) var _changedFields: Set<String> = []
+
+    /// The fields whose value this model supplied from their `default`
+    /// rather than read or were given (#6304): a field the record held
+    /// no value of its kind for, an initializer parameter left out, a
+    /// decoded key that held none. `primitiveValues()` leaves them out,
+    /// so no write sends a default the model filled in; assigning the
+    /// field, or `markAllChanged()`, makes its value the caller's.
+    /// Not part of the record's persisted/equatable identity.
+    public private(set) var _suppliedDefaults: Set<String> = []
 
     /// Forget the pending field changes without writing them, so a
     /// later `save(in:)` treats this value as unmodified. Mirrors
@@ -86,6 +95,7 @@ public struct GreetingRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
     /// Every field it writes wins last-writer-wins against a concurrent
     /// remote edit to that field, which is the cost of a full copy.
     public mutating func markAllChanged() {
+        _suppliedDefaults = []
         _changedFields = Set(primitiveValues().keys)
     }
 
@@ -96,11 +106,14 @@ public struct GreetingRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
         accented: String? = nil
     ) {
         self.id = id
-        self.rocket = rocket
-        self.japanese = japanese
-        self.accented = accented
+        self.rocket = rocket ?? "🚀"
+        self.japanese = japanese ?? "こんにちは"
+        self.accented = accented ?? "café"
         self.related = .empty
-        self._changedFields = Set(primitiveValues().keys)
+        if rocket == nil { _suppliedDefaults.insert("rocket") }
+        if japanese == nil { _suppliedDefaults.insert("japanese") }
+        if accented == nil { _suppliedDefaults.insert("accented") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     /// Create a record with an auto-generated id. The id is NOT
@@ -114,40 +127,62 @@ public struct GreetingRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
         accented: String? = nil
     ) {
         self.id = PrimitiveSchemaRegistry.newId()
-        self.rocket = rocket
-        self.japanese = japanese
-        self.accented = accented
+        self.rocket = rocket ?? "🚀"
+        self.japanese = japanese ?? "こんにちは"
+        self.accented = accented ?? "café"
         self.related = .empty
         self._explicitId = false
-        self._changedFields = Set(primitiveValues().keys)
+        if rocket == nil { _suppliedDefaults.insert("rocket") }
+        if japanese == nil { _suppliedDefaults.insert("japanese") }
+        if accented == nil { _suppliedDefaults.insert("accented") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     public init?(record: PrimitiveRecord) {
+        guard !record.isCleared("rocket"),
+              !record.isCleared("japanese"),
+              !record.isCleared("accented")
+        else { return nil }
+        let _rocket = record.fittingValue("rocket", as: .string)?.asString
+        let _japanese = record.fittingValue("japanese", as: .string)?.asString
+        let _accented = record.fittingValue("accented", as: .string)?.asString
         self.id = record.id
-        self.rocket = record.holds("rocket") == false ? "🚀" : record["rocket"]?.asString
-        self.japanese = record.holds("japanese") == false ? "こんにちは" : record["japanese"]?.asString
-        self.accented = record.holds("accented") == false ? "café" : record["accented"]?.asString
+        self.rocket = _rocket ?? "🚀"
+        self.japanese = _japanese ?? "こんにちは"
+        self.accented = _accented ?? "café"
         self.related = .empty
         self._changedFields = []
+        if _rocket == nil { _suppliedDefaults.insert("rocket") }
+        if _japanese == nil { _suppliedDefaults.insert("japanese") }
+        if _accented == nil { _suppliedDefaults.insert("accented") }
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
     public init?(row: [String: JSONValue]) {
-        guard let id = row["id"]?.stringValue
+        guard let id = row["id"]?.stringValue,
+              !PrimitiveRecord.isCleared("rocket", in: row),
+              !PrimitiveRecord.isCleared("japanese", in: row),
+              !PrimitiveRecord.isCleared("accented", in: row)
         else { return nil }
+        let _rocket = PrimitiveRecord.fittingValue("rocket", as: .string, in: row)?.asString
+        let _japanese = PrimitiveRecord.fittingValue("japanese", as: .string, in: row)?.asString
+        let _accented = PrimitiveRecord.fittingValue("accented", as: .string, in: row)?.asString
         self.id = id
-        self.rocket = PrimitiveRecord.holds("rocket", in: row) == false ? "🚀" : row["rocket"]?.stringValue
-        self.japanese = PrimitiveRecord.holds("japanese", in: row) == false ? "こんにちは" : row["japanese"]?.stringValue
-        self.accented = PrimitiveRecord.holds("accented", in: row) == false ? "café" : row["accented"]?.stringValue
+        self.rocket = _rocket ?? "🚀"
+        self.japanese = _japanese ?? "こんにちは"
+        self.accented = _accented ?? "café"
         self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []
+        if _rocket == nil { _suppliedDefaults.insert("rocket") }
+        if _japanese == nil { _suppliedDefaults.insert("japanese") }
+        if _accented == nil { _suppliedDefaults.insert("accented") }
     }
 
     public func primitiveValues() -> [String: PrimitiveValue] {
         var values: [String: PrimitiveValue] = [:]
-        if let rocket { values["rocket"] = .string(rocket) }
-        if let japanese { values["japanese"] = .string(japanese) }
-        if let accented { values["accented"] = .string(accented) }
+        if !_suppliedDefaults.contains("rocket") { values["rocket"] = .string(rocket) }
+        if !_suppliedDefaults.contains("japanese") { values["japanese"] = .string(japanese) }
+        if !_suppliedDefaults.contains("accented") { values["accented"] = .string(accented) }
         return values
     }
 
@@ -157,11 +192,17 @@ public struct GreetingRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try container.decode(String.self, forKey: .id)
-        self.rocket = try container.decodeIfPresent(String.self, forKey: .rocket)
-        self.japanese = try container.decodeIfPresent(String.self, forKey: .japanese)
-        self.accented = try container.decodeIfPresent(String.self, forKey: .accented)
+        let _rocket = container.fittingValue(forKey: .rocket, as: .string)?.asString
+        self.rocket = _rocket ?? "🚀"
+        let _japanese = container.fittingValue(forKey: .japanese, as: .string)?.asString
+        self.japanese = _japanese ?? "こんにちは"
+        let _accented = container.fittingValue(forKey: .accented, as: .string)?.asString
+        self.accented = _accented ?? "café"
         self.related = .empty
-        self._changedFields = Set(primitiveValues().keys)
+        if _rocket == nil { _suppliedDefaults.insert("rocket") }
+        if _japanese == nil { _suppliedDefaults.insert("japanese") }
+        if _accented == nil { _suppliedDefaults.insert("accented") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     public enum CodingKeys: String, CodingKey {

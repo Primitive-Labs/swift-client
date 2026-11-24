@@ -283,6 +283,9 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             }
             columns.append("\"\(field.name)\" \(sqlType)")
         }
+        // The stored values a row's columns do not carry as stored (#6304,
+        // `PrimitiveRecord.storedKindsKey`); NULL for almost every row.
+        columns.append("\"\(PrimitiveRecord.storedKindsKey)\" TEXT")
 
         if withDocIdColumn {
             columns.append("PRIMARY KEY (\"_meta_doc_id\", \"id\")")
@@ -384,6 +387,17 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
         var rows: [[String: JSONValue]] = []
         reportingFailure("a raw query") { rows = try executeQuery(sql, params: params) }
         return rows
+    }
+
+    /// The stored-kinds column's value for `stored` (#6304,
+    /// `PrimitiveRecord.storedKindsKey`): its JSON text, which a row reads
+    /// back as the object.
+    static func storedKindsColumn(_ stored: [String: JSONValue]) -> JSONValue {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(JSONValue.object(stored)),
+              let text = String(data: data, encoding: .utf8) else { return .null }
+        return .string(text)
     }
 
     // MARK: - Data Sync
@@ -654,6 +668,13 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
                 }
             }
         }
+        // The stored values a row's columns do not carry as stored (#6304) are
+        // selected in both modes, so a selected field reads as its record does;
+        // `storedKindsProjected` drops the entries of fields the projection
+        // leaves out.
+        if tableCols.contains(PrimitiveRecord.storedKindsKey) {
+            selected.insert(PrimitiveRecord.storedKindsKey)
+        }
         _ = stringsetFields // stringsets don't appear in SELECT either way
 
         // Deterministic column order for readable SQL.
@@ -672,6 +693,26 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             )
         }
         return (columns.joined(separator: ", "), aliased)
+    }
+
+    /// `row` with its stored-kinds entry (#6304, `PrimitiveRecord.storedKindsKey`)
+    /// kept only for the fields `projection` answers: those it lists under an
+    /// inclusion projection, all but those it lists under an exclusion one.
+    /// The key goes when no entry is left, as a row with none carries none.
+    static func storedKindsProjected(
+        _ row: [String: JSONValue],
+        projection: [String: Int]?
+    ) -> [String: JSONValue] {
+        guard let projection, !projection.isEmpty,
+              case .object(let stored)? = row[PrimitiveRecord.storedKindsKey] else { return row }
+        let include = projection.values.contains(1)
+        let kept = stored.filter { field, _ in
+            include ? projection[field] == 1 : projection[field] != 0
+        }
+        guard kept.count != stored.count else { return row }
+        var out = row
+        out[PrimitiveRecord.storedKindsKey] = kept.isEmpty ? nil : .object(kept)
+        return out
     }
 
     /// After a main-table SELECT, fill each row's stringset fields
@@ -864,6 +905,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             stringsetFields: stringsetFields,
             projection: options?.projection
         )
+        rows = rows.map { Self.storedKindsProjected($0, projection: options?.projection) }
         // The unpaginated read mints no cursors, so the internal sort-value
         // aliases (#3228) are of no use to it — strip them so its rows carry
         // exactly the columns the projection asked for, as before.
@@ -927,6 +969,7 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
             stringsetFields: stringsetFields,
             projection: options?.projection
         )
+        rows = rows.map { Self.storedKindsProjected($0, projection: options?.projection) }
         let hasMore: Bool = {
             guard let limit else { return false }
             if rows.count > limit {
@@ -1310,7 +1353,11 @@ public final class BaoModelQueryEngine: @unchecked Sendable {
                     row[name] = .number(sqlite3_column_double(stmt, i))
                 case SQLITE_TEXT:
                     if let cStr = sqlite3_column_text(stmt, i) {
-                        row[name] = .string(String(cString: cStr))
+                        let text = String(cString: cStr)
+                        // The stored-kinds column reads back as the object it was written from.
+                        row[name] = name == PrimitiveRecord.storedKindsKey
+                            ? (JSONValue(jsonText: text) ?? .string(text))
+                            : .string(text)
                     }
                 case SQLITE_NULL:
                     break // omit nulls

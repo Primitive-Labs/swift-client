@@ -285,9 +285,10 @@ public final class DocumentRecords: Sendable {
                 ))
             }
             try assertRecordLogEntry(documentId: documentId, mutations: mutations, report: report)
-            // A string outside an enforced enum of the db3's type is refused here, as the room would (#5897).
+            // A string outside an enforced enum of the db3's type is refused here, as the room would (#5897);
+            // a typed local-only db3's store judges its whole type in the commit (#6025).
             try assertRecordLogDeclaredEnums(
-                documentId: documentId, mutations: mutations, enums: binding.declaredType?.enums ?? [:], report: report
+                documentId: documentId, mutations: mutations, enums: binding.precommitDeclaredType?.enums ?? [:], report: report
             )
             let seq = try binding.commit([RecordLogWrite(mutations: mutations)]).last?.seq
             return (

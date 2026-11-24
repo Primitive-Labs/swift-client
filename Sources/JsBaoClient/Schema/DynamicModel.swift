@@ -2671,6 +2671,21 @@ public final class DynamicModel: @unchecked Sendable {
         return (try? local.holds(id: recordId, field: field)) ?? nil
     }
 
+    /// Whether the db3's held revision clears `field`; `false` on a Y.Map
+    /// document, where a record lacking a field merely lacks it.
+    internal func isCleared(recordId: String, field: String) -> Bool {
+        local?.clears(field: field) ?? false
+    }
+
+    /// The stored value of `field` when it is of the kind `type` takes,
+    /// judged on its stored spelling (`PrimitiveRecord.fitting`); `nil` when
+    /// missing, `null` or of another kind. A Y.Map document's `0` and `1` are
+    /// booleans.
+    internal func fittingValue(recordId: String, field: String, type: PrimitiveFieldType) -> PrimitiveValue? {
+        guard let raw = readRaw(recordId: recordId, field: field), let value = JSONValue(jsonText: raw) else { return nil }
+        return PrimitiveRecord.fitting(value, as: type, numericBooleans: local == nil)
+    }
+
     internal func fieldNames(recordId: String) -> Set<String> {
         if let local { return (try? local.fieldNames(id: recordId)) ?? [] }
         return withTx { [self] txn in
@@ -2832,6 +2847,14 @@ public final class DynamicModel: @unchecked Sendable {
             } else if let sql = sqliteRepresentation(of: v) {
                 row[name] = sql
             }
+        }
+        // A stored value the decode above converts (a number in a boolean
+        // field) or drops (a number in a date field) is listed as stored, so
+        // a model built from the row judges the stored kind as it does for
+        // the record (#6304). The row's columns, and so every filter and
+        // sort, are unchanged.
+        if let stored = PrimitiveRecord.storedKinds(of: schema.fields, raw: { try? rec.get(tx: tx, key: $0) }) {
+            row[PrimitiveRecord.storedKindsKey] = BaoModelQueryEngine.storedKindsColumn(stored)
         }
         queryEngine.upsertRecord(
             modelName: schema.name,

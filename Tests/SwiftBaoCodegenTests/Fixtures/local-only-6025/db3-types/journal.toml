@@ -1,0 +1,41 @@
+[type]
+name = "journal6025"
+allowLocalOnly = true
+models = ["tag6025"]
+
+[models.entry6025]
+class_name = "Entry6025"
+removedFields = ["legacy"]
+
+[models.entry6025.fields.title]
+type = "string"
+indexed = true
+required = true
+
+[models.entry6025.fields.dueAt]
+type = "date"
+storedAs = "due"
+default = 2026-01-01
+
+[models.entry6025.fields.weight]
+type = "number"
+default = 1.5
+
+[models.entry6025.fields.status]
+ref = "Status"
+enforce_enum = true
+default = "open"
+
+[models.entry6025.fields.embedding]
+type = "vector"
+dims = 3
+element = "f32"
+
+[models.entry6025.fields.old]
+type = "string"
+deprecated = true
+cleared = true
+
+[[models.entry6025.unique_constraints]]
+name = "title_due"
+fields = ["title", "dueAt"]

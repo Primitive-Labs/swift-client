@@ -24,22 +24,50 @@ public enum CollectionRole: String, Codable, Sendable, Equatable {
 }
 
 /// A collection-level access level from before collection roles: `reader`
-/// (a viewer) or `read-write` (an editor). `read-write` carries an explicit
-/// raw value (the hyphen isn't a legal Swift identifier).
+/// (a viewer) or `read-write` (an editor). A level this client does not know
+/// decodes as `.unknown` carrying the string sent.
 @available(*, deprecated, message: "Collections have fixed roles: use CollectionRole. Removed by #4718.")
-public enum CollectionPermission: String, Codable, Sendable, Equatable {
+public enum CollectionPermission: RawRepresentable, CaseIterable, Codable, Sendable, Hashable {
     case reader
-    case readWrite = "read-write"
+    case readWrite
+    /// A level this client does not know, as the server sent it.
+    case unknown(String)
+
+    /// The known levels.
+    public static var allCases: [CollectionPermission] { [.reader, .readWrite] }
+
+    public init(rawValue: String) {
+        switch rawValue {
+        case "reader": self = .reader
+        case "read-write": self = .readWrite
+        default: self = .unknown(rawValue)
+        }
+    }
+
+    /// The wire string: `"reader"`, `"read-write"`, or the unknown level.
+    public var rawValue: String {
+        switch self {
+        case .reader: return "reader"
+        case .readWrite: return "read-write"
+        case .unknown(let value): return value
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        self.init(rawValue: try decoder.singleValueContainer().decode(String.self))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
 
-/// The caller's effective permission on a document *inside* a collection.
+/// The caller's effective permission on a document *inside* a collection:
+/// the document level (`.owner`, `.readWrite`, `.reader`, or `.unknown`).
 /// Admins/owners always resolve to `.owner`. Mirrors JS
 /// `CollectionDocumentInfo.permission`.
-public enum CollectionDocumentPermission: String, Codable, Sendable, Equatable {
-    case owner
-    case readWrite = "read-write"
-    case reader
-}
+public typealias CollectionDocumentPermission = DocumentAccessLevel
 
 // MARK: Collection metadata
 
@@ -120,7 +148,7 @@ public struct CollectionGroupPermissionInfo: Decodable, Sendable, Equatable {
     public let groupType: String
     public let groupId: String
     @available(*, deprecated, message: "Read role. Removed by #4718.")
-    public let permission: String
+    public let permission: CollectionAccessLevel
     /// The group's role on the collection.
     public let role: CollectionRole?
     public let grantedAt: String
@@ -131,7 +159,7 @@ public struct CollectionGroupPermissionInfo: Decodable, Sendable, Equatable {
 public struct CollectionMemberInfo: Decodable, Sendable, Equatable {
     public let userId: String
     @available(*, deprecated, message: "Read role. Removed by #4718.")
-    public let permission: String
+    public let permission: CollectionAccessLevel
     /// The member's role on the collection.
     public let role: CollectionRole?
     public let addedAt: String?
@@ -437,7 +465,7 @@ public struct CollectionGroupMemberAdd: Decodable, Sendable, Equatable {
     public let groupType: String
     public let role: CollectionRole
     @available(*, deprecated, message: "Read role. Removed by #4718.")
-    public let permission: String
+    public let permission: CollectionAccessLevel
     public let addedAt: String?
     @available(*, deprecated, message: "Read role. Removed by #4718.")
     public let addedBy: String
@@ -458,7 +486,7 @@ public struct CollectionMemberEntry: Decodable, Sendable, Equatable {
     public let groupType: String?
     public let role: CollectionRole
     @available(*, deprecated, message: "Read role. Removed by #4718.")
-    public let permission: String
+    public let permission: CollectionAccessLevel
     public let addedAt: String?
     @available(*, deprecated, message: "Read role. Removed by #4718.")
     public let addedBy: String?

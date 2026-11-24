@@ -277,6 +277,13 @@ public enum JsBaoErrorCode: String, Sendable {
     /// `details["type"]` name them. Nothing of the db3 is applied and the
     /// open is not retried; subscribe with `allowUnknownType` to open it anyway.
     case db3TypeUnknownToClient = "DB3_TYPE_UNKNOWN_TO_CLIENT"
+    /// A db3 that lives only on this device whose type's declarations do
+    /// not stand with this build: ``Db3State/error`` when the build's
+    /// declarations were not installed (`reasons`, named as a push refusal
+    /// names them), diverged from the ones the copy holds, or cannot be
+    /// read. A write refused for the last two carries `details["scope"]`
+    /// `"local"` and `details["diverged"]` or `details["unreadable"]`.
+    case db3TypeRefused = "DB3_TYPE_REFUSED"
     /// A device read with `QueryOptions.maxDrift` whose db3 copy is further
     /// behind the server than the bound, or has not heard the server's
     /// position yet (`details["drift"]` is then `null`). `details` carry

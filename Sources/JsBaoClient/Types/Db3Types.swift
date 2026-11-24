@@ -62,8 +62,9 @@ public struct Db3Info: Decodable, Sendable, Equatable {
     /// The opaque metadata blob, when the route answers it.
     public let metadata: JSONValue?
     /// The caller's level, when the route answers it (`get` for a grant
-    /// holder, each `listMine` row); `nil` otherwise.
-    public let permission: DocumentPermission?
+    /// holder, each `listMine` row); `nil` otherwise. A level this client
+    /// does not know is `.unknown`.
+    public let permission: DocumentAccessLevel?
     /// How the caller holds it, when `get` answers it (`.app` for an app
     /// grant, `.resource` for a member of the resource that holds it); `nil`
     /// when absent or a value this client does not know.
@@ -94,7 +95,7 @@ public struct Db3Info: Decodable, Sendable, Equatable {
 
     public init(
         id: String, title: String, createdBy: String, createdAt: String, modifiedAt: String, custodian: String?,
-        sync: Bool, type: String?, tags: [String], metadata: JSONValue?, permission: DocumentPermission?,
+        sync: Bool, type: String?, tags: [String], metadata: JSONValue?, permission: DocumentAccessLevel?,
         accessSource: DocumentAccessSource?, grantedAt: String?, grantedBy: String? = nil, via: Db3Via? = nil,
         localOnly: Bool = false, publicAccess: Db3PublicAccessLevel? = nil, publicAccessUpdatedBy: String? = nil,
         publicAccessUpdatedAt: String? = nil
@@ -138,7 +139,7 @@ public struct Db3Info: Decodable, Sendable, Equatable {
         type = try c.decodeIfPresent(String.self, forKey: .type)
         tags = try c.decodeIfPresent([String].self, forKey: .tags) ?? []
         metadata = try c.decodeIfPresent(JSONValue.self, forKey: .metadata)
-        permission = try c.decodeIfPresent(DocumentPermission.self, forKey: .permission)
+        permission = try c.decodeIfPresent(DocumentAccessLevel.self, forKey: .permission)
         accessSource = DocumentAccessSource.lenient(c, forKey: .accessSource)
         grantedAt = try c.decodeIfPresent(String.self, forKey: .grantedAt)
         grantedBy = try c.decodeIfPresent(String.self, forKey: .grantedBy)

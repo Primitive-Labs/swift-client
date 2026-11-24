@@ -52,3 +52,27 @@ required = ["kind"]
 type = "object"
 [defs.ShipUnused.properties.note]
 type = "string"
+
+# A list def (#6307): the field stores the array itself, `[String]` in Swift.
+[defs.ShipTags]
+type = "array"
+items = { type = "string", minLength = 1 }
+maxItems = 3
+
+# A list of an object def, by name: `[ShipAddress]` in Swift.
+[defs.ShipStops]
+type = "array"
+items = { ref = "ShipAddress" }
+
+# A map with typed values (#6307): `[String: Double]` in Swift.
+[defs.ShipWeights]
+type = "object"
+additionalProperties = { type = "number", minimum = 0 }
+
+# A value schema beside a required key `properties` does not declare: `id`
+# is a `Double` property, the other keys a `[String: Double]` catch-all.
+[defs.ShipKeyed]
+type = "object"
+properties = {}
+required = ["id"]
+additionalProperties = { type = "number" }

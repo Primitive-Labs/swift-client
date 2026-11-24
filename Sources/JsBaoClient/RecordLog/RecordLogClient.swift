@@ -242,6 +242,20 @@ extension JsBaoClient {
         recordLogState.binding(documentId)
     }
 
+    /// Reconcile every bound typed local-only copy with the local-only
+    /// declarations registered now (#6025): a build registered after its
+    /// copies bound installs, or reports, as one registered before.
+    func reconcileLocalTypes() {
+        for (documentId, binding) in recordLogState.bindings where binding.isLocalOnly && !binding.isClosed {
+            let knownType = documentManager.getLocalMetadata(documentId)?.db3Type.flatMap { $0.isEmpty ? nil : $0 }
+            do {
+                try binding.reconcileLocalType({ [db3KnownTypes] in db3KnownTypes.localOnly(of: $0) }, knownType: knownType)
+            } catch {
+                logger.warn("[db3] \(documentId): reconciling its local type failed:", error.localizedDescription)
+            }
+        }
+    }
+
     /// The binding `db3.records(_:)` and `documents.records(_:)` read and write through:
     /// the document must be open, and format 3.
     func modelFreeBinding(_ documentId: String) throws -> RecordLogDocumentBinding {
@@ -264,6 +278,8 @@ extension JsBaoClient {
     func readableModelFreeBinding(_ documentId: String) throws -> RecordLogDocumentBinding {
         let binding = try modelFreeBinding(documentId)
         guard binding.isResident else { throw db3NotResidentError([documentId], source: "documents.records") }
+        // #6025 — a typed local-only copy reads by the declarations its store holds now.
+        binding.revalidateLocalType()
         return binding
     }
 
@@ -468,7 +484,12 @@ extension JsBaoClient {
         binding.createdLocally = documentManager.isPendingCreate(documentId)
         // #5155 — one that lives only on this device: its row says so (a
         // create), or its store's mark does (every later bind).
-        if isLocalOnlyDb3Row(documentId) || binding.isLocalOnly { try binding.markLocalOnly() }
+        if isLocalOnlyDb3Row(documentId) || binding.isLocalOnly {
+            // #6025 — a typed one: created with its build's declarations, then reconciled with them at every bind.
+            let knownType = documentManager.getLocalMetadata(documentId)?.db3Type.flatMap { $0.isEmpty ? nil : $0 }
+            try binding.markLocalOnly(type: knownType.flatMap { db3KnownTypes.localOnly(of: $0) })
+            try binding.reconcileLocalType({ [db3KnownTypes] in db3KnownTypes.localOnly(of: $0) }, knownType: knownType)
+        }
         // A db3 created here with a type declares nothing to its room (#5020).
         if let type = documentManager.getLocalMetadata(documentId)?.db3Type, !type.isEmpty {
             try binding.seedType(type)
@@ -602,7 +623,7 @@ extension JsBaoClient {
                 self.db3IndexReadForTest?(documentId)
                 if let hold = self.db3IndexReadHoldForTest { await hold(documentId) }
                 let answer = try await self.requestJSON(
-                    method: .get, path: "/db3/\(URLEncoding.encodeComponent(documentId))/indexes",
+                    method: .get, path: "/db3/\(URLEncoding.pathSegment(documentId, name: "db3Id"))/indexes",
                     options: RequestOptions(timeout: Self.db3IndexListTimeout)
                 )
                 return (answer?["indexes"]?.arrayValue ?? []).compactMap(RecordLogIndexEntry.init(json:))

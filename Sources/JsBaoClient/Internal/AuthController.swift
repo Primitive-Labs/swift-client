@@ -246,16 +246,37 @@ public final class AuthController: @unchecked Sendable {
     /// Drop the handler at client teardown, so a token applied afterwards
     /// cannot reach a socket that is being (or has been) closed.
     func clearTokenAppliedHandler() {
-        lock.withLock { tokenAppliedHandler = nil; identityChangedHandler = nil }
+        lock.withLock { tokenAppliedHandler = nil; identityChangedHandler = nil; signedInHandler = nil }
+    }
+
+    /// Awaited by every interactive sign-in (email code, magic link, passkey,
+    /// OAuth, Apple) once its token is applied, before the call returns. The
+    /// client waits here for the rebind of its user-scoped storage that the
+    /// change of user started (see `identityChangedHandler`), so whatever the
+    /// app does next with the result is the new user's.
+    private var signedInHandler: (@Sendable () async -> Void)?
+
+    func setSignedInHandler(_ handler: @escaping @Sendable () async -> Void) {
+        lock.withLock { signedInHandler = handler }
+    }
+
+    /// Run the signed-in handler, if one is installed.
+    private func signedIn() async {
+        let handler = lock.withLock { signedInHandler }
+        await handler?()
     }
 
     /// Called once the signed-in user changed — another user's token applied,
     /// or the token cleared by a logout, `updateToken(nil)` or a rejected
-    /// refresh — after the change is installed. The token-applied handler is
-    /// told about none of the clearing paths.
-    private var identityChangedHandler: (@Sendable () -> Void)?
+    /// refresh — after the change is installed, with the cause of the token
+    /// application and whether `logout()` itself made the change. The latter
+    /// is the controller's own knowledge, never read off the cause: a caller
+    /// of `updateToken(nil, cause: "logout")` did not run a logout. The
+    /// token-applied handler is told about none of the clearing paths. The
+    /// client rebinds its user-scoped storage from here.
+    private var identityChangedHandler: (@Sendable (_ cause: String?, _ byLogout: Bool) -> Void)?
 
-    func setIdentityChangedHandler(_ handler: @escaping @Sendable () -> Void) {
+    func setIdentityChangedHandler(_ handler: @escaping @Sendable (_ cause: String?, _ byLogout: Bool) -> Void) {
         lock.withLock { identityChangedHandler = handler }
     }
 
@@ -490,6 +511,8 @@ public final class AuthController: @unchecked Sendable {
     /// - Parameter requiring: drop the application unless the token held now
     ///   still matches. Unlike `onlyWhenSignedOut` this also guards *clearing*
     ///   the token, which is what a rejected refresh does.
+    /// - Parameter byLogout: `logout()` is clearing the token. Only `logout()`
+    ///   passes it; the identity-changed handler is told.
     /// - Returns: `true` when the token was applied, `false` when a guard
     ///   dropped it — callers with follow-up work (deleting the persisted JWT)
     ///   must skip it in the latter case.
@@ -500,7 +523,8 @@ public final class AuthController: @unchecked Sendable {
         cause: String?,
         onlyWhenSignedOut: Bool = false,
         explicitSignIn: Bool = false,
-        requiring precondition: HeldTokenPrecondition = .none
+        requiring precondition: HeldTokenPrecondition = .none,
+        byLogout: Bool = false
     ) -> Bool {
         let isSignIn = explicitSignIn || Self.isInteractiveLogin(cause)
         // Logout race guard: a refresh/restore that resolves AFTER the
@@ -572,7 +596,7 @@ public final class AuthController: @unchecked Sendable {
 
         if userChanged {
             let notify = lock.withLock { identityChangedHandler }
-            notify?()
+            notify?(cause, byLogout)
         }
 
         // The mode is read through the locked accessor at each construction
@@ -1214,6 +1238,7 @@ public final class AuthController: @unchecked Sendable {
 
         let previous = getToken()
         applyToken(result.token, previous: previous, cause: "oauthCallback")
+        await signedIn()
         return result
     }
 
@@ -1267,6 +1292,7 @@ public final class AuthController: @unchecked Sendable {
 
         let previous = getToken()
         applyToken(result.token, previous: previous, cause: "apple")
+        await signedIn()
         return result
     }
 
@@ -1579,6 +1605,7 @@ public final class AuthController: @unchecked Sendable {
         let envelope: MagicLinkVerifyEnvelope = try applyVerifiedToken(
             MagicLinkVerifyEnvelope.self, from: raw, path: endpoint, cause: "magicLinkVerify"
         )
+        await signedIn()
 
         return MagicLinkVerifyResult(
             user: envelope.user,
@@ -1618,6 +1645,7 @@ public final class AuthController: @unchecked Sendable {
         let envelope: OtpVerifyEnvelope = try applyVerifiedToken(
             OtpVerifyEnvelope.self, from: raw, path: endpoint, cause: "otpVerify"
         )
+        await signedIn()
 
         return OtpVerifyResult(user: envelope.user, isNewUser: envelope.isNewUser)
     }
@@ -1687,6 +1715,7 @@ public final class AuthController: @unchecked Sendable {
             path: "/passkey/auth/finish",
             cause: "passkeyAuth"
         )
+        await signedIn()
         return PasskeySignInResult(user: envelope.user, isNewUser: envelope.isNewUser)
     }
 
@@ -1795,7 +1824,7 @@ public final class AuthController: @unchecked Sendable {
         await postServerLogout()
 
         let previous = getToken()
-        applyToken(nil, previous: previous, cause: "logout")
+        applyToken(nil, previous: previous, cause: "logout", byLogout: true)
 
         // Default-true in JS: drop the in-memory offline identity unless the
         // caller explicitly opts out.

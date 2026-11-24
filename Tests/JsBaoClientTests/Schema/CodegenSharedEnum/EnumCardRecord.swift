@@ -54,34 +54,36 @@ public struct EnumCardRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
     public var id: String {
         didSet { _changedFields.insert("id") }
     }
-    public var title: String? {
-        didSet { _changedFields.insert("title") }
+    public var title: String {
+        didSet { _changedFields.insert("title"); _suppliedDefaults.remove("title") }
     }
-    public var points: Double? {
-        didSet { _changedFields.insert("points") }
+    public var points: Double {
+        didSet { _changedFields.insert("points"); _suppliedDefaults.remove("points") }
     }
-    public var ratio: Double? {
-        didSet { _changedFields.insert("ratio") }
+    public var ratio: Double {
+        didSet { _changedFields.insert("ratio"); _suppliedDefaults.remove("ratio") }
     }
-    public var done: Bool? {
-        didSet { _changedFields.insert("done") }
+    public var done: Bool {
+        didSet { _changedFields.insert("done"); _suppliedDefaults.remove("done") }
     }
     /// The `phase` field as stored: any string, one of `Phase`'s
     /// values or not. Assign `phase` to change it.
-    public private(set) var phaseRaw: String? {
-        didSet { _changedFields.insert("phase") }
+    public private(set) var phaseRaw: String {
+        didSet { _changedFields.insert("phase"); _suppliedDefaults.remove("phase") }
     }
     /// The `phase` field as the shared enum `Phase`: `nil` when the
     /// field is absent or holds a value outside the enum (`phaseRaw`
     /// keeps the string). Assigning stores the case's raw value.
+    /// Assigning `nil` leaves the stored value unchanged, since the
+    /// field reads its default when it holds no value.
     /// `Phase` is declared in `Primitive.generated.swift`, which
     /// `primitive functions codegen --lang swift` writes.
     public var phase: Phase? {
-        get { phaseRaw.flatMap { .init(rawValue: $0) } }
-        set { phaseRaw = newValue?.rawValue }
+        get { .init(rawValue: phaseRaw) }
+        set { if let newValue { phaseRaw = newValue.rawValue } }
     }
     public var rank: Double {
-        didSet { _changedFields.insert("rank") }
+        didSet { _changedFields.insert("rank"); _suppliedDefaults.remove("rank") }
     }
     public var tags: Set<String>? {
         didSet { _changedFields.insert("tags") }
@@ -111,6 +113,15 @@ public struct EnumCardRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
     /// Not part of the record's persisted/equatable identity.
     public private(set) var _changedFields: Set<String> = []
 
+    /// The fields whose value this model supplied from their `default`
+    /// rather than read or were given (#6304): a field the record held
+    /// no value of its kind for, an initializer parameter left out, a
+    /// decoded key that held none. `primitiveValues()` leaves them out,
+    /// so no write sends a default the model filled in; assigning the
+    /// field, or `markAllChanged()`, makes its value the caller's.
+    /// Not part of the record's persisted/equatable identity.
+    public private(set) var _suppliedDefaults: Set<String> = []
+
     /// Forget the pending field changes without writing them, so a
     /// later `save(in:)` treats this value as unmodified. Mirrors
     /// js-bao's `discardChanges()`. The field values themselves are
@@ -135,6 +146,7 @@ public struct EnumCardRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
     /// Every field it writes wins last-writer-wins against a concurrent
     /// remote edit to that field, which is the cost of a full copy.
     public mutating func markAllChanged() {
+        _suppliedDefaults = []
         _changedFields = Set(primitiveValues().keys)
     }
 
@@ -150,16 +162,21 @@ public struct EnumCardRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
         note: String? = nil
     ) {
         self.id = id
-        self.title = title
-        self.points = points
-        self.ratio = ratio
-        self.done = done
-        self.phaseRaw = phase?.rawValue
+        self.title = title ?? "Untitled"
+        self.points = points ?? 3
+        self.ratio = ratio ?? 0.5
+        self.done = done ?? false
+        self.phaseRaw = phase?.rawValue ?? "open"
         self.rank = rank
         self.tags = tags
         self.note = note
         self.related = .empty
-        self._changedFields = Set(primitiveValues().keys)
+        if title == nil { _suppliedDefaults.insert("title") }
+        if points == nil { _suppliedDefaults.insert("points") }
+        if ratio == nil { _suppliedDefaults.insert("ratio") }
+        if done == nil { _suppliedDefaults.insert("done") }
+        if phase == nil { _suppliedDefaults.insert("phase") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     /// Create a record with an auto-generated id. The id is NOT
@@ -178,62 +195,100 @@ public struct EnumCardRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
         note: String? = nil
     ) {
         self.id = PrimitiveSchemaRegistry.newId()
-        self.title = title
-        self.points = points
-        self.ratio = ratio
-        self.done = done
-        self.phaseRaw = phase?.rawValue
+        self.title = title ?? "Untitled"
+        self.points = points ?? 3
+        self.ratio = ratio ?? 0.5
+        self.done = done ?? false
+        self.phaseRaw = phase?.rawValue ?? "open"
         self.rank = rank
         self.tags = tags
         self.note = note
         self.related = .empty
         self._explicitId = false
-        self._changedFields = Set(primitiveValues().keys)
+        if title == nil { _suppliedDefaults.insert("title") }
+        if points == nil { _suppliedDefaults.insert("points") }
+        if ratio == nil { _suppliedDefaults.insert("ratio") }
+        if done == nil { _suppliedDefaults.insert("done") }
+        if phase == nil { _suppliedDefaults.insert("phase") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     public init?(record: PrimitiveRecord) {
-        guard let rank = record.holds("rank") == false ? 1 : record["rank"]?.asNumber
+        guard !record.isCleared("title"),
+              !record.isCleared("points"),
+              !record.isCleared("ratio"),
+              !record.isCleared("done"),
+              !record.isCleared("phase"),
+              !record.isCleared("rank")
         else { return nil }
+        let _title = record.fittingValue("title", as: .string)?.asString
+        let _points = record.fittingValue("points", as: .number)?.asNumber
+        let _ratio = record.fittingValue("ratio", as: .number)?.asNumber
+        let _done = record.fittingValue("done", as: .boolean)?.asBoolean
+        let _phaseRaw = record.fittingValue("phase", as: .string)?.asString
+        let _rank = record.fittingValue("rank", as: .number)?.asNumber
         self.id = record.id
-        self.title = record.holds("title") == false ? "Untitled" : record["title"]?.asString
-        self.points = record.holds("points") == false ? 3 : record["points"]?.asNumber
-        self.ratio = record.holds("ratio") == false ? 0.5 : record["ratio"]?.asNumber
-        self.done = record.holds("done") == false ? false : record["done"]?.asBoolean
-        self.phaseRaw = record.holds("phase") == false ? "open" : record["phase"]?.asString
-        self.rank = rank
+        self.title = _title ?? "Untitled"
+        self.points = _points ?? 3
+        self.ratio = _ratio ?? 0.5
+        self.done = _done ?? false
+        self.phaseRaw = _phaseRaw ?? "open"
+        self.rank = _rank ?? 1
         self.tags = record.holds("tags") == false ? Set(["a"]) : record["tags"]?.asStringSet
         self.note = record["note"]?.asString
         self.related = .empty
         self._changedFields = []
+        if _title == nil { _suppliedDefaults.insert("title") }
+        if _points == nil { _suppliedDefaults.insert("points") }
+        if _ratio == nil { _suppliedDefaults.insert("ratio") }
+        if _done == nil { _suppliedDefaults.insert("done") }
+        if _phaseRaw == nil { _suppliedDefaults.insert("phase") }
+        if _rank == nil { _suppliedDefaults.insert("rank") }
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
     public init?(row: [String: JSONValue]) {
         guard let id = row["id"]?.stringValue,
-              let rank = PrimitiveRecord.holds("rank", in: row) == false ? 1 : row["rank"]?.numberValue
+              !PrimitiveRecord.isCleared("title", in: row),
+              !PrimitiveRecord.isCleared("points", in: row),
+              !PrimitiveRecord.isCleared("ratio", in: row),
+              !PrimitiveRecord.isCleared("done", in: row),
+              !PrimitiveRecord.isCleared("phase", in: row),
+              !PrimitiveRecord.isCleared("rank", in: row)
         else { return nil }
+        let _title = PrimitiveRecord.fittingValue("title", as: .string, in: row)?.asString
+        let _points = PrimitiveRecord.fittingValue("points", as: .number, in: row)?.asNumber
+        let _ratio = PrimitiveRecord.fittingValue("ratio", as: .number, in: row)?.asNumber
+        let _done = PrimitiveRecord.fittingValue("done", as: .boolean, in: row)?.asBoolean
+        let _phaseRaw = PrimitiveRecord.fittingValue("phase", as: .string, in: row)?.asString
+        let _rank = PrimitiveRecord.fittingValue("rank", as: .number, in: row)?.asNumber
         self.id = id
-        self.title = PrimitiveRecord.holds("title", in: row) == false ? "Untitled" : row["title"]?.stringValue
-        self.points = PrimitiveRecord.holds("points", in: row) == false ? 3 : row["points"]?.numberValue
-        self.ratio = PrimitiveRecord.holds("ratio", in: row) == false ? 0.5 : row["ratio"]?.numberValue
-        self.done = PrimitiveRecord.holds("done", in: row) == false ? false : row["done"]?.rowBoolValue
-        self.phaseRaw = PrimitiveRecord.holds("phase", in: row) == false ? "open" : row["phase"]?.stringValue
-        self.rank = rank
+        self.title = _title ?? "Untitled"
+        self.points = _points ?? 3
+        self.ratio = _ratio ?? 0.5
+        self.done = _done ?? false
+        self.phaseRaw = _phaseRaw ?? "open"
+        self.rank = _rank ?? 1
         self.tags = PrimitiveRecord.holds("tags", in: row) == false ? Set(["a"]) : (row["tags"]?.stringArrayValue).map(Set.init)
         self.note = row["note"]?.stringValue
         self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []
+        if _title == nil { _suppliedDefaults.insert("title") }
+        if _points == nil { _suppliedDefaults.insert("points") }
+        if _ratio == nil { _suppliedDefaults.insert("ratio") }
+        if _done == nil { _suppliedDefaults.insert("done") }
+        if _phaseRaw == nil { _suppliedDefaults.insert("phase") }
+        if _rank == nil { _suppliedDefaults.insert("rank") }
     }
 
     public func primitiveValues() -> [String: PrimitiveValue] {
-        var values: [String: PrimitiveValue] = [
-            "rank": .number(rank),
-        ]
-        if let title { values["title"] = .string(title) }
-        if let points { values["points"] = .number(points) }
-        if let ratio { values["ratio"] = .number(ratio) }
-        if let done { values["done"] = .boolean(done) }
-        if let phaseRaw { values["phase"] = .string(phaseRaw) }
+        var values: [String: PrimitiveValue] = [:]
+        if !_suppliedDefaults.contains("title") { values["title"] = .string(title) }
+        if !_suppliedDefaults.contains("points") { values["points"] = .number(points) }
+        if !_suppliedDefaults.contains("ratio") { values["ratio"] = .number(ratio) }
+        if !_suppliedDefaults.contains("done") { values["done"] = .boolean(done) }
+        if !_suppliedDefaults.contains("phase") { values["phase"] = .string(phaseRaw) }
+        if !_suppliedDefaults.contains("rank") { values["rank"] = .number(rank) }
         if let tags { values["tags"] = .stringset(tags) }
         if let note { values["note"] = .string(note) }
         return values
@@ -245,16 +300,28 @@ public struct EnumCardRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable, 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try container.decode(String.self, forKey: .id)
-        self.title = try container.decodeIfPresent(String.self, forKey: .title)
-        self.points = try container.decodeIfPresent(Double.self, forKey: .points)
-        self.ratio = try container.decodeIfPresent(Double.self, forKey: .ratio)
-        self.done = try container.decodeIfPresent(Bool.self, forKey: .done)
-        self.phaseRaw = try container.decodeIfPresent(String.self, forKey: .phaseRaw)
-        self.rank = try container.decode(Double.self, forKey: .rank)
+        let _title = container.fittingValue(forKey: .title, as: .string)?.asString
+        self.title = _title ?? "Untitled"
+        let _points = container.fittingValue(forKey: .points, as: .number)?.asNumber
+        self.points = _points ?? 3
+        let _ratio = container.fittingValue(forKey: .ratio, as: .number)?.asNumber
+        self.ratio = _ratio ?? 0.5
+        let _done = container.fittingValue(forKey: .done, as: .boolean)?.asBoolean
+        self.done = _done ?? false
+        let _phaseRaw = container.fittingValue(forKey: .phaseRaw, as: .string)?.asString
+        self.phaseRaw = _phaseRaw ?? "open"
+        let _rank = container.fittingValue(forKey: .rank, as: .number)?.asNumber
+        self.rank = _rank ?? 1
         self.tags = try container.decodeIfPresent(Set<String>.self, forKey: .tags)
         self.note = try container.decodeIfPresent(String.self, forKey: .note)
         self.related = .empty
-        self._changedFields = Set(primitiveValues().keys)
+        if _title == nil { _suppliedDefaults.insert("title") }
+        if _points == nil { _suppliedDefaults.insert("points") }
+        if _ratio == nil { _suppliedDefaults.insert("ratio") }
+        if _done == nil { _suppliedDefaults.insert("done") }
+        if _phaseRaw == nil { _suppliedDefaults.insert("phase") }
+        if _rank == nil { _suppliedDefaults.insert("rank") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     public enum CodingKeys: String, CodingKey {

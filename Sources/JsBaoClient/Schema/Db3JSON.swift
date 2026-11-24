@@ -1,8 +1,9 @@
 import Foundation
 
-// A db3 JSON field (#5899): a field whose `ref` names a `schemas/` object def,
-// stored as canonical JSON text in a `string` field and read and written as
-// the def's type. The canonical text is RFC 8785's (keys sorted by UTF-16
+// A db3 JSON field (#5899): a field whose `ref` names a `schemas/` object or
+// list def (#6307), stored as canonical JSON text in a `string` field and read
+// and written as the def's type. The value's root is an array when the def's
+// compiled schema has `type` `array`, and an object otherwise. The canonical text is RFC 8785's (keys sorted by UTF-16
 // code unit, no whitespace, strings and numbers as ECMAScript writes them),
 // byte for byte what js-bao and the functions SDK write for the same value.
 //
@@ -36,8 +37,9 @@ public protocol Db3JSONDef {
 
 /// Why a db3 JSON field's value was refused: JSON cannot hold a number above
 /// 2^53 in magnitude or a non-finite one (`number`), a lone surrogate
-/// (`surrogate`), a root that is not an object (`root`), a value of another
-/// kind (`type`), or the value does not match the def (`schema`).
+/// (`surrogate`), a root that is not the def's kind, an object or an array
+/// (`root`), a value of another kind (`type`), or the value does not match
+/// the def (`schema`).
 ///
 /// - Stability: beta
 public enum Db3JSONRefusalKind: String, Sendable, Equatable {
@@ -80,17 +82,19 @@ public extension Db3JSONDef {
     ///
     /// - Throws: `Db3JSONValueError` when JSON cannot hold the value exactly
     ///   (a number above 2^53 in magnitude, a non-finite number, a root that
-    ///   is not an object) or it does not match the def.
+    ///   is not the def's kind: an array for a list def, an object otherwise)
+    ///   or it does not match the def.
     /// - Stability: beta
     static func storedText(for value: Value, model: String, field: String) throws -> String {
+        let compiled = Db3JSONSchemas.parsed(id: id, text: schema)
         let text: String
         do {
-            text = try Db3JSONCanonical.text(Db3JSONTreeEncoder.encode(value))
+            text = try Db3JSONCanonical.text(Db3JSONTreeEncoder.encode(value, root: Db3JSONRoot(schema: compiled)))
         } catch let refusal as Db3JSONRefusal {
             throw Db3JSONValueError(model: model, field: field, def: id, path: refusal.path, reason: refusal.reason, kind: refusal.kind)
         }
         // A compiled schema that is not JSON text cannot check anything, so the value is refused, never passed unchecked.
-        guard let compiled = Db3JSONSchemas.parsed(id: id, text: schema) else {
+        guard let compiled else {
             throw Db3JSONValueError(model: model, field: field, def: id, path: "value", reason: Db3JSONSchemas.unreadable, kind: .schema)
         }
         // Validated as stored: the value the text carries, as js-bao validates it.
@@ -107,18 +111,22 @@ public extension Db3JSONDef {
     ///
     /// - Stability: beta
     static func canonicalText(_ value: Value) -> String? {
-        try? Db3JSONCanonical.text(Db3JSONTreeEncoder.encode(value))
+        try? Db3JSONCanonical.text(Db3JSONTreeEncoder.encode(value, root: Db3JSONRoot(schema: Db3JSONSchemas.parsed(id: id, text: schema))))
     }
 
     /// A stored text as the field reads it: the decoded value, or `nil` when
-    /// there is no text or it does not decode as `Value` (logged once per
-    /// model and field; the text stays in the model's `<field>Raw`). Reads do
-    /// not validate against the def.
+    /// there is no text, its root is not the def's kind (an array for a list
+    /// def, an object otherwise), or it does not decode as `Value` (logged
+    /// once per model and field; the text stays in the model's `<field>Raw`).
+    /// Reads check the root kind only and do not validate against the def.
     ///
     /// - Stability: beta
     static func value(fromStored text: String?, model: String, field: String) -> Value? {
         guard let text else { return nil }
-        if let value = try? JSONDecoder().decode(Value.self, from: Data(text.utf8)) { return value }
+        let root = Db3JSONRoot(schema: Db3JSONSchemas.parsed(id: id, text: schema))
+        let opener: UInt8 = root == .array ? UInt8(ascii: "[") : UInt8(ascii: "{")
+        let first = text.utf8.first { ![0x20, 0x09, 0x0A, 0x0D].contains($0) }
+        if first == opener, let value = try? JSONDecoder().decode(Value.self, from: Data(text.utf8)) { return value }
         Db3JSONMisreads.report(model: model, field: field, def: id)
         return nil
     }
@@ -320,23 +328,43 @@ private enum Db3JSONNumbers {
     }
 }
 
+/// The root kind a db3 JSON field's value takes: an array for a list def
+/// (#6307), whose compiled schema has `type` `array`, and an object for any
+/// other def.
+enum Db3JSONRoot: Equatable {
+    case object, array
+
+    /// The root kind `schema`, a def's compiled schema, gives its field.
+    init(schema: Db3JSONNode?) {
+        self = schema?["type"] == .string("array") ? .array : .object
+    }
+}
+
 /// Walks an `Encodable` value into a `Db3JSONNode`, applying the number rule.
 enum Db3JSONTreeEncoder {
-    /// The value's tree; its root must be an object.
-    static func encode<T: Encodable>(_ value: T) throws -> Db3JSONNode {
+    /// The value's tree; its root must be `root`'s kind, an object unless asked for an array.
+    static func encode<T: Encodable>(_ value: T, root: Db3JSONRoot = .object) throws -> Db3JSONNode {
         let slot = Db3JSONSlot()
         try value.encode(to: Db3JSONEncoder(slot: slot, codingPath: []))
         let node = slot.node
-        guard node.isObject else {
+        let fits: Bool
+        switch (root, node) {
+        case (.array, .array): fits = true
+        case (.object, .object): fits = true
+        default: fits = false
+        }
+        guard fits else {
             let what: String
             switch node {
             case .array: what = "an array"
+            case .object: what = "an object"
             case .null: what = "null"
             case .string: what = "string"
             case .bool: what = "boolean"
             default: what = "number"
             }
-            throw Db3JSONRefusal(kind: .root, path: "value", reason: "the value is \(what); a db3 JSON field holds an object")
+            let holds = root == .array ? "this db3 JSON field holds an array" : "a db3 JSON field holds an object"
+            throw Db3JSONRefusal(kind: .root, path: "value", reason: "the value is \(what); \(holds)")
         }
         return node
     }
@@ -1060,6 +1088,12 @@ enum Db3JSONValidator {
             if schema["additionalProperties"] == .bool(false) {
                 for key in ownKeys(object.keys) where properties.values[Db3JSONKey(key)] == nil {
                     fail("\(path).\(key)", "\(path).\(key) is not allowed", &issues)
+                }
+            }
+            // A map's value schema: each key `properties` does not declare, in own-key order.
+            if let valueSchema = schema["additionalProperties"], valueSchema.isObject {
+                for key in ownKeys(object.keys) where properties.values[Db3JSONKey(key)] == nil {
+                    walk(object.values[Db3JSONKey(key)]!, valueSchema, "\(path).\(key)", &issues)
                 }
             }
         }

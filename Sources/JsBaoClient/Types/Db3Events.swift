@@ -45,6 +45,7 @@ public enum Db3Permission: String, Sendable, Equatable {
     case reader
     case readWrite = "read-write"
     case owner
+    @available(*, deprecated, message: "No answer sends admin: a console administrator's access is owner.")
     case admin
     case refused
 }
@@ -53,10 +54,51 @@ public enum Db3Permission: String, Sendable, Equatable {
 public struct Db3StateError: Sendable, Equatable {
     public let code: String
     public let message: String
+    /// For `DB3_TYPE_REFUSED` on a db3 that lives only on this device, what
+    /// kept the build's declarations from being installed, named as a
+    /// synced db3's push refusal names it; `nil` otherwise.
+    public let reasons: [Db3TypeRefusalReason]?
 
     public init(code: String, message: String) {
         self.code = code
         self.message = message
+        self.reasons = nil
+    }
+
+    /// An error carrying the faults that refused a type's declarations.
+    public init(code: String, message: String, reasons: [Db3TypeRefusalReason]) {
+        self.code = code
+        self.message = message
+        self.reasons = reasons
+    }
+}
+
+/// One fault that kept a type's declarations from being installed on a db3:
+/// where (`models.<model>`, `models.<model>.fields.<field>` or
+/// `models.<model>.constraints.<name>`), why, and what the copy holds that
+/// breaks it.
+///
+/// ```swift
+/// for reason in try await client.db3.state(db3Id).error?.reasons ?? [] { print(reason.path, reason.reason) }
+/// ```
+public struct Db3TypeRefusalReason: Sendable, Equatable {
+    /// Where the fault is.
+    public let path: String
+    /// Why it refuses the declarations.
+    public let reason: String
+    /// Records of a model the declarations do not declare, or holding a value they do not take.
+    public let rows: Int?
+    /// Keys a unique constraint finds held by more than one record.
+    public let duplicates: Int?
+    /// Up to three of those keys, or `[id, value]` pairs of those values.
+    public let samples: [[JSONValue]]?
+
+    public init(path: String, reason: String, rows: Int? = nil, duplicates: Int? = nil, samples: [[JSONValue]]? = nil) {
+        self.path = path
+        self.reason = reason
+        self.rows = rows
+        self.duplicates = duplicates
+        self.samples = samples
     }
 }
 

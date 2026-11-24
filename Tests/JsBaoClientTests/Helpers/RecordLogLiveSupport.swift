@@ -112,6 +112,47 @@ final class RecordLogLiveApp {
         return client
     }
 
+    /// A client whose startup stops after binding the user of `token` (the
+    /// owner by default) and before storage is ready, until `storageReadyHold`
+    /// returns. Not waited for and not connected.
+    func startingClient(
+        _ name: String, models: [PrimitiveSchema], token: String? = nil, file: String? = nil,
+        storageReadyHold: @escaping @Sendable () async -> Void
+    ) -> JsBaoClient {
+        let client = createTestClient(
+            appId: app.appId, token: token ?? app.ownerJWT,
+            storageConfig: .sqlite(directory: file ?? directory + "/\(name)-\(UUID().uuidString.prefix(4)).sqlite"), autoNetwork: true,
+            storageReadyHoldForTest: storageReadyHold
+        )
+        client.registerModels(models)
+        clients.append(client)
+        return client
+    }
+
+    /// A client started with no session, over its own file. With
+    /// `storageReadyHold` its startup stops after binding nobody and before
+    /// storage is ready, until the hold returns; without one it is waited for
+    /// until storage is ready. Not connected.
+    func signedOutClient(
+        _ name: String, models: [PrimitiveSchema], storageReadyHold: (@Sendable () async -> Void)? = nil
+    ) async -> JsBaoClient {
+        let client = JsBaoClient(options: JsBaoClientOptions(
+            apiUrl: TestConfig.httpUrl,
+            wsUrl: TestConfig.wsUrl,
+            appId: app.appId,
+            token: nil,
+            globalAdminAppId: TestConfig.globalAdminAppId,
+            wsHeaders: ["X-Global-Admin-App-Id": TestConfig.globalAdminAppId],
+            logLevel: .warn,
+            storageConfig: .sqlite(directory: directory + "/\(name)-\(UUID().uuidString.prefix(4)).sqlite"),
+            autoNetwork: true
+        ), connectivityMonitor: nil, storageReadyHoldForTest: storageReadyHold)
+        client.registerModels(models)
+        clients.append(client)
+        if storageReadyHold == nil { _ = await client.waitForStorageReady() }
+        return client
+    }
+
     @available(*, deprecated)
     func createDocument(_ client: JsBaoClient) async throws -> String {
         let created = try await client.createDocument(options: CreateDocumentOptions(title: "record log", documentFormat: 3))

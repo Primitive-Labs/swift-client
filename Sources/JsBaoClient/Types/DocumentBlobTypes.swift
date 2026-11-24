@@ -43,6 +43,24 @@ public struct DocumentBlobListResult: Decodable, Sendable {
     }
 }
 
+/// Result of `Db3BlobContext.deleteBatch(blobIds:)`. Mirrors JS
+/// `Db3BlobBatchDeleteResult` (`{ deleted, blobIds, db3Id }`).
+/// - Stability: beta
+public struct Db3BlobBatchDeleteResult: Decodable, Sendable, Equatable {
+    /// The number of ids the request named, duplicates included.
+    public let deleted: Int
+    /// The ids the request named, in order.
+    public let blobIds: [String]
+    /// The db3.
+    public let db3Id: String
+
+    public init(deleted: Int, blobIds: [String], db3Id: String) {
+        self.deleted = deleted
+        self.blobIds = blobIds
+        self.db3Id = db3Id
+    }
+}
+
 /// Result of `DocumentBlobContext.delete`. Mirrors JS `{ deleted: boolean }`.
 public struct BlobDeleteResult: Decodable, Sendable, Equatable {
     public let deleted: Bool

@@ -157,6 +157,10 @@ struct Db3LifecycleDeps: Sendable {
     var isKnownType: @Sendable (String) -> Bool = { _ in true }
     /// Let the db3 open whatever its type, for the life of the client (#6024).
     var allowUnknownType: @Sendable (String) -> Void = { _ in }
+    /// How a bound typed local-only copy stands with this build (#6025):
+    /// `DB3_TYPE_REFUSED` when its declarations were refused, diverged or
+    /// cannot be read; `nil` otherwise.
+    var localTypeStanding: @Sendable (String) -> Db3StateError? = { _ in nil }
     var logger: Logger?
 }
 
@@ -747,6 +751,9 @@ final class Db3Lifecycle: @unchecked Sendable {
             if deps.knownTypesOnly(), let type = await deps.heldType(id), !deps.isKnownType(type) {
                 entry.knownType = false
                 entry.type = type
+            } else if state.localOnly, let type = await deps.heldType(id) {
+                // #6025 — a typed local-only copy names its type.
+                entry.type = type
             }
             out.append(entry)
         }
@@ -947,9 +954,10 @@ final class Db3Lifecycle: @unchecked Sendable {
     /// Open the db3 for its subscriptions; `identity` is the one the step
     /// started under (`openIdentity` answers it while the open is in flight).
     private func start(_ db3Id: String, identity: Int) async {
-        if isLocalOnly(db3Id) { return await startLocal(db3Id) }
-        // #6024 — a type the device holds that this client does not open: refused without opening it.
+        // #6024 — a type the device holds that this client does not open:
+        // refused without opening it. #6025 — a typed local-only copy is refused alike.
         if let held = await typeRefusal(db3Id) { return await refuseType(db3Id, held) }
+        if isLocalOnly(db3Id) { return await startLocal(db3Id) }
         var format: Int?
         if deps.isBound(db3Id) || deps.isPendingCreate(db3Id) {
             format = RecordLogTransport.documentFormat
@@ -1097,7 +1105,8 @@ final class Db3Lifecycle: @unchecked Sendable {
             let wasActive = active.remove(db3Id) != nil
             return (wasActive, doorHeld.contains(db3Id))
         }
-        if wasActive {
+        // Nothing was opened on the socket for a db3 that lives only here (#6025).
+        if wasActive && !isLocalOnly(db3Id) {
             do {
                 try await deps.close(db3Id)
             } catch {
@@ -1427,7 +1436,13 @@ final class Db3Lifecycle: @unchecked Sendable {
     /// subscription opens after the close. While the release runs, no db3 it
     /// releases reads resident. Returns once those closes ran, never waiting
     /// for a later open, which may itself wait for this release.
-    func releaseAll(unbind: Bool) async {
+    ///
+    /// `keepingFrom` keeps every subscription made under that identity or a
+    /// later one (`forgetStates()` answers it) whether or not another release
+    /// ran since the change: the client's rebind passes the identity at its
+    /// start, so a subscription made right after the token changed is the new
+    /// user's however the releases interleave.
+    func releaseAll(unbind: Bool, keepingFrom keptIdentity: Int? = nil) async {
         let bound = deps.boundIds()
         // Every outgoing open is retired and its close queued in the same hold
         // that moves the generation on: a reconcile queued before it does
@@ -1449,7 +1464,7 @@ final class Db3Lifecycle: @unchecked Sendable {
         }
         for db3Id in ids {
             // A subscription made since the user changed is the new user's.
-            for handle in handlesOf(db3Id) where !changed || handle.identity < now {
+            for handle in handlesOf(db3Id) where handle.identity < (keptIdentity ?? (changed ? now : Int.max)) {
                 handle.subscription.reject(db3DisposedError(
                     db3Id, .identityChanged, message: "the subscription to '\(db3Id)' ended: the signed-in user changed"
                 ))
@@ -1483,6 +1498,9 @@ final class Db3Lifecycle: @unchecked Sendable {
     private func isReleasing(_ db3Id: String) -> Bool {
         lock.withLock { releasing.values.contains { $0.contains(db3Id) } }
     }
+
+    /// The identity the latest `forgetStates()` moved to.
+    var currentIdentity: Int { lock.withLock { identity } }
 
     /// Forget every db3's last state, error and status (the user changed); a
     /// binding of the stored db3s under way is undone. Answers the new
@@ -1709,14 +1727,16 @@ final class Db3Lifecycle: @unchecked Sendable {
         let permission = localOnly ? .owner : permissionOf(db3Id, marks)
         let gone = goneError(db3Id)
         let openError = lock.withLock { errors[db3Id] }
-        // #6024 — a held type this client does not open, refused or not yet asked.
-        let refusedType = localOnly || phase == .gone ? nil : await typeRefusal(db3Id)
+        // #6024 — a held type this client does not open, refused or not yet
+        // asked (#6025: a typed local-only copy's too).
+        let refusedType = phase == .gone ? nil : await typeRefusal(db3Id)
         let typeError = refusedType.map { Self.typeError(db3Id, $0) }
         // A copy refused for its type is not resident, even while its unbind is on its way.
         if refusedType != nil { resident = false }
         let error: Db3StateError? = phase == .gone
             ? Db3StateError(code: gone.code.rawValue, message: gone.message)
             : typeError.map { Db3StateError(code: $0.code.rawValue, message: $0.message) }
+                ?? (localOnly ? deps.localTypeStanding(db3Id) : nil)
                 ?? openError ?? (pendingCreate ? deps.createRefusal(db3Id) : nil)
         let cursor = stored?.cursor ?? marks?.cursor ?? 0
         let pendingWrites = stored?.writers.reduce(0) { $0 + $1.pending } ?? 0

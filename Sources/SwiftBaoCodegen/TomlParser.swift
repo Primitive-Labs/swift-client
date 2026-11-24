@@ -55,6 +55,10 @@ enum CodegenError: Error, CustomStringConvertible {
     /// A model whose own names would take or shadow what a ref'd field
     /// generates (#5896); `message` names the model, the field and the def.
     case sharedEnumNaming(message: String)
+    /// An input type file that allows local-only db3s and cannot be embedded
+    /// (a hook beside the setting, a model it names that no input declares,
+    /// a value js-bao prints differently); `message` names the file.
+    case localOnlyType(message: String)
 
     var description: String {
         switch self {
@@ -97,6 +101,8 @@ enum CodegenError: Error, CustomStringConvertible {
         case let .sharedEnumRef(message):
             return message
         case let .sharedEnumNaming(message):
+            return message
+        case let .localOnlyType(message):
             return message
         case let .conflictingDeclarations(model, first, second, differences):
             return "Model `\(model)` is declared differently in \(first) and \(second): "

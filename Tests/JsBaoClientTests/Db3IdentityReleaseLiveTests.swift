@@ -2,8 +2,10 @@ import XCTest
 @testable import JsBaoClient
 
 /// #5044 — a sign-out or a user switch releases the previous user's db3s,
-/// against the dev server. The lifecycle's close of an outgoing open is held
-/// at `db3CloseHoldForTest`, so "during the release" is a fixed point:
+/// against the dev server. The switch is `updateToken` of another user and
+/// nothing else: the client rebinds its user-scoped storage itself (#6375).
+/// The lifecycle's close of an outgoing open is held at
+/// `db3CloseHoldForTest`, so "during the release" is a fixed point:
 ///
 /// - 4 (and 10): another account's session. B subscribes to a db3 both users
 ///   share while A's close is held: B's `available()` waits and the state is
@@ -17,9 +19,8 @@ import XCTest
 ///   marked releasing.
 /// - 18: a `logout()` while B's open waits at the identity gate returns, B's
 ///   `ready()` throws `identity-changed`, and `destroy()` returns.
-/// - E12: a subscribe made after `updateToken(B)` but before
-///   `rebindUserScopedStorage()` belongs to A: it never reads A's binding as
-///   available and ends with `identity-changed` at the rebind.
+/// - E12: a subscribe made right after `updateToken(B)` belongs to B: it never
+///   reads A's binding, and opens as B once the client's own rebind ran.
 @available(*, deprecated)
 final class Db3IdentityReleaseLiveTests: XCTestCase {
 
@@ -99,9 +100,10 @@ final class Db3IdentityReleaseLiveTests: XCTestCase {
 
         let hold = CloseHold()
         hold.install(x)
+        // Opened on every way out, so a teardown's close never waits on it.
+        defer { hold.release.open() }
         x.updateToken(member.jwt)
-        let rebind = Task { await x.rebindUserScopedStorage() }
-        await hold.reached.wait()
+        try await settles(within: 15, "the client's own rebind reaching A's close") { await hold.reached.wait() }
 
         let b = try x.db3.subscribe(shared)
         try await Task.sleep(nanoseconds: 300_000_000)
@@ -111,7 +113,7 @@ final class Db3IdentityReleaseLiveTests: XCTestCase {
 
         hold.release.open()
         x.db3CloseHoldForTest = nil
-        try await settles(within: 15, "the rebind") { _ = await rebind.value }
+        try await settles(within: 15, "the rebind") { await x.rebindUserScopedStorage() }
         x.setNetworkMode(.auto)
         try await settles(within: 30, "B's available()") { try await b.available() }
         XCTAssertTrue(x.isRecordLogDocument(shared), "bound at available()")
@@ -137,10 +139,11 @@ final class Db3IdentityReleaseLiveTests: XCTestCase {
 
         let hold = CloseHold()
         hold.install(x)
+        // Opened on every way out, so a teardown's close never waits on it.
+        defer { hold.release.open() }
         let member = try await ctx.createTestUser(appId: live.app.appId)
         x.updateToken(member.jwt)
-        let rebind = Task { await x.rebindUserScopedStorage() }
-        await hold.reached.wait()
+        try await settles(within: 15, "the client's own rebind reaching A's close") { await hold.reached.wait() }
         let release = hold.release
         Task {
             try? await Task.sleep(nanoseconds: 1_000_000_000)
@@ -149,7 +152,7 @@ final class Db3IdentityReleaseLiveTests: XCTestCase {
         try await settles(within: 15, "destroy() during the release") { await x.destroy() }
         let why = await reason(pending)
         XCTAssertTrue(["identity-changed", "destroyed"].contains(why), why)
-        _ = await rebind.value
+        try await settles(within: 15, "the rebind") { await x.rebindUserScopedStorage() }
     }
 
     // MARK: - Behaviour 14
@@ -190,16 +193,17 @@ final class Db3IdentityReleaseLiveTests: XCTestCase {
         defer { watch.cancel() }
         let hold = CloseHold()
         hold.install(x)
+        // Opened on every way out, so a teardown's close never waits on it.
+        defer { hold.release.open() }
         sends.tokenChanged.value = true
         x.updateToken(member.jwt)
-        let rebind = Task { await x.rebindUserScopedStorage() }
-        await hold.reached.wait()
+        try await settles(within: 15, "the client's own rebind reaching A's close") { await hold.reached.wait() }
         try await eventually(timeout: 15, description: "B's socket") { connected.value >= 1 && x.isConnected }
         try await Task.sleep(nanoseconds: 500_000_000)
         sends.released.value = true
         hold.release.open()
         x.db3CloseHoldForTest = nil
-        try await settles(within: 15, "the rebind") { _ = await rebind.value }
+        try await settles(within: 15, "the rebind") { await x.rebindUserScopedStorage() }
 
         let b = try x.db3.subscribe(shared)
         try await settles(within: 30, "B's ready()") { try await b.ready() }
@@ -232,9 +236,10 @@ final class Db3IdentityReleaseLiveTests: XCTestCase {
 
         let hold = CloseHold()
         hold.install(x)
+        // Opened on every way out, so a teardown's close never waits on it.
+        defer { hold.release.open() }
         x.updateToken(member.jwt)
-        let rebind = Task { await x.rebindUserScopedStorage() }
-        await hold.reached.wait()
+        try await settles(within: 15, "the client's own rebind reaching A's close") { await hold.reached.wait() }
 
         // B's open of another db3 waits at the identity gate.
         let b = try x.db3.subscribe(incoming)
@@ -246,28 +251,30 @@ final class Db3IdentityReleaseLiveTests: XCTestCase {
         XCTAssertEqual(why, "identity-changed")
         hold.release.open()
         x.db3CloseHoldForTest = nil
-        try await settles(within: 15, "the rebind") { _ = await rebind.value }
+        try await settles(within: 15, "the rebind") { await x.rebindUserScopedStorage() }
         XCTAssertTrue(x.db3IdentityRelease.releasing.isEmpty, "nothing left releasing")
         try await settles(within: 15, "destroy()") { await x.destroy() }
     }
 
     // MARK: - E12
 
-    func testASubscribeAfterTheTokenChangeBelongsToThePreviousUser() async throws {
+    func testASubscribeAfterTheTokenChangeBelongsToTheNewUser() async throws {
         let id = try await live.db3Written(1, model: "Note")
         let (x, handles) = try await ownerSubscribed("x", [id])
         let member = try await ctx.createTestUser(appId: live.app.appId)
+        _ = try await x.db3.permissions(id).set(.user(member.userId, permission: "read-write"))
+
         x.updateToken(member.jwt)
         let late = try x.db3.subscribe(id, options: Db3SubscribeOptions(readyTimeout: .infinity))
-        try await Task.sleep(nanoseconds: 300_000_000)
-        XCTAssertNil(late.availableResult, "A's binding is not available to the new identity")
         let state = try await x.db3.state(id)
-        XCTAssertFalse(state.resident)
+        XCTAssertFalse(state.resident, "A's binding is not the new identity's")
 
-        try await settles(within: 15, "the rebind") { await x.rebindUserScopedStorage() }
-        let lateReason = await reason(late)
-        XCTAssertEqual(lateReason, "identity-changed")
+        try await settles(within: 15, "B's available()") { try await late.available() }
+        try await settles(within: 30, "B's ready()") { try await late.ready() }
+        XCTAssertEqual(x.documentManager.userId, member.userId, "the storage is B's")
+        XCTAssertEqual(try titles(x, id), ["row 1"], "B reads the room's rows")
         let earlyReason = await reason(handles[0])
         XCTAssertEqual(earlyReason, "resolved", "the earlier handle had settled ready")
+        late.dispose()
     }
 }

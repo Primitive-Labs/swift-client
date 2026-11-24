@@ -322,9 +322,10 @@ final class TypedSaveChangeTrackingTests: XCTestCase {
         )
 
         let made = CrashTestRecord(id: "c1", requiredTags: ["a"])
-        XCTAssertNil(made.`default`, "precondition: the caller never set the defaulted fields")
-        XCTAssertNil(made.score)
-        XCTAssertNil(made.active)
+        // Precondition: the caller never set the defaulted fields. They read
+        // their defaults, which the model supplied, so no write sends them (#6304).
+        XCTAssertEqual(made._suppliedDefaults, ["default", "score", "active"])
+        XCTAssertNil(made.primitiveValues()["score"])
 
         let saved = try made.save(in: docId)
         XCTAssertEqual(saved.`default`, "fallback")

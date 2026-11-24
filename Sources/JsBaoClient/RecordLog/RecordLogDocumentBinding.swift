@@ -321,10 +321,115 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
 
     /// Mark the db3 as living only on this device. The mark is the store's,
     /// so every later bind finds it; its constraints and indexes follow from
-    /// its models at once.
-    func markLocalOnly() throws {
-        if !isLocalOnly { try setState(localOnly: true) }
+    /// its models at once. `type`, for a typed local-only db3 whose store
+    /// holds no type yet (its create), is recorded with the mark in one
+    /// transaction (#6025).
+    func markLocalOnly(type: RecordLogLocalType? = nil) throws {
+        let marks = self.marks
+        // A store already marked, and typed (or holding an unreadable type), is written nothing more.
+        if !marks.localOnly || (type != nil && marks.typed != .yes && !marks.localTypeUnreadable) {
+            let marks = try withOperation { try store.markLocalOnly(type: type) }
+            state.withLock { _marks = marks }
+        }
         try applyLocalDeclarations()
+    }
+
+    // MARK: - A typed db3 that lives only on this device (#6025)
+
+    private var _localBuild: RecordLogLocalType?
+    private var _localStanding: Db3StateError?
+    /// The type entry a typed local-only copy's marks were last checked
+    /// against; `nil` until the first read checks it.
+    private var _checkedTypeEntry: String??
+
+    /// For a typed local-only copy (#6025), read its marks again when the
+    /// type entry its store holds is no longer the one they were checked
+    /// against: another client of the store installed declarations, so the
+    /// cleared names, declarations and index list a read uses here are
+    /// theirs from this read on. One read of the type entry per read
+    /// operation; nothing for any other db3.
+    func revalidateLocalType() {
+        let marks = self.marks
+        guard marks.localOnly, marks.typed == .yes || marks.localTypeUnreadable else { return }
+        guard let entry = try? store.typeEntry() else { return }
+        if state.withLock({ _checkedTypeEntry }) == .some(entry) { return }
+        guard (try? refreshMarks()) != nil else { return }
+        state.withLock { _checkedTypeEntry = .some(entry) }
+    }
+
+    /// This client's build's declarations of the copy's type, which its
+    /// writes carry to the store: a build diverged from the installed ones
+    /// has its writes refused. `nil` when the build carries none.
+    var localBuild: RecordLogLocalType? {
+        get { state.withLock { _localBuild } }
+        set { state.withLock { _localBuild = newValue } }
+    }
+
+    /// How a typed local-only copy stands with this build when it cannot
+    /// simply be written (`DB3_TYPE_REFUSED`), as the db3's state reports it;
+    /// `nil` when its writes are judged as usual.
+    var localTypeStanding: Db3StateError? { state.withLock { _localStanding } }
+
+    /// The models a local-only db3's constraints and indexes are derived
+    /// from: a typed one's installed declarations, else the registered models.
+    var localSchemas: [PrimitiveSchema] {
+        if let local = marks.localDeclarations { return recordLogLocalSchemas(local) }
+        return registeredSchemas
+    }
+
+    /// Reconcile a typed local-only copy with this build's declarations
+    /// for its type at bind (#6025): nothing for a copy that is not one, for
+    /// the same hash, and for a build that carries none while the installed
+    /// ones can be read. Otherwise the store installs a superset (or
+    /// recovers unreadable declarations, the type named by `knownType` when
+    /// the store lost it) after checking the records, in one transaction,
+    /// and the standing says how the copy then stands with this build. One
+    /// line is logged per install, refused install, diverged open and
+    /// unreadable open.
+    ///
+    /// Gated on the marks this binding already holds (the bind read them):
+    /// a copy that syncs, an untyped local-only one, and a typed one whose
+    /// build carries the installed hash read and write nothing here. The
+    /// store's install judges against what it holds in its own transaction.
+    func reconcileLocalType(_ buildOf: (String) -> RecordLogLocalType?, knownType: String?) throws {
+        let marks = self.marks
+        guard marks.localOnly, marks.typed == .yes || marks.localTypeUnreadable else { return }
+        let unreadable = marks.localTypeUnreadable
+        let name = marks.db3Type?.name ?? knownType
+        let build = name.flatMap(buildOf)
+        localBuild = build
+        if !unreadable && (build == nil || build?.hash == marks.db3Type?.hash) {
+            state.withLock { _localStanding = nil }
+            return
+        }
+        guard let build else {
+            logger?.warn("[db3] \(documentId): local type \(name ?? "(unknown)"): declarations unreadable; writes are refused (DB3_TYPE_REFUSED)")
+            state.withLock { _localStanding = RecordLogLocalTypeStanding.unreadable(documentId) }
+            return
+        }
+        let answer = try withOperation { try store.installLocalType(build) }
+        var standing: Db3StateError?
+        switch answer {
+        case .installed(let from):
+            logger?.log("[db3] \(documentId): local type \(build.name) installed (\(from ?? "unreadable") → \(build.hash))")
+            try refreshMarks()
+            try applyLocalDeclarations()
+        case .refused(let reasons, let unreadable):
+            logger?.warn(
+                "[db3] \(documentId): local type \(build.name) not installed (DB3_TYPE_REFUSED): "
+                    + reasons.map { "\($0.path) \($0.reason)" }.joined(separator: "; ")
+            )
+            standing = RecordLogLocalTypeStanding.refused(documentId, type: build.name, reasons: reasons, unreadable: unreadable)
+        case .diverged:
+            logger?.warn(
+                "[db3] \(documentId): local type \(build.name): this build's declarations diverged from the installed ones; "
+                    + "its writes are refused (DB3_TYPE_REFUSED)"
+            )
+            standing = RecordLogLocalTypeStanding.diverged(documentId, type: build.name)
+        case .same, .subset, .untyped:
+            break
+        }
+        state.withLock { _localStanding = standing }
     }
 
     /// Make a local-only db3's constraints and view indexes what its models
@@ -352,22 +457,32 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         try withOperation {
             var current = try refreshMarks().localIndexes
             while true {
-                let schemas = registeredSchemas
+                let marks = self.marks
+                let schemas = marks.localDeclarations.map(recordLogLocalSchemas) ?? registeredSchemas
                 let (registrations, unique) = try plan(current)
                 let change = try store.changeLocalIndexes(
                     from: current, to: registrations, constraints: RecordLogLocalOnly.constraints(schemas, registrations),
-                    unique: unique.map { ($0.model, $0.fields, RecordLogLocalOnly.maxDuplicates) }
+                    unique: unique.map { ($0.model, $0.fields, RecordLogLocalOnly.maxDuplicates) },
+                    // A typed copy's change is written only under the declarations it was
+                    // derived from: another client's install meanwhile plans it again (#6025).
+                    typeHash: marks.typed == .yes ? .some(marks.db3Type?.hash) : nil,
+                    // The list is cached in the change's own transaction, under its checks (#6025)…
+                    indexes: RecordLogLocalOnly.entries(RecordLogLocalOnly.indexList(schemas, registrations))
                 )
                 switch change {
                 case .changed(let marks):
                     state.withLock { _marks = marks }
-                    try store.syncIndexes(RecordLogLocalOnly.entries(RecordLogLocalOnly.indexList(schemas, registrations)))
+                    // …and the indexes then follow the list the store holds, which a later change (another
+                    // handle's, under newer declarations) may have replaced meanwhile: never this change's own.
+                    try store.syncIndexes(nil)
                     vectorsChanged(.list)
                     return registrations
                 case .duplicates(let duplicates, let marks):
                     state.withLock { _marks = marks }
                     throw RecordLogLocalOnly.notUnique(model: unique?.model ?? "", fields: unique?.fields ?? [], duplicates: duplicates)
                 case .moved(let marks):
+                    // Planned again from the store's registrations and declarations.
+                    state.withLock { _marks = marks }
                     current = marks.localIndexes
                 }
             }
@@ -376,7 +491,7 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
 
     /// A local-only db3's index list, as the room lists its registry.
     var localIndexes: [Db3Index] {
-        RecordLogLocalOnly.indexList(registeredSchemas, marks.localIndexes)
+        RecordLogLocalOnly.indexList(localSchemas, marks.localIndexes)
     }
 
     /// Register an index on a local-only db3 by the room's rules
@@ -390,18 +505,29 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         let parsed = try RecordLogLocalOnly.parse(registration)
         var index: Db3Index?
         let written = try changeLocalIndexes { current in
-            let planned = try RecordLogLocalOnly.register(registeredSchemas, current, registration)
+            // No index of any kind over a field the installed declarations clear or
+            // tombstone, as the room refuses it (#6025): judged on each plan, so
+            // against what another client installed meanwhile.
+            let hidden = Set(recordLogLocalHidden(self.marks.localDeclarations?[parsed.model]))
+            if let over = parsed.fields.first(where: hidden.contains) {
+                throw JsBaoError(
+                    code: .db3IndexInvalid,
+                    message: "\(parsed.model).\(over) is cleared by the db3's type: no write stores it and no read answers it, so it takes no index",
+                    details: ["field": .string(over)]
+                )
+            }
+            let planned = try RecordLogLocalOnly.register(localSchemas, current, registration)
             index = planned.index
             return (planned.registrations, parsed.unique ? (parsed.model, parsed.fields) : nil)
         }
-        return RecordLogLocalOnly.indexList(registeredSchemas, written).first { $0.name == index?.name } ?? index!
+        return RecordLogLocalOnly.indexList(localSchemas, written).first { $0.name == index?.name } ?? index!
     }
 
     /// Drop an index of a local-only db3 by the room's rules
     /// (``RecordLogLocalOnly/drop(_:_:name:)``); its constraints and view
     /// indexes follow before this returns.
     func dropLocalIndex(_ name: String) throws {
-        _ = try changeLocalIndexes { current in (try RecordLogLocalOnly.drop(registeredSchemas, current, name: name), nil) }
+        _ = try changeLocalIndexes { current in (try RecordLogLocalOnly.drop(localSchemas, current, name: name), nil) }
     }
 
     /// This writer's entries not yet acknowledged, in order: none on a db3
@@ -595,11 +721,12 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         let reply: RecordLogCommitReply
         do {
             reply = try withOperation {
-                try store.commitEntries(writer: writer, writes: writes) { [weak self] error in
+                try store.commitEntries(writer: writer, writes: writes, listener: { [weak self] error in
                     if let saved = delivery.outcome(error) { self?.groupCommitted(saved, writer: writer, error: error) }
-                }
+                }, localBuild: localBuild)
             }
-        } catch let error as JsBaoError where RecordLogHandBackCode.all.contains(error.code.rawValue) {
+        } catch let error as JsBaoError
+            where RecordLogHandBackCode.all.contains(error.code.rawValue) || error.code == .db3TypeRefused {
             if let first = writes.first?.mutations, !first.isEmpty {
                 reportRefused(recordLogLocalRefusal(
                     error, documentId: documentId, mutations: writes.flatMap(\.mutations)
@@ -962,6 +1089,19 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
         return RecordLogDeclaredType(name: name, models: models, vectors: marks.vectors ?? [:], enums: marks.enums ?? [:])
     }
 
+    /// The declarations a write is judged by before it reaches the store:
+    /// ``declaredType`` for a db3 that syncs; `nil` for a typed local-only
+    /// db3 (#6025), whose store judges each write inside the transaction
+    /// that commits it by the declarations installed then. A copy of them
+    /// held here may be older (another client of the store installed a
+    /// build since), so it neither refuses what the installed ones take nor
+    /// lets through what they refuse.
+    var precommitDeclaredType: RecordLogDeclaredType? {
+        let marks = self.marks
+        if marks.localOnly && (marks.typed == .yes || marks.localTypeUnreadable) { return nil }
+        return declaredType
+    }
+
     /// Mark the copy of a db3 the server just created caught up, so it is
     /// resident; a copy already marked keeps its mark.
     func markCaughtUpAtCreate() throws {
@@ -1026,8 +1166,9 @@ final class RecordLogDocumentBinding: @unchecked Sendable {
                 try assertRecordLogEntry(documentId: documentId, mutations: mutations, upsertOn: upsertOn) { [weak self] event in
                     self?.reportRefused(event)
                 }
-                // A typed db3's declarations, as the room judges the entry (#5020).
-                try assertRecordLogDeclaredTypes(documentId: documentId, mutations: mutations, type: declaredType) { [weak self] event in
+                // A typed db3's declarations, as the room judges the entry (#5020); a
+                // typed local-only one's are judged in the store's commit (#6025).
+                try assertRecordLogDeclaredTypes(documentId: documentId, mutations: mutations, type: precommitDeclaredType) { [weak self] event in
                     self?.reportRefused(event)
                 }
                 let committed = try commit([RecordLogWrite(mutations: mutations, upsertOn: upsertOn)])

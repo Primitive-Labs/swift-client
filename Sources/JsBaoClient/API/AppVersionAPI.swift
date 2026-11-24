@@ -113,8 +113,11 @@ public final class AppVersionAPI: Sendable {
         await controller.refresh()
     }
 
-    /// Call `handler` with the new status each time it changes. Keep the
-    /// returned subscription; cancel it to stop.
+    /// Call `handler` with the status each time what the client reports
+    /// changes: the status, this platform's policy entry (a raised `latest`
+    /// that keeps `updateAvailable`, say), or a server refusal. Read
+    /// `getPolicy()` for the entry. Keep the returned subscription; cancel it
+    /// to stop.
     /// - Stability: beta
     public func onStatusChange(_ handler: @escaping @Sendable (AppVersionStatus) -> Void) -> EventSubscription {
         controller.onStatusChange(handler)

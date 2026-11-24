@@ -37,8 +37,8 @@ public struct Task6023: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashab
     public var title: String? {
         didSet { _changedFields.insert("title") }
     }
-    public var dueAt: Double? {
-        didSet { _changedFields.insert("dueAt") }
+    public var dueAt: Double {
+        didSet { _changedFields.insert("dueAt"); _suppliedDefaults.remove("dueAt") }
     }
     public var labels: Set<String>? {
         didSet { _changedFields.insert("labels") }
@@ -65,6 +65,15 @@ public struct Task6023: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashab
     /// Not part of the record's persisted/equatable identity.
     public private(set) var _changedFields: Set<String> = []
 
+    /// The fields whose value this model supplied from their `default`
+    /// rather than read or were given (#6304): a field the record held
+    /// no value of its kind for, an initializer parameter left out, a
+    /// decoded key that held none. `primitiveValues()` leaves them out,
+    /// so no write sends a default the model filled in; assigning the
+    /// field, or `markAllChanged()`, makes its value the caller's.
+    /// Not part of the record's persisted/equatable identity.
+    public private(set) var _suppliedDefaults: Set<String> = []
+
     /// Forget the pending field changes without writing them, so a
     /// later `save(in:)` treats this value as unmodified. Mirrors
     /// js-bao's `discardChanges()`. The field values themselves are
@@ -89,6 +98,7 @@ public struct Task6023: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashab
     /// Every field it writes wins last-writer-wins against a concurrent
     /// remote edit to that field, which is the cost of a full copy.
     public mutating func markAllChanged() {
+        _suppliedDefaults = []
         _changedFields = Set(primitiveValues().keys)
     }
 
@@ -100,10 +110,11 @@ public struct Task6023: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashab
     ) {
         self.id = id
         self.title = title
-        self.dueAt = dueAt
+        self.dueAt = dueAt ?? 3
         self.labels = labels
         self.related = .empty
-        self._changedFields = Set(primitiveValues().keys)
+        if dueAt == nil { _suppliedDefaults.insert("dueAt") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     /// Create a record with an auto-generated id. The id is NOT
@@ -118,38 +129,46 @@ public struct Task6023: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashab
     ) {
         self.id = PrimitiveSchemaRegistry.newId()
         self.title = title
-        self.dueAt = dueAt
+        self.dueAt = dueAt ?? 3
         self.labels = labels
         self.related = .empty
         self._explicitId = false
-        self._changedFields = Set(primitiveValues().keys)
+        if dueAt == nil { _suppliedDefaults.insert("dueAt") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     public init?(record: PrimitiveRecord) {
+        guard !record.isCleared("dueAt")
+        else { return nil }
+        let _dueAt = record.fittingValue("dueAt", as: .number)?.asNumber
         self.id = record.id
         self.title = record["title"]?.asString
-        self.dueAt = record.holds("dueAt") == false ? 3 : record["dueAt"]?.asNumber
+        self.dueAt = _dueAt ?? 3
         self.labels = record["labels"]?.asStringSet
         self.related = .empty
         self._changedFields = []
+        if _dueAt == nil { _suppliedDefaults.insert("dueAt") }
     }
 
     /// Build from a SQLite-backed query row (`dynamic.query(...)`).
     public init?(row: [String: JSONValue]) {
-        guard let id = row["id"]?.stringValue
+        guard let id = row["id"]?.stringValue,
+              !PrimitiveRecord.isCleared("dueAt", in: row)
         else { return nil }
+        let _dueAt = PrimitiveRecord.fittingValue("dueAt", as: .number, in: row)?.asNumber
         self.id = id
         self.title = row["title"]?.stringValue
-        self.dueAt = PrimitiveRecord.holds("dueAt", in: row) == false ? 3 : row["dueAt"]?.numberValue
+        self.dueAt = _dueAt ?? 3
         self.labels = (row["labels"]?.stringArrayValue).map(Set.init)
         self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []
+        if _dueAt == nil { _suppliedDefaults.insert("dueAt") }
     }
 
     public func primitiveValues() -> [String: PrimitiveValue] {
         var values: [String: PrimitiveValue] = [:]
         if let title { values["title"] = .string(title) }
-        if let dueAt { values["dueAt"] = .number(dueAt) }
+        if !_suppliedDefaults.contains("dueAt") { values["dueAt"] = .number(dueAt) }
         if let labels { values["labels"] = .stringset(labels) }
         return values
     }
@@ -161,10 +180,12 @@ public struct Task6023: PrimitiveModel, PrimitiveRowDecodable, Equatable, Hashab
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try container.decode(String.self, forKey: .id)
         self.title = try container.decodeIfPresent(String.self, forKey: .title)
-        self.dueAt = try container.decodeIfPresent(Double.self, forKey: .dueAt)
+        let _dueAt = container.fittingValue(forKey: .dueAt, as: .number)?.asNumber
+        self.dueAt = _dueAt ?? 3
         self.labels = try container.decodeIfPresent(Set<String>.self, forKey: .labels)
         self.related = .empty
-        self._changedFields = Set(primitiveValues().keys)
+        if _dueAt == nil { _suppliedDefaults.insert("dueAt") }
+        self._changedFields = Set(primitiveValues().keys).subtracting(_suppliedDefaults)
     }
 
     public enum CodingKeys: String, CodingKey {

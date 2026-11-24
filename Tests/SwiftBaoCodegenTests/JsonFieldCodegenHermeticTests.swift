@@ -93,7 +93,7 @@ final class JsonFieldCodegenHermeticTests: XCTestCase {
         XCTAssertTrue(order.contains("        hasher.combine(shipping_address != nil)\n"), order)
         XCTAssertFalse(order.contains("hasher.combine(shipping_address)\n"), order)
         XCTAssertFalse(order.contains("hasher.combine(shipping_addressRaw"), order)
-        XCTAssertTrue(order.contains("        case id, title, shipping_address, parcel, meta, needs, invoice\n"), order)
+        XCTAssertTrue(order.contains("        case id, title, shipping_address, parcel, meta, needs, invoice, tags, stops, weights, keyed\n"), order)
     }
 
     func testARequiredJSONFieldIsOptionalAndCheckedAtSave() throws {

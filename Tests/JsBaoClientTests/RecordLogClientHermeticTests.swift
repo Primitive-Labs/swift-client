@@ -193,12 +193,13 @@ final class RecordLogClientHermeticTests: XCTestCase {
         _ = try XCTUnwrap(client.sharedModel("Note")?.member(docId: documentId)).create(id: "n1", values: ["title": .string("by a")])
         try client.recordLogBinding(documentId)?.store.flush()
         try await client.logout()
-        client.updateToken(makeTestJwt(userId: "user-b"))
 
         try execute(path, """
             CREATE TRIGGER refuse_reset BEFORE DELETE ON record_log_pending
             BEGIN SELECT RAISE(ABORT, 'the reset cannot complete'); END
             """)
+        // The sign-in rebinds the storage itself; this waits for it.
+        client.updateToken(makeTestJwt(userId: "user-b"))
         await client.rebindUserScopedStorage()
         XCTAssertEqual(try owner(path), "user-a", "the reset could not run")
         do {

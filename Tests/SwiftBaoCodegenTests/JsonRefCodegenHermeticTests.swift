@@ -158,7 +158,7 @@ final class JsonRefCodegenHermeticTests: XCTestCase {
         XCTAssertEqual(try parse(Self.shop(#"ref = "Ship""#), cross).fields["shipping"]?.json, Db3JSONRef(file: "shop", name: "Ship"))
         for name in ["ToEnum", "ToMissing", "LoopA", "Nullable"] {
             XCTAssertTrue(failure(Self.shop("ref = \"\(name)\""), shared).hasPrefix(
-                "[models.orders.fields.shipping]: ref \"\(name)\": schemas/shop.toml#\(name) is neither a shared enum nor an object def: it declares no type;"), name)
+                "[models.orders.fields.shipping]: ref \"\(name)\": schemas/shop.toml#\(name) is neither a shared enum, an object def nor a list def: it declares no type;"), name)
         }
     }
 
@@ -170,13 +170,13 @@ final class JsonRefCodegenHermeticTests: XCTestCase {
         XCTAssertEqual(failure(Self.shop(#"ref = "billing.Address""#), shared),
                        prefix("billing.Address") + "billing is a key in more than one family; use a long form: db3.billing.Address, schemas.billing.Address.")
         XCTAssertEqual(failure(Self.shop(#"ref = "a.b.c.d""#), shared),
-                       prefix("a.b.c.d") + #"a db3 field refs only a shared enum or an object def in schemas/; write "<Name>", "<file>.<Name>" or "schemas.<file>.<Name>"."#)
+                       prefix("a.b.c.d") + #"a db3 field refs only a shared enum, an object def or a list def in schemas/; write "<Name>", "<file>.<Name>" or "schemas.<file>.<Name>"."#)
         XCTAssertEqual(failure(Self.shop(#"ref = "shared.Address""#), shared),
-                       prefix("shared.Address") + #"there is no schemas/shared.toml; a db3 field refs only a shared enum or an object def in schemas/, so fix the file name or write "schemas.<file>.Address"."#)
+                       prefix("shared.Address") + #"there is no schemas/shared.toml; a db3 field refs only a shared enum, an object def or a list def in schemas/, so fix the file name or write "schemas.<file>.Address"."#)
         XCTAssertEqual(failure(Self.shop(#"ref = "platform.Address""#), shared),
-                       prefix("platform.Address") + #"the platform prefix is reserved; name a shared enum or an object def in schemas/ as "schemas.<file>.<Name>"."#)
+                       prefix("platform.Address") + #"the platform prefix is reserved; name a shared enum, an object def or a list def in schemas/ as "schemas.<file>.<Name>"."#)
         XCTAssertEqual(failure(Self.shop(#"ref = "common.Address#row""#), shared),
-                       prefix("common.Address#row") + "a projection (#row) applies to a db3 model ref and a shared enum or an object def has none; drop the suffix.")
+                       prefix("common.Address#row") + "a projection (#row) applies to a db3 model ref and a shared enum, an object def or a list def has none; drop the suffix.")
     }
 
     // MARK: - Behavior 3
@@ -184,18 +184,18 @@ final class JsonRefCodegenHermeticTests: XCTestCase {
     func testOnlyRequiredMaySitBesideAnObjectRef() {
         let shared = objects([("common", Self.common)])
         let cases: [(String, String)] = [
-            (#"type = "string""#, "type cannot sit beside a ref to an object def: the field is stored as JSON text in a string field, so remove it."),
-            (#"enum = ["a"]"#, "enum cannot sit beside a ref to an object def: the def declares the value's shape, so remove it."),
-            ("indexed = true", "indexed cannot sit beside a ref to an object def: an index on JSON text neither orders nor matches the values inside it, so remove it."),
-            ("unique = true", "unique cannot sit beside a ref to an object def: uniqueness of JSON text is not uniqueness of the values inside it, so remove it."),
-            (#"default = "{}""#, "default cannot sit beside a ref to an object def: a JSON field has no default, so remove it."),
-            ("max_length = 10", "max_length cannot sit beside a ref to an object def: bound the value in the def (maxLength, maxItems) instead, so remove it."),
-            ("max_count = 10", "max_count cannot sit beside a ref to an object def: it bounds a stringset field, so remove it."),
-            (#"auto_assign = "ulid""#, "auto_assign cannot sit beside a ref to an object def: the client writes a JSON field's value, so remove it."),
-            (#"auto_stamp = "create""#, "auto_stamp cannot sit beside a ref to an object def: the client writes a JSON field's value, so remove it."),
-            ("dims = 3", "dims cannot sit beside a ref to an object def: it shapes a vector field, so remove it."),
-            (#"element = "f32""#, "element cannot sit beside a ref to an object def: it shapes a vector field, so remove it."),
-            (#"colour = "red""#, "colour cannot sit beside a ref to an object def: only required may, so remove it."),
+            (#"type = "string""#, "type cannot sit beside a ref to an object or list def: the field is stored as JSON text in a string field, so remove it."),
+            (#"enum = ["a"]"#, "enum cannot sit beside a ref to an object or list def: the def declares the value's shape, so remove it."),
+            ("indexed = true", "indexed cannot sit beside a ref to an object or list def: an index on JSON text neither orders nor matches the values inside it, so remove it."),
+            ("unique = true", "unique cannot sit beside a ref to an object or list def: uniqueness of JSON text is not uniqueness of the values inside it, so remove it."),
+            (#"default = "{}""#, "default cannot sit beside a ref to an object or list def: a JSON field has no default, so remove it."),
+            ("max_length = 10", "max_length cannot sit beside a ref to an object or list def: bound the value in the def (maxLength, maxItems) instead, so remove it."),
+            ("max_count = 10", "max_count cannot sit beside a ref to an object or list def: it bounds a stringset field, so remove it."),
+            (#"auto_assign = "ulid""#, "auto_assign cannot sit beside a ref to an object or list def: the client writes a JSON field's value, so remove it."),
+            (#"auto_stamp = "create""#, "auto_stamp cannot sit beside a ref to an object or list def: the client writes a JSON field's value, so remove it."),
+            ("dims = 3", "dims cannot sit beside a ref to an object or list def: it shapes a vector field, so remove it."),
+            (#"element = "f32""#, "element cannot sit beside a ref to an object or list def: it shapes a vector field, so remove it."),
+            (#"colour = "red""#, "colour cannot sit beside a ref to an object or list def: only required may, so remove it."),
         ]
         for (extra, sentence) in cases {
             XCTAssertEqual(failure(Self.shop(#"ref = "Address""#, extra: extra), shared),
@@ -216,10 +216,11 @@ final class JsonRefCodegenHermeticTests: XCTestCase {
 
     func testADefThatIsNeitherKindIsRefusedNamingBoth() {
         let shared = objects([("common", Self.common)])
-        for (name, what) in [("Tags", #"type = "array""#), ("Count", #"type = "number""#), ("Plain", "no enum")] {
+        // #6307 — a list def (`Tags`) is a JSON field now; see JsonListRefCodegenHermeticTests.
+        for (name, what) in [("Count", #"type = "number""#), ("Plain", "no enum")] {
             XCTAssertEqual(failure(Self.shop("ref = \"\(name)\""), shared),
-                           "[models.orders.fields.shipping]: ref \"\(name)\": schemas/common.toml#\(name) is neither a shared enum nor an object def: it declares \(what); "
-                           + #"a db3 field refs a def with type = "string" and a non-empty enum of distinct strings, or a def with type = "object" (to store an array, wrap it in an object def)."#)
+                           "[models.orders.fields.shipping]: ref \"\(name)\": schemas/common.toml#\(name) is neither a shared enum, an object def nor a list def: it declares \(what); "
+                           + #"a db3 field refs a def with type = "string" and a non-empty enum of distinct strings, a def with type = "object", or a def with type = "array"."#)
         }
     }
 
@@ -227,7 +228,7 @@ final class JsonRefCodegenHermeticTests: XCTestCase {
 
     func testAnObjectRefInAFileWithNoTypeTableIsRefused() {
         XCTAssertEqual(failure(Self.shop(#"ref = "Address""#, typed: false), objects([("common", Self.common)])),
-                       #"[models.orders.fields.shipping]: ref "Address": a ref to an object def belongs to a db3 type file, one with a [type] table; add [type] to the file, or declare the field type = "string"."#)
+                       #"[models.orders.fields.shipping]: ref "Address": a ref to an object or list def belongs to a db3 type file, one with a [type] table; add [type] to the file, or declare the field type = "string"."#)
         // A shared enum ref is still read there, as it always was.
         XCTAssertNoThrow(try parse(Self.shop(#"ref = "Status""#, typed: false), objects([("common", Self.common)])))
     }

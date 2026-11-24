@@ -171,6 +171,36 @@ public struct Db3Cost: Decodable, Sendable, Equatable {
     public let rowsWritten: Int?
 }
 
+/// What `client.db3.deleteWhere` and `patchWhere` answer: one page of the
+/// records matching a filter, changed as one write.
+/// - Stability: beta
+public struct Db3WriteWhereResult: Decodable, Sendable, Equatable {
+    /// The records this call deleted or patched.
+    /// - Stability: beta
+    public let changed: Int
+    /// Whether a matching record remains after the last one changed.
+    /// - Stability: beta
+    public let hasMore: Bool
+    /// Present when `hasMore` is true: pass it back as `cursor` to continue.
+    /// - Stability: beta
+    public let nextCursor: String?
+    /// Why the page ended before `limit` with more records matching:
+    /// `"entryBytes"` when its write would have passed 1 MiB, `"rowBytes"`
+    /// when the stored records it read would have passed 16 MiB. The
+    /// records that fit were written.
+    /// - Stability: beta
+    public let cutBy: String?
+    /// The write's log number; `nil` when nothing matched and nothing was written.
+    /// - Stability: beta
+    public let lsn: Int?
+    /// The call's `requestId`, echoed.
+    /// - Stability: beta
+    public let requestId: String?
+    /// The rows the call read and wrote.
+    /// - Stability: beta
+    public let cost: Db3Cost?
+}
+
 /// One read's answer in a db3 batch.
 public enum Db3BatchReadAnswer: Sendable, Equatable {
     /// A page of records, whether more follow, and the cursors for the next and the previous page.
@@ -312,4 +342,81 @@ public struct Db3BatchResult: Decodable, Sendable, Equatable {
     public let requestId: String?
     /// The rows the batch read and wrote.
     public let cost: Db3Cost?
+}
+
+// MARK: - Parallel requests
+
+/// One request of `client.db3.parallel(_:)`: a `batch` or a `batchRead` on its
+/// own db3, its body exactly what that call sends.
+public enum Db3ParallelRequest: Encodable, Sendable, Equatable {
+    /// `client.db3.batch(db3Id, operations, options:)`.
+    case batch(_ db3Id: String, _ operations: [Db3BatchOperation], options: Db3BatchOptions = Db3BatchOptions())
+    /// `client.db3.batchRead(db3Id, operations, atomic:)`.
+    case batchRead(_ db3Id: String, _ operations: [Db3BatchReadOperation], atomic: Bool? = nil)
+
+    /// The db3 the request names.
+    public var db3Id: String {
+        switch self {
+        case .batch(let id, _, _), .batchRead(let id, _, _): return id
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey { case db3Id, route, body }
+    private enum BodyKeys: String, CodingKey { case operations, atomic, requestId }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(db3Id, forKey: .db3Id)
+        switch self {
+        case .batch(_, let operations, let options):
+            try container.encode("batch", forKey: .route)
+            var body = container.nestedContainer(keyedBy: BodyKeys.self, forKey: .body)
+            try body.encode(operations, forKey: .operations)
+            try body.encodeIfPresent(options.atomic, forKey: .atomic)
+            try body.encodeIfPresent(options.requestId, forKey: .requestId)
+        case .batchRead(_, let operations, let atomic):
+            try container.encode("batch-read", forKey: .route)
+            var body = container.nestedContainer(keyedBy: BodyKeys.self, forKey: .body)
+            try body.encode(operations, forKey: .operations)
+            try body.encodeIfPresent(atomic, forKey: .atomic)
+        }
+    }
+}
+
+/// The error envelope a request of `client.db3.parallel(_:)` was answered
+/// with when its status is 400 or more.
+public struct Db3ParallelRefusal: Decodable, Sendable, Equatable {
+    /// The server's sentence.
+    public let error: String
+    /// The status, as the envelope repeats it.
+    public let status: Int?
+    /// The stable code, such as `DB3_NOT_FOUND` or `DB3_RESOURCE_HELD`.
+    public let code: String?
+    /// What the refusal names beside its code.
+    public let details: [String: JSONValue]?
+}
+
+/// One request's answer, in its place.
+public enum Db3ParallelAnswer: Sendable, Equatable {
+    /// A `batch` request's writes (and reads), as `client.db3.batch` answers them.
+    case batch(Db3BatchResult)
+    /// A `batchRead` request's results, as `client.db3.batchRead` answers them.
+    case batchRead(Db3BatchReadResponse)
+    /// A request answered 400 or more: its error envelope.
+    case refused(Db3ParallelRefusal)
+}
+
+/// One result of `client.db3.parallel(_:)`: the status the request's route
+/// answered, and its answer.
+public struct Db3ParallelResult: Sendable, Equatable {
+    /// The HTTP status the request's route answered.
+    public let status: Int
+    /// The decoded answer, or the refusal.
+    public let answer: Db3ParallelAnswer
+}
+
+/// What `client.db3.parallel(_:)` answers: one result per request, in order.
+public struct Db3ParallelResponse: Sendable, Equatable {
+    /// One result per request, in request order.
+    public let results: [Db3ParallelResult]
 }

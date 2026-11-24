@@ -46,16 +46,16 @@ final class Db3BlobDownloadRequestHermeticTests: XCTestCase {
         let context = blobs(getToken: { "t1" })
         let plain = try context.downloadRequest(blobId: "B1")
         XCTAssertEqual(plain.httpMethod, "GET")
-        XCTAssertEqual(plain.url?.absoluteString, context.downloadUrl(blobId: "B1"))
+        XCTAssertEqual(plain.url?.absoluteString, try context.downloadUrl(blobId: "B1"))
         XCTAssertEqual(plain.url?.absoluteString, "https://api.test/app/app1/api/db3/D1/blobs/B1/download")
 
         let inline = try context.downloadRequest(blobId: "B1", disposition: .inline)
-        XCTAssertEqual(inline.url?.absoluteString, context.downloadUrl(blobId: "B1", disposition: .inline))
+        XCTAssertEqual(inline.url?.absoluteString, try context.downloadUrl(blobId: "B1", disposition: .inline))
 
         let attachment = try context.downloadRequest(blobId: "B/1", disposition: .attachment, attachmentFilename: "résumé 1.pdf")
         XCTAssertEqual(
             attachment.url?.absoluteString,
-            context.downloadUrl(blobId: "B/1", disposition: .attachment, attachmentFilename: "résumé 1.pdf")
+            try context.downloadUrl(blobId: "B/1", disposition: .attachment, attachmentFilename: "résumé 1.pdf")
         )
         XCTAssertEqual(
             attachment.url?.absoluteString,

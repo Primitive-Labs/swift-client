@@ -149,7 +149,7 @@ public struct DeferredDocumentGrant: Decodable, Sendable, Equatable {
     public let type: DeferredGrantType
     public let email: String
     public let documentId: String
-    public let permission: String
+    public let permission: DocumentGrantLevel
     public let grantedBy: String
     public let createdAt: String
     public let expiresAt: String

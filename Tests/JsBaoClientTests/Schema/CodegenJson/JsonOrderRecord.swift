@@ -16,6 +16,10 @@ public struct JsonOrderRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
             "meta":             FieldDescriptor(type: .string),
             "needs":            FieldDescriptor(type: .string),
             "invoice":          FieldDescriptor(type: .string),
+            "tags":             FieldDescriptor(type: .string),
+            "stops":            FieldDescriptor(type: .string),
+            "weights":          FieldDescriptor(type: .string),
+            "keyed":            FieldDescriptor(type: .string),
         ]
     )
 
@@ -29,6 +33,10 @@ public struct JsonOrderRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         public let meta: JsonOrderRecord._JSONFieldToken = .init("meta")
         public let needs: JsonOrderRecord._JSONFieldToken = .init("needs")
         public let invoice: JsonOrderRecord._JSONFieldToken = .init("invoice")
+        public let tags: JsonOrderRecord._JSONFieldToken = .init("tags")
+        public let stops: JsonOrderRecord._JSONFieldToken = .init("stops")
+        public let weights: JsonOrderRecord._JSONFieldToken = .init("weights")
+        public let keyed: JsonOrderRecord._JSONFieldToken = .init("keyed")
     }
 
     /// The model's field tokens.
@@ -125,6 +133,74 @@ public struct JsonOrderRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
     /// not it decodes; `nil` once `invoice` is assigned. A save that
     /// did not assign `invoice` leaves the stored text as it is.
     public private(set) var invoiceRaw: String?
+    /// The `tags` field as its def's type (`schemas/common.toml#ShipTags`):
+    /// `nil` when the field holds no value, or text that does not decode
+    /// (`tagsRaw` keeps it). Saving encodes an assigned value as
+    /// canonical JSON and validates it against the def, throwing
+    /// `Db3JSONValueError` and writing nothing when it does not match.
+    /// `Db3JSON_common_ShipTags` is declared in `Primitive.generated.swift`,
+    /// which `primitive functions codegen --lang swift` writes.
+    public var tags: Db3JSON_common_ShipTags? {
+        didSet {
+            _changedFields.insert("tags")
+            tagsRaw = nil
+        }
+    }
+    /// The `tags` field's text as read from the store, whether or
+    /// not it decodes; `nil` once `tags` is assigned. A save that
+    /// did not assign `tags` leaves the stored text as it is.
+    public private(set) var tagsRaw: String?
+    /// The `stops` field as its def's type (`schemas/common.toml#ShipStops`):
+    /// `nil` when the field holds no value, or text that does not decode
+    /// (`stopsRaw` keeps it). Saving encodes an assigned value as
+    /// canonical JSON and validates it against the def, throwing
+    /// `Db3JSONValueError` and writing nothing when it does not match.
+    /// `Db3JSON_common_ShipStops` is declared in `Primitive.generated.swift`,
+    /// which `primitive functions codegen --lang swift` writes.
+    public var stops: Db3JSON_common_ShipStops? {
+        didSet {
+            _changedFields.insert("stops")
+            stopsRaw = nil
+        }
+    }
+    /// The `stops` field's text as read from the store, whether or
+    /// not it decodes; `nil` once `stops` is assigned. A save that
+    /// did not assign `stops` leaves the stored text as it is.
+    public private(set) var stopsRaw: String?
+    /// The `weights` field as its def's type (`schemas/common.toml#ShipWeights`):
+    /// `nil` when the field holds no value, or text that does not decode
+    /// (`weightsRaw` keeps it). Saving encodes an assigned value as
+    /// canonical JSON and validates it against the def, throwing
+    /// `Db3JSONValueError` and writing nothing when it does not match.
+    /// `Db3JSON_common_ShipWeights` is declared in `Primitive.generated.swift`,
+    /// which `primitive functions codegen --lang swift` writes.
+    public var weights: Db3JSON_common_ShipWeights? {
+        didSet {
+            _changedFields.insert("weights")
+            weightsRaw = nil
+        }
+    }
+    /// The `weights` field's text as read from the store, whether or
+    /// not it decodes; `nil` once `weights` is assigned. A save that
+    /// did not assign `weights` leaves the stored text as it is.
+    public private(set) var weightsRaw: String?
+    /// The `keyed` field as its def's type (`schemas/common.toml#ShipKeyed`):
+    /// `nil` when the field holds no value, or text that does not decode
+    /// (`keyedRaw` keeps it). Saving encodes an assigned value as
+    /// canonical JSON and validates it against the def, throwing
+    /// `Db3JSONValueError` and writing nothing when it does not match.
+    /// `Db3JSON_common_ShipKeyed` is declared in `Primitive.generated.swift`,
+    /// which `primitive functions codegen --lang swift` writes.
+    public var keyed: Db3JSON_common_ShipKeyed? {
+        didSet {
+            _changedFields.insert("keyed")
+            keyedRaw = nil
+        }
+    }
+    /// The `keyed` field's text as read from the store, whether or
+    /// not it decodes; `nil` once `keyed` is assigned. A save that
+    /// did not assign `keyed` leaves the stored text as it is.
+    public private(set) var keyedRaw: String?
 
     public var related: RelatedRecords = .empty
 
@@ -181,7 +257,11 @@ public struct JsonOrderRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         parcel: Db3JSON_common_ShipParcel? = nil,
         meta: Db3JSON_common_ShipMeta? = nil,
         needs: Db3JSON_common_ShipNeedsKind? = nil,
-        invoice: Db3JSON_billing_v2_ShipInvoice? = nil
+        invoice: Db3JSON_billing_v2_ShipInvoice? = nil,
+        tags: Db3JSON_common_ShipTags? = nil,
+        stops: Db3JSON_common_ShipStops? = nil,
+        weights: Db3JSON_common_ShipWeights? = nil,
+        keyed: Db3JSON_common_ShipKeyed? = nil
     ) {
         self.id = id
         self.title = title
@@ -190,6 +270,10 @@ public struct JsonOrderRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         self.meta = meta
         self.needs = needs
         self.invoice = invoice
+        self.tags = tags
+        self.stops = stops
+        self.weights = weights
+        self.keyed = keyed
         self.related = .empty
         self._changedFields = Set(primitiveValues().keys)
     }
@@ -205,7 +289,11 @@ public struct JsonOrderRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         parcel: Db3JSON_common_ShipParcel? = nil,
         meta: Db3JSON_common_ShipMeta? = nil,
         needs: Db3JSON_common_ShipNeedsKind? = nil,
-        invoice: Db3JSON_billing_v2_ShipInvoice? = nil
+        invoice: Db3JSON_billing_v2_ShipInvoice? = nil,
+        tags: Db3JSON_common_ShipTags? = nil,
+        stops: Db3JSON_common_ShipStops? = nil,
+        weights: Db3JSON_common_ShipWeights? = nil,
+        keyed: Db3JSON_common_ShipKeyed? = nil
     ) {
         self.id = PrimitiveSchemaRegistry.newId()
         self.title = title
@@ -214,6 +302,10 @@ public struct JsonOrderRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         self.meta = meta
         self.needs = needs
         self.invoice = invoice
+        self.tags = tags
+        self.stops = stops
+        self.weights = weights
+        self.keyed = keyed
         self.related = .empty
         self._explicitId = false
         self._changedFields = Set(primitiveValues().keys)
@@ -232,6 +324,14 @@ public struct JsonOrderRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         self.needs = Db3JSONDef_common_ShipNeedsKind.value(fromStored: record["needs"]?.asString, model: Self.modelName, field: "needs")
         self.invoiceRaw = record["invoice"]?.asString
         self.invoice = Db3JSONDef_billing_v2_ShipInvoice.value(fromStored: record["invoice"]?.asString, model: Self.modelName, field: "invoice")
+        self.tagsRaw = record["tags"]?.asString
+        self.tags = Db3JSONDef_common_ShipTags.value(fromStored: record["tags"]?.asString, model: Self.modelName, field: "tags")
+        self.stopsRaw = record["stops"]?.asString
+        self.stops = Db3JSONDef_common_ShipStops.value(fromStored: record["stops"]?.asString, model: Self.modelName, field: "stops")
+        self.weightsRaw = record["weights"]?.asString
+        self.weights = Db3JSONDef_common_ShipWeights.value(fromStored: record["weights"]?.asString, model: Self.modelName, field: "weights")
+        self.keyedRaw = record["keyed"]?.asString
+        self.keyed = Db3JSONDef_common_ShipKeyed.value(fromStored: record["keyed"]?.asString, model: Self.modelName, field: "keyed")
         self.related = .empty
         self._changedFields = []
     }
@@ -252,6 +352,14 @@ public struct JsonOrderRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         self.needs = Db3JSONDef_common_ShipNeedsKind.value(fromStored: row["needs"]?.stringValue, model: Self.modelName, field: "needs")
         self.invoiceRaw = row["invoice"]?.stringValue
         self.invoice = Db3JSONDef_billing_v2_ShipInvoice.value(fromStored: row["invoice"]?.stringValue, model: Self.modelName, field: "invoice")
+        self.tagsRaw = row["tags"]?.stringValue
+        self.tags = Db3JSONDef_common_ShipTags.value(fromStored: row["tags"]?.stringValue, model: Self.modelName, field: "tags")
+        self.stopsRaw = row["stops"]?.stringValue
+        self.stops = Db3JSONDef_common_ShipStops.value(fromStored: row["stops"]?.stringValue, model: Self.modelName, field: "stops")
+        self.weightsRaw = row["weights"]?.stringValue
+        self.weights = Db3JSONDef_common_ShipWeights.value(fromStored: row["weights"]?.stringValue, model: Self.modelName, field: "weights")
+        self.keyedRaw = row["keyed"]?.stringValue
+        self.keyed = Db3JSONDef_common_ShipKeyed.value(fromStored: row["keyed"]?.stringValue, model: Self.modelName, field: "keyed")
         self.related = RelatedRecords(raw: row["_related"]?.objectValue ?? [:])
         self._changedFields = []
     }
@@ -264,6 +372,10 @@ public struct JsonOrderRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         if let metaRaw { values["meta"] = .string(metaRaw) } else if let meta, let text = Db3JSONDef_common_ShipMeta.canonicalText(meta) { values["meta"] = .string(text) }
         if let needsRaw { values["needs"] = .string(needsRaw) } else if let needs, let text = Db3JSONDef_common_ShipNeedsKind.canonicalText(needs) { values["needs"] = .string(text) }
         if let invoiceRaw { values["invoice"] = .string(invoiceRaw) } else if let invoice, let text = Db3JSONDef_billing_v2_ShipInvoice.canonicalText(invoice) { values["invoice"] = .string(text) }
+        if let tagsRaw { values["tags"] = .string(tagsRaw) } else if let tags, let text = Db3JSONDef_common_ShipTags.canonicalText(tags) { values["tags"] = .string(text) }
+        if let stopsRaw { values["stops"] = .string(stopsRaw) } else if let stops, let text = Db3JSONDef_common_ShipStops.canonicalText(stops) { values["stops"] = .string(text) }
+        if let weightsRaw { values["weights"] = .string(weightsRaw) } else if let weights, let text = Db3JSONDef_common_ShipWeights.canonicalText(weights) { values["weights"] = .string(text) }
+        if let keyedRaw { values["keyed"] = .string(keyedRaw) } else if let keyed, let text = Db3JSONDef_common_ShipKeyed.canonicalText(keyed) { values["keyed"] = .string(text) }
         return values
     }
 
@@ -288,6 +400,18 @@ public struct JsonOrderRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         if invoiceRaw == nil, let invoice {
             values["invoice"] = .string(try Db3JSONDef_billing_v2_ShipInvoice.storedText(for: invoice, model: Self.modelName, field: "invoice"))
         }
+        if tagsRaw == nil, let tags {
+            values["tags"] = .string(try Db3JSONDef_common_ShipTags.storedText(for: tags, model: Self.modelName, field: "tags"))
+        }
+        if stopsRaw == nil, let stops {
+            values["stops"] = .string(try Db3JSONDef_common_ShipStops.storedText(for: stops, model: Self.modelName, field: "stops"))
+        }
+        if weightsRaw == nil, let weights {
+            values["weights"] = .string(try Db3JSONDef_common_ShipWeights.storedText(for: weights, model: Self.modelName, field: "weights"))
+        }
+        if keyedRaw == nil, let keyed {
+            values["keyed"] = .string(try Db3JSONDef_common_ShipKeyed.storedText(for: keyed, model: Self.modelName, field: "keyed"))
+        }
         return values
     }
 
@@ -303,12 +427,16 @@ public struct JsonOrderRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         self.meta = try container.decodeIfPresent(Db3JSON_common_ShipMeta.self, forKey: .meta)
         self.needs = try container.decodeIfPresent(Db3JSON_common_ShipNeedsKind.self, forKey: .needs)
         self.invoice = try container.decodeIfPresent(Db3JSON_billing_v2_ShipInvoice.self, forKey: .invoice)
+        self.tags = try container.decodeIfPresent(Db3JSON_common_ShipTags.self, forKey: .tags)
+        self.stops = try container.decodeIfPresent(Db3JSON_common_ShipStops.self, forKey: .stops)
+        self.weights = try container.decodeIfPresent(Db3JSON_common_ShipWeights.self, forKey: .weights)
+        self.keyed = try container.decodeIfPresent(Db3JSON_common_ShipKeyed.self, forKey: .keyed)
         self.related = .empty
         self._changedFields = Set(primitiveValues().keys)
     }
 
     public enum CodingKeys: String, CodingKey {
-        case id, title, shipping_address, parcel, meta, needs, invoice
+        case id, title, shipping_address, parcel, meta, needs, invoice, tags, stops, weights, keyed
     }
 
     public static func == (lhs: JsonOrderRecord, rhs: JsonOrderRecord) -> Bool {
@@ -318,7 +446,11 @@ public struct JsonOrderRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         lhs.parcel == rhs.parcel &&
         lhs.meta == rhs.meta &&
         lhs.needs == rhs.needs &&
-        lhs.invoice == rhs.invoice
+        lhs.invoice == rhs.invoice &&
+        lhs.tags == rhs.tags &&
+        lhs.stops == rhs.stops &&
+        lhs.weights == rhs.weights &&
+        lhs.keyed == rhs.keyed
     }
 
     public func hash(into hasher: inout Hasher) {
@@ -329,6 +461,10 @@ public struct JsonOrderRecord: PrimitiveModel, PrimitiveRowDecodable, Equatable,
         hasher.combine(meta != nil)
         hasher.combine(needs != nil)
         hasher.combine(invoice != nil)
+        hasher.combine(tags != nil)
+        hasher.combine(stops != nil)
+        hasher.combine(weights != nil)
+        hasher.combine(keyed != nil)
     }
 }
 

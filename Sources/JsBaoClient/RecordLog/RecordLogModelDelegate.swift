@@ -41,7 +41,9 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
     /// `transact` on this thread, as the transaction's saves leave it — each
     /// vector field read as its numbers.
     func row(id: String) throws -> [String: JSONValue]? {
-        try storedRow(id: id).map { binding.decodedVectors($0, model: modelName, encodings: vectorEncodings) }
+        // #6025 — a typed local-only copy reads by the declarations its store holds now.
+        binding.revalidateLocalType()
+        return try storedRow(id: id).map { binding.decodedVectors($0, model: modelName, encodings: vectorEncodings) }
     }
 
     /// ``row(id:)`` as stored, a vector field its base64: what a write plans against.
@@ -69,6 +71,8 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
 
     /// The reader over this document's view, narrowed to `requested`.
     private func reader(_ requested: [String]?) -> RecordLogViewReader {
+        // #6025 — a typed local-only copy reads by the declarations its store holds now.
+        binding.revalidateLocalType()
         var reader = RecordLogViewReader(store: store, documents: scope(narrowedTo: requested))
         // The fields the db3's held revision clears read as unset (#6021).
         if let cleared = binding.heldCleared { reader.cleared = [binding.documentId: cleared] }
@@ -168,9 +172,18 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
     func holds(id: String, field: String) throws -> Bool? {
         // A field the db3's held revision clears reads as unset: neither held
         // nor never written, so a generated model fills no default (#6021).
+        binding.revalidateLocalType()
         if binding.heldCleared?[modelName]?.contains(field) == true { return nil }
         guard let row = try handleRow(id: id) else { return nil }
         return row[field] != nil
+    }
+
+    /// Whether the db3's held revision clears `field` of this model (#6304):
+    /// a generated model does not build a record whose non-optional field
+    /// its db3 clears.
+    func clears(field: String) -> Bool {
+        binding.revalidateLocalType()
+        return binding.heldCleared?[modelName]?.contains(field) == true
     }
 
     func fieldNames(id: String) throws -> Set<String> {
@@ -274,7 +287,7 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
             let after = recordLogPlainRowAfter(existing, mutation) ?? existing
             let values = Dictionary(uniqueKeysWithValues: fields.keys.map { ($0, recordLogNumeric(after[$0])) })
             if binding.stage(mutation, upsertOn: nil, existing: existing) { return (values, nil) }
-            try assertRecordLogDeclaredTypes(documentId: binding.documentId, mutations: [mutation], type: binding.declaredType, report: report)
+            try assertRecordLogDeclaredTypes(documentId: binding.documentId, mutations: [mutation], type: binding.precommitDeclaredType, report: report)
             let seq = try binding.commit([RecordLogWrite(mutations: [mutation])]).first?.seq
             return (values, seq)
         }
@@ -372,8 +385,9 @@ final class RecordLogModelDelegate: LocalRecordDelegate {
             binding.reportRefused(event)
         }
         // A typed db3's declarations, as the room judges the entry (#5020); a
-        // transaction's are judged whole when it commits.
-        try assertRecordLogDeclaredTypes(documentId: binding.documentId, mutations: mutations, type: binding.declaredType) { [binding] event in
+        // transaction's are judged whole when it commits. A typed local-only
+        // db3's are judged in the store's commit (#6025).
+        try assertRecordLogDeclaredTypes(documentId: binding.documentId, mutations: mutations, type: binding.precommitDeclaredType) { [binding] event in
             binding.reportRefused(event)
         }
         return try binding.commit([RecordLogWrite(mutations: mutations, upsertOn: upsertOn)]).first?.seq

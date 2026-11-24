@@ -192,30 +192,27 @@ final class AppVersionRefusalHermeticTests: XCTestCase {
 
     // MARK: - Behavior 27
 
+    /// The JavaScript client's schedule: the first refusal fetches at once; a
+    /// refusal within 60 s of the previous one waits 1 s, doubling to at most
+    /// 60 s; 60 s without a refusal starts over.
     func testRefusalFetchBackoff() {
         var backoff = RefusalFetchBackoff()
         let t0 = Date(timeIntervalSince1970: 1_000_000)
         XCTAssertEqual(backoff.delay(forRefusalAt: t0), 0, "the first refusal fetches at once")
-        backoff.noteRelease(at: t0.addingTimeInterval(1))
-        XCTAssertEqual(backoff.delay(forRefusalAt: t0.addingTimeInterval(11)), 5, "within 60 s of a release: 5 s")
-        backoff.noteRelease(at: t0.addingTimeInterval(20))
-        XCTAssertEqual(backoff.delay(forRefusalAt: t0.addingTimeInterval(21)), 10)
-        var at = t0.addingTimeInterval(21)
+        XCTAssertEqual(backoff.delay(forRefusalAt: t0.addingTimeInterval(10)), 1, "within 60 s of a refusal: 1 s")
+        XCTAssertEqual(backoff.delay(forRefusalAt: t0.addingTimeInterval(20)), 2)
+        var at = t0.addingTimeInterval(20)
         var delays: [TimeInterval] = []
-        for _ in 0..<4 {
-            at = at.addingTimeInterval(1)
-            backoff.noteRelease(at: at)
+        for _ in 0..<7 {
             at = at.addingTimeInterval(1)
             delays.append(backoff.delay(forRefusalAt: at))
         }
-        XCTAssertEqual(delays, [20, 40, 60, 60], "doubling, at most 60")
-        backoff.noteRelease(at: at)
-        XCTAssertEqual(backoff.delay(forRefusalAt: at.addingTimeInterval(61)), 0, "after a longer gap, at once")
-        backoff.noteRelease(at: at.addingTimeInterval(62))
-        XCTAssertEqual(backoff.delay(forRefusalAt: at.addingTimeInterval(63)), 5, "and the doubling starts over")
+        XCTAssertEqual(delays, [4, 8, 16, 32, 60, 60, 60], "doubling, at most 60")
+        XCTAssertEqual(backoff.delay(forRefusalAt: at.addingTimeInterval(60)), 0, "60 s without a refusal: at once")
+        XCTAssertEqual(backoff.delay(forRefusalAt: at.addingTimeInterval(61)), 1, "and the doubling starts over")
     }
 
-    func testARefusalSoonAfterAReleaseDelaysItsFetch() async throws {
+    func testARefusalWithin60sOfTheLastDelaysItsFetchBy1s() async throws {
         world.setPolicy(AppVersionWorld.currentPolicy)
         let client = client()
         let clock = LockedBox(Date(timeIntervalSince1970: 2_000_000))
@@ -232,7 +229,7 @@ final class AppVersionRefusalHermeticTests: XCTestCase {
         clock.value = clock.value.addingTimeInterval(10)
         await world.refuse(client)
         XCTAssertTrue(client.appVersionController.isRefused)
-        XCTAssertEqual(client.appVersionController.lastRefusalFetchDelay, 5)
+        XCTAssertEqual(client.appVersionController.lastRefusalFetchDelay, 1, "1 s, as in the JavaScript client")
         try await delay(0.6)
         XCTAssertEqual(world.policyFetches, fetches, "the second refusal's fetch waits")
     }

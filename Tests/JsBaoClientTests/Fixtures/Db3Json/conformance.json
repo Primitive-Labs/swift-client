@@ -1,5 +1,5 @@
 {
-  "$comment": "#5899: a db3 JSON field's stored form, read by the functions SDK, js-bao and (as a copy in swift-client/Tests/JsBaoClientTests/Fixtures/Db3Json/) the Swift client. canonical: each value's RFC 8785 text, or the kind of refusal. A number JSON cannot hold exactly (2^53 + 1) is built in each runtime's test code instead.",
+  "$comment": "#5899: a db3 JSON field's stored form, read by the functions SDK, js-bao and (as a copy in swift-client/Tests/JsBaoClientTests/Fixtures/Db3Json/) the Swift client. canonical: each value's RFC 8785 text, or the kind of refusal, for a field whose def is an object; canonicalList (#6307): the same for a field whose def is a list. validationMap (#6307): cases whose verdict needs a map value schema walked, checked against the server validator with walkDictionaryValues. A number JSON cannot hold exactly (2^53 + 1) is built in each runtime's test code instead.",
   "canonical": [
     {
       "name": "keys sorted, no whitespace",
@@ -143,6 +143,69 @@
         "e\u0301": 2
       },
       "text": "{\"e\u0301\":2,\"\u00e9\":1}"
+    }
+  ],
+  "canonicalList": [
+    {
+      "name": "a list root keeps item order",
+      "value": [
+        "b",
+        "a",
+        [
+          "c"
+        ]
+      ],
+      "text": "[\"b\",\"a\",[\"c\"]]"
+    },
+    {
+      "name": "an empty list",
+      "value": [],
+      "text": "[]"
+    },
+    {
+      "name": "a list of objects, each object's keys sorted",
+      "value": [
+        {
+          "zip": "1000",
+          "city": "Lisbon"
+        },
+        {
+          "city": "Porto"
+        }
+      ],
+      "text": "[{\"city\":\"Lisbon\",\"zip\":\"1000\"},{\"city\":\"Porto\"}]"
+    },
+    {
+      "name": "-(2^53 + 2) in a list is refused",
+      "value": [
+        1,
+        -9007199254740994
+      ],
+      "refused": "number"
+    },
+    {
+      "name": "a lone surrogate in a list is refused",
+      "value": [
+        "\ud800"
+      ],
+      "refused": "surrogate"
+    },
+    {
+      "name": "an object root is refused under a list def",
+      "value": {
+        "a": 1
+      },
+      "refused": "root"
+    },
+    {
+      "name": "a null root is refused under a list def",
+      "value": null,
+      "refused": "root"
+    },
+    {
+      "name": "a string root is refused under a list def",
+      "value": "x",
+      "refused": "root"
     }
   ],
   "validation": [
@@ -1238,6 +1301,543 @@
       },
       "valid": false,
       "path": "value.e\u0301"
+    },
+    {
+      "name": "a list root's items",
+      "schema": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "value": [
+        "a",
+        "b"
+      ],
+      "valid": true
+    },
+    {
+      "name": "a list root's item of the wrong type",
+      "schema": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "value": [
+        "a",
+        1
+      ],
+      "valid": false,
+      "path": "value[1]"
+    },
+    {
+      "name": "a list root below minItems",
+      "schema": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "minItems": 1,
+        "maxItems": 2
+      },
+      "value": [],
+      "valid": false,
+      "path": "value"
+    },
+    {
+      "name": "a list root above maxItems",
+      "schema": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "minItems": 1,
+        "maxItems": 2
+      },
+      "value": [
+        "a",
+        "b",
+        "c"
+      ],
+      "valid": false,
+      "path": "value"
+    },
+    {
+      "name": "a list root of objects names the nested path",
+      "schema": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "city": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "city"
+          ]
+        }
+      },
+      "value": [
+        {
+          "city": ""
+        },
+        {
+          "zip": "1"
+        }
+      ],
+      "valid": false,
+      "path": "value[0].city"
+    },
+    {
+      "name": "a list def refuses an object root",
+      "schema": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "value": {
+        "a": "b"
+      },
+      "valid": false,
+      "path": "value"
+    }
+  ],
+  "validationMap": [
+    {
+      "name": "a map of numbers takes numbers",
+      "schema": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "number"
+        }
+      },
+      "value": {
+        "a": 1,
+        "b": 2.5
+      },
+      "valid": true
+    },
+    {
+      "name": "an empty map",
+      "schema": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "number"
+        }
+      },
+      "value": {},
+      "valid": true
+    },
+    {
+      "name": "a map value of the wrong type is refused at its key",
+      "schema": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "number"
+        }
+      },
+      "value": {
+        "a": 1,
+        "b": "x"
+      },
+      "valid": false,
+      "path": "value.b",
+      "errors": [
+        "value.b must be number"
+      ]
+    },
+    {
+      "name": "a map value below the value schema's minimum",
+      "schema": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "value": {
+        "a": -1
+      },
+      "valid": false,
+      "path": "value.a",
+      "errors": [
+        "value.a must be >= 0"
+      ]
+    },
+    {
+      "name": "every map value is checked, in key order",
+      "schema": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "string",
+          "maxLength": 2
+        }
+      },
+      "value": {
+        "z": "long",
+        "a": "ok",
+        "m": "also long"
+      },
+      "valid": false,
+      "path": "value.z",
+      "errors": [
+        "value.z must be at most 2 characters",
+        "value.m must be at most 2 characters"
+      ]
+    },
+    {
+      "name": "array-index keys are visited in JavaScript's own-key order",
+      "schema": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "number"
+        }
+      },
+      "value": {
+        "x": "a",
+        "10": "b",
+        "2": "c"
+      },
+      "valid": false,
+      "path": "value.2",
+      "errors": [
+        "value.2 must be number",
+        "value.10 must be number",
+        "value.x must be number"
+      ]
+    },
+    {
+      "name": "a map of objects checks each object",
+      "schema": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object",
+          "required": [
+            "amount"
+          ],
+          "properties": {
+            "amount": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        }
+      },
+      "value": {
+        "usd": {
+          "amount": 1
+        },
+        "eur": {
+          "amount": -1
+        },
+        "gbp": {}
+      },
+      "valid": false,
+      "path": "value.eur.amount",
+      "errors": [
+        "value.eur.amount must be >= 0",
+        "value.gbp.amount is required"
+      ]
+    },
+    {
+      "name": "declared properties are checked by their own schema only",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": {
+          "type": "number"
+        }
+      },
+      "value": {
+        "name": "Ada",
+        "age": 36
+      },
+      "valid": true
+    },
+    {
+      "name": "a declared key that fits the value schema but not its own is refused",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": {
+          "type": "number"
+        }
+      },
+      "value": {
+        "name": 5
+      },
+      "valid": false,
+      "path": "value.name",
+      "errors": [
+        "value.name must be string"
+      ]
+    },
+    {
+      "name": "an undeclared key beside declared properties is checked by the value schema",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": {
+          "type": "number"
+        }
+      },
+      "value": {
+        "name": "Ada",
+        "age": "old"
+      },
+      "valid": false,
+      "path": "value.age",
+      "errors": [
+        "value.age must be number"
+      ]
+    },
+    {
+      "name": "a required key properties does not declare must be present",
+      "schema": {
+        "type": "object",
+        "properties": {},
+        "required": [
+          "id"
+        ],
+        "additionalProperties": {
+          "type": "number"
+        }
+      },
+      "value": {
+        "x": 1
+      },
+      "valid": false,
+      "path": "value.id",
+      "errors": [
+        "value.id is required"
+      ]
+    },
+    {
+      "name": "a required key properties does not declare is checked by the value schema",
+      "schema": {
+        "type": "object",
+        "properties": {},
+        "required": [
+          "id"
+        ],
+        "additionalProperties": {
+          "type": "number"
+        }
+      },
+      "value": {
+        "id": "one"
+      },
+      "valid": false,
+      "path": "value.id",
+      "errors": [
+        "value.id must be number"
+      ]
+    },
+    {
+      "name": "a required key with no properties table at all",
+      "schema": {
+        "type": "object",
+        "required": [
+          "id"
+        ],
+        "additionalProperties": {
+          "type": "number"
+        }
+      },
+      "value": {
+        "id": 1,
+        "x": "y"
+      },
+      "valid": false,
+      "path": "value.x",
+      "errors": [
+        "value.x must be number"
+      ]
+    },
+    {
+      "name": "a map nested under items",
+      "schema": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "boolean"
+          }
+        }
+      },
+      "value": [
+        {
+          "a": true
+        },
+        {
+          "b": "no"
+        }
+      ],
+      "valid": false,
+      "path": "value[1].b",
+      "errors": [
+        "value[1].b must be boolean"
+      ]
+    },
+    {
+      "name": "a map nested under a property",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "scores": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer"
+            }
+          }
+        }
+      },
+      "value": {
+        "scores": {
+          "a": 1,
+          "b": 1.5
+        }
+      },
+      "valid": false,
+      "path": "value.scores.b",
+      "errors": [
+        "value.scores.b must be integer"
+      ]
+    },
+    {
+      "name": "a map member of an untagged oneOf",
+      "schema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": {
+              "type": "number"
+            }
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "value": {
+        "a": "x"
+      },
+      "valid": false,
+      "path": "value",
+      "errors": [
+        "value matches no member of oneOf"
+      ]
+    },
+    {
+      "name": "a map member of an untagged oneOf matches",
+      "schema": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": {
+              "type": "number"
+            }
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "value": {
+        "a": 1
+      },
+      "valid": true
+    },
+    {
+      "name": "a value schema beside an enum-tagged oneOf makes it mixed",
+      "schema": {
+        "additionalProperties": {
+          "type": "number"
+        },
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "a"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "b"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "value": {
+        "kind": "a"
+      },
+      "valid": false,
+      "path": "value.kind",
+      "errors": [
+        "value.kind must be number"
+      ]
+    },
+    {
+      "name": "additionalProperties false still names each extra key",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": false
+      },
+      "value": {
+        "a": 1,
+        "b": 2
+      },
+      "valid": false,
+      "path": "value.b",
+      "errors": [
+        "value.b is not allowed"
+      ]
+    },
+    {
+      "name": "additionalProperties true takes any value",
+      "schema": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "value": {
+        "a": [
+          1,
+          {
+            "b": null
+          }
+        ]
+      },
+      "valid": true
     }
   ]
 }

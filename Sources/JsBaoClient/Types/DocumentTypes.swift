@@ -77,7 +77,8 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
     /// `modifiedAt` field when `lastModified` is absent, so the typed
     /// surface matches the JS client's `lastModified` either way.
     public let lastModified: String
-    public let permission: DocumentPermission
+    /// The caller's level. A level this client does not know is `.unknown`.
+    public let permission: DocumentAccessLevel
     public let grantedAt: String?
     public let tags: [String]?
     /// Optional reference to a Blob owned by this document.
@@ -120,7 +121,7 @@ public struct DocumentInfo: Decodable, Sendable, Equatable {
         createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
         lastModified = try c.decodeIfPresent(String.self, forKey: .lastModified)
             ?? c.decodeIfPresent(String.self, forKey: .modifiedAt) ?? ""
-        permission = try c.decodeIfPresent(DocumentPermission.self, forKey: .permission) ?? .reader
+        permission = try c.decodeIfPresent(DocumentAccessLevel.self, forKey: .permission) ?? .reader
         grantedAt = try c.decodeIfPresent(String.self, forKey: .grantedAt)
         tags = try c.decodeIfPresent([String].self, forKey: .tags)
         thumbnailBlobId = try c.decodeIfPresent(String.self, forKey: .thumbnailBlobId)
@@ -523,12 +524,43 @@ public enum DocumentPermissionTarget: Sendable, ExpressibleByStringLiteral {
 // MARK: Link access ("anyone with the link")
 
 /// The level an "anyone with the link" share confers. Mirrors js-bao's
-/// `"reader" | "read-write"` union on `documents.setLinkAccess`. A deliberate
-/// subset of `DocumentPermission`: link access can never confer `owner` or
-/// `admin`.
-public enum DocumentLinkAccessLevel: String, Codable, Sendable {
+/// `"reader" | "read-write"` union on `documents.setLinkAccess` and
+/// `LinkAccessResult.linkAccess`. Link access can never confer `owner`. A level
+/// this client does not know decodes as `.unknown` carrying the string sent.
+public enum DocumentLinkAccessLevel: RawRepresentable, CaseIterable, Codable, Sendable, Hashable {
     case reader
-    case readWrite = "read-write"
+    case readWrite
+    /// A level this client does not know, as the server sent it.
+    case unknown(String)
+
+    /// The known levels.
+    public static var allCases: [DocumentLinkAccessLevel] { [.reader, .readWrite] }
+
+    public init(rawValue: String) {
+        switch rawValue {
+        case "reader": self = .reader
+        case "read-write": self = .readWrite
+        default: self = .unknown(rawValue)
+        }
+    }
+
+    /// The wire string: `"reader"`, `"read-write"`, or the unknown level.
+    public var rawValue: String {
+        switch self {
+        case .reader: return "reader"
+        case .readWrite: return "read-write"
+        case .unknown(let value): return value
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        self.init(rawValue: try decoder.singleValueContainer().decode(String.self))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
 }
 
 /// How the caller's effective permission on a document was obtained. Mirrors
@@ -591,7 +623,7 @@ public struct DocumentPermissionEntry: Decodable, Sendable, Equatable {
     public let userId: String
     public let email: String
     public let name: String?
-    public let permission: DocumentPermission
+    public let permission: DocumentAccessLevel
     public let grantedAt: String
 }
 
@@ -600,7 +632,7 @@ public struct DocumentGroupPermissionEntry: Decodable, Sendable, Equatable {
     public let documentId: String
     public let groupType: String
     public let groupId: String
-    public let permission: String
+    public let permission: DocumentGrantLevel
     public let grantedAt: String
     public let grantedBy: String
 }
@@ -708,13 +740,13 @@ public struct DirectPermissionGrant: Decodable, Sendable {
     /// `"granted"` or `"updated"`.
     public let status: String
     public let userId: String
-    public let permission: String
+    public let permission: DocumentGrantLevel
 }
 
 /// Result of a deferred permission grant (recipient not yet in the app).
 public struct DeferredPermissionGrant: Decodable, Sendable {
     public let email: String
-    public let permission: String
+    public let permission: DocumentGrantLevel
     /// Always `"pending_signup"`.
     public let status: String
     public let appInvitationCreated: Bool
@@ -767,7 +799,7 @@ public struct ValidateAccessSubjectParams: Encodable, Sendable {
 public struct DocumentAccessResult: Decodable, Sendable {
     public let success: Bool
     public let hasAccess: Bool
-    public let permission: DocumentPermission?
+    public let permission: DocumentAccessLevel?
     /// How the access was obtained: `"owner"`, `"grant"`, `"group"` or
     /// `"link"`. Present whenever `hasAccess` is true.
     public let accessSource: String?
@@ -789,12 +821,12 @@ public struct DocumentAccessRequest: Decodable, Sendable {
     /// `"pending"`, `"approved"`, or `"denied"`.
     public let status: String
     /// `"read-write"` or `"reader"`.
-    public let requestedPermission: String
+    public let requestedPermission: DocumentGrantLevel
     public let message: String?
     public let createdAt: String
     public let resolvedBy: String?
     public let resolvedAt: String?
-    public let grantedPermission: String?
+    public let grantedPermission: DocumentGrantLevel?
 }
 
 /// A short document summary attached to an access-request response.
@@ -871,7 +903,7 @@ public struct DenyAccessRequestOptions: Encodable, Sendable {
 /// A pending (deferred) invitation scoped to a single document.
 public struct PendingInvitationEntry: Decodable, Sendable {
     public let email: String
-    public let permission: String
+    public let permission: DocumentGrantLevel
     public let invitationId: String
     public let createdAt: String
     public let expiresAt: String

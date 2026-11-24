@@ -127,6 +127,11 @@ public actor BlobManager {
     /// whose upload is one of them is not queued again: the task in memory
     /// is newer than any row.
     private var knownUploads: Set<String> = []
+    /// The uploads successful db3 batches removed, by requester, db3 and blob
+    /// id. A restore of stored uploads still out when a batch answered, or
+    /// started after it, drops a row naming one of them instead of queueing
+    /// it, so a deleted blob is not uploaded again (CSO-6245-013).
+    private var db3BatchDeleted: Set<Db3BatchDeletedUpload> = []
     /// Owned document uploads whose first PUT is in flight: not queued (not
     /// listed, not attempted), but written, so a process that ends during
     /// the PUT restores them.
@@ -315,7 +320,7 @@ public actor BlobManager {
 
         let (responseData, status) = try await transport.requestData(
             method: .put,
-            path: Self.blobPath(family, documentId: documentId, blobId: blobId),
+            path: try Self.blobPath(family, documentId: documentId, blobId: blobId),
             body: data,
             options: RequestOptions(customHeaders: headers)
         )
@@ -530,23 +535,25 @@ public actor BlobManager {
         disposition: BlobDisposition? = nil,
         attachmentFilename: String? = nil
     ) -> String {
-        downloadUrl(
+        // The documents family's route never throws.
+        (try? downloadUrl(
             family: .documents, documentId: documentId, blobId: blobId,
             disposition: disposition, attachmentFilename: attachmentFilename
-        )
+        )) ?? ""
     }
 
     /// `downloadUrl` over `family`'s route: the db3 family's is
-    /// `/app/<appId>/api/db3/<id>/blobs/<blobId>/download`, each id encoded.
+    /// `/app/<appId>/api/db3/<id>/blobs/<blobId>/download`, each id encoded,
+    /// and throws `.invalidArgument` for an id of exactly `.` or `..`.
     nonisolated func downloadUrl(
         family: BlobRouteFamily,
         documentId: String,
         blobId: String,
         disposition: BlobDisposition? = nil,
         attachmentFilename: String? = nil
-    ) -> String {
+    ) throws -> String {
         guard let apiUrl = getApiUrl?(), let appId = getAppId?() else { return "" }
-        var url = "\(apiUrl)/app/\(appId)/api" + Self.blobPath(family, documentId: documentId, blobId: blobId) + "/download"
+        var url = try "\(apiUrl)/app/\(appId)/api" + Self.blobPath(family, documentId: documentId, blobId: blobId) + "/download"
         var query: [String] = []
         if let disposition = disposition {
             query.append("disposition=\(disposition.rawValue)")
@@ -574,8 +581,8 @@ public actor BlobManager {
         blobId: String,
         disposition: BlobDisposition? = nil,
         attachmentFilename: String? = nil
-    ) -> URLRequest? {
-        let url = downloadUrl(
+    ) throws -> URLRequest? {
+        let url = try downloadUrl(
             family: family, documentId: documentId, blobId: blobId,
             disposition: disposition, attachmentFilename: attachmentFilename
         )
@@ -642,7 +649,7 @@ public actor BlobManager {
         }
 
         // Download from server
-        guard let request = downloadRequest(
+        guard let request = try downloadRequest(
             family: family, documentId: documentId, blobId: blobId, disposition: effectiveDisposition
         ) else {
             throw JsBaoError(code: .invalidArgument, message: "Invalid blob URL")
@@ -847,6 +854,89 @@ public actor BlobManager {
         if outcome.removed && outcome.queueEmpty {
             emit?(BlobsQueueDrainedEvent())
         }
+    }
+
+    /// The cleanup a db3 batch or single delete runs once the server accepted it: for
+    /// each id, a queued upload is removed only when it is this db3's (not a
+    /// session's, available to the signed-in user, family `.db3` and stored
+    /// target `db3Id`), and this db3's copy of the id is evicted. An upload of
+    /// the id queued for another db3, a document or a session stays queued
+    /// with its bytes: the server skipped that id.
+    ///
+    /// The uploads matched are `requester`'s (the user signed in when the
+    /// batch was sent, from `requestingUserId()`), not those of whoever is
+    /// signed in now: a user who signed in while the request was out keeps
+    /// every upload, and the requester's queued upload does not survive to
+    /// be sent on their next sign-in (CSO-6245-009).
+    ///
+    /// The requester's stored uploads are cleaned too, whether or not a
+    /// restore has queued them yet: a named row is dropped by any later
+    /// restore, and the rows still stored are deleted before this returns
+    /// (CSO-6245-013).
+    nonisolated func cancelQueuedUploadsInDb3(db3Id: String, blobIds: [String], requester: String?) async {
+        let (outcome, stored) = await removeDb3BatchUploads(db3Id: db3Id, blobIds: blobIds, requester: requester)
+        if outcome.removed { await rearmQueueTimer() }
+        if outcome.removed && outcome.queueEmpty { emit?(BlobsQueueDrainedEvent()) }
+        await stored?.value
+    }
+
+    /// The queue half of a batch's cleanup, then its stored half for the
+    /// requester, in one isolated step: from here a restore drops the named
+    /// uploads, and the write deletes the named rows no restore has queued.
+    /// A row of an upload whose first PUT is in flight is left to that
+    /// upload's outcome, as the queue cleanup leaves the upload.
+    private func removeDb3BatchUploads(
+        db3Id: String, blobIds: [String], requester: String?
+    ) -> (outcome: (removed: Bool, queueEmpty: Bool), stored: Task<Void, Never>?) {
+        let outcome = removeQueuedDb3Uploads(db3Id: db3Id, blobIds: blobIds, requester: requester)
+        guard let requester else { return (outcome, nil) }
+        let named = Set(blobIds)
+        for blobId in named {
+            db3BatchDeleted.insert(Db3BatchDeletedUpload(userId: requester, db3Id: db3Id, blobId: blobId))
+        }
+        let ids = named.filter { immediateUploads[$0] == nil }
+        guard !ids.isEmpty else { return (outcome, nil) }
+        let stored = schedulePersistence("delete db3 batch rows db3Id=\(db3Id) count=\(ids.count)") { store, appId in
+            for record in try await store.loadBlobUploads(appId: appId, userId: requester)
+            where ids.contains(record.blobId) && Self.isDb3Upload(record, of: db3Id) {
+                try await store.deleteBlobUpload(
+                    appId: appId, userId: requester, queueId: record.queueId,
+                    documentId: record.documentId, blobId: record.blobId
+                )
+            }
+        }
+        return (outcome, stored)
+    }
+
+    /// Whether a stored row is an upload to db3 `db3Id`.
+    private static func isDb3Upload(_ record: PersistedUploadRecord, of db3Id: String) -> Bool {
+        guard case .db3? = record.destination else { return false }
+        return record.documentId == db3Id
+    }
+
+    /// The user signed in now, read before a request whose cleanup must be
+    /// that user's whoever is signed in when the answer arrives.
+    nonisolated func requestingUserId() -> String? {
+        currentIdentity?().userId
+    }
+
+    private func removeQueuedDb3Uploads(db3Id: String, blobIds: [String], requester: String?) -> (removed: Bool, queueEmpty: Bool) {
+        // Settles an identity change before the queue is read, as every decision does.
+        _ = runContext()
+        var removed = false
+        for blobId in Set(blobIds) {
+            if let task = uploadQueue[blobId], !task.isSession, task.userId == nil || task.userId == requester,
+               task.family == .db3, task.documentId == db3Id {
+                // A transfer in flight is stopped, and its outcome finds the
+                // entry gone, so it completes nothing (CSO-6245-011).
+                task.cancelQueuedTransfer?()
+                uploadQueue.removeValue(forKey: blobId)
+                unpersist(task)
+                removed = true
+            }
+            evict(documentId: db3Id, blobId: blobId, family: .db3)
+        }
+        return (removed, uploadQueue.isEmpty)
     }
 
     /// Drop the queue record and the retained bytes in one isolated step. Under
@@ -1183,6 +1273,32 @@ public actor BlobManager {
         current.cancelTransfer = { transfer.cancel() }
         uploadQueue[task.blobId] = current
         return transfer
+    }
+
+    /// Start a queued document or db3 attempt's transfer and record its
+    /// cancel handle on the queue entry, in one isolated step, for the batch
+    /// delete to stop it (CSO-6245-011). The identity is not settled here:
+    /// an attempt selected for a user leaves with that user's token, as it
+    /// always did, and its outcome is judged by its attempt token. An attempt
+    /// whose entry was removed before it left (a delete or a cancel came
+    /// first) is not sent, and gives back its slot.
+    private func startQueuedTransfer(_ task: UploadTask, token: String?) -> Task<Void, any Error>? {
+        guard var current = uploadQueue[task.blobId] else {
+            activeUploads = max(0, activeUploads - 1)
+            return nil
+        }
+        let transfer = makeQueuedTransfer(task, token: token)
+        let earlier = current.cancelQueuedTransfer
+        current.cancelQueuedTransfer = {
+            earlier?()
+            transfer.cancel()
+        }
+        uploadQueue[task.blobId] = current
+        return transfer
+    }
+
+    private nonisolated func makeQueuedTransfer(_ task: UploadTask, token: String?) -> Task<Void, any Error> {
+        Task { try await self.putOwnedDocumentBlob(task, options: task.options, token: token) }
     }
 
     /// The transfer task, made off the actor (as `makeQueueTimer` is) so its
@@ -1833,6 +1949,13 @@ public actor BlobManager {
         var restored = 0
         for row in rows where !knownUploads.contains(row.record.blobId) {
             let task = UploadTask(restoring: row.record, data: row.data, userId: userId, generation: generation)
+            if task.family == .db3,
+               db3BatchDeleted.contains(Db3BatchDeletedUpload(userId: userId, db3Id: task.documentId, blobId: task.blobId)) {
+                // A batch of this user's removed it while it was stored (CSO-6245-013).
+                logger.debug("Dropped a stored upload a db3 batch deleted", "queueId=\(task.queueId)")
+                if let drop = unpersist(task) { drops.append(drop) }
+                continue
+            }
             knownUploads.insert(task.blobId)
             uploadQueue[task.blobId] = task
             cacheBlob(row.data, forKey: task.cacheKey)
@@ -2041,12 +2164,15 @@ public actor BlobManager {
 
     /// The route of a blob in `family`: `/documents/{documentId}/blobs/{blobId}`
     /// as it always was, or `/db3/{db3Id}/blobs/{blobId}` with each id encoded.
-    static func blobPath(_ family: BlobRouteFamily, documentId: String, blobId: String) -> String {
+    /// The db3 family throws `.invalidArgument` for an id of exactly `.` or `..`.
+    static func blobPath(_ family: BlobRouteFamily, documentId: String, blobId: String) throws -> String {
         switch family {
         case .documents:
             return "/documents/\(documentId)/blobs/\(blobId)"
         case .db3:
-            return "/db3/\(URLEncoding.encodeComponent(documentId))/blobs/\(URLEncoding.encodeComponent(blobId))"
+            let db3 = try URLEncoding.pathSegment(documentId, name: "db3Id")
+            let blob = try URLEncoding.pathSegment(blobId, name: "blobId")
+            return "/db3/\(db3)/blobs/\(blob)"
         }
     }
 
@@ -2268,7 +2394,18 @@ public actor BlobManager {
         emitUploadProgress(task, status: "uploading")
 
         do {
-            try await putOwnedDocumentBlob(task, options: task.options, token: token)
+            // The transfer runs in its own task whose cancel handle the queue
+            // entry holds, so a batch delete that removes the entry stops the
+            // PUT (CSO-6245-011). A cancel of this run still reaches it.
+            guard let transfer = await startQueuedTransfer(task, token: token) else {
+                await rearmQueueTimer()
+                return
+            }
+            try await withTaskCancellationHandler {
+                try await transfer.value
+            } onCancel: {
+                transfer.cancel()
+            }
 
             // An attempt that is no longer the task's (its user signed out,
             // or it was cancelled) completes nothing and emits nothing.
@@ -2400,6 +2537,7 @@ public actor BlobManager {
         // Clear the in-flight marker on the failure path so the task
         // becomes eligible again once its backoff elapses.
         updatedTask.uploading = false
+        updatedTask.cancelQueuedTransfer = nil
         let delay = computeBackoff(attempts: updatedTask.attempts)
         updatedTask.nextAttemptAt = now + Double(delay) / 1000.0
         uploadQueue[task.blobId] = updatedTask
@@ -2626,6 +2764,9 @@ struct UploadTask: Sendable {
     var attempt: UInt64 = 0
     /// Cancels the session attempt in flight.
     var cancelTransfer: (@Sendable () -> Void)?
+    /// Cancels the transfers in flight of a queued document or db3 upload;
+    /// only a db3 batch delete calls it (CSO-6245-011).
+    var cancelQueuedTransfer: (@Sendable () -> Void)?
 
     /// The queue identifier. Mirrors JS, where `queueId === blobId`.
     var queueId: String { blobId }
@@ -2739,6 +2880,13 @@ extension UploadTask {
     }
 }
 
+/// An upload a successful db3 delete of `userId`'s removed.
+struct Db3BatchDeletedUpload: Hashable, Sendable {
+    let userId: String
+    let db3Id: String
+    let blobId: String
+}
+
 /// Where an upload goes.
 enum UploadDestination: Sendable, Equatable {
     /// `/documents/{documentId}/blobs/{blobId}`.
@@ -2820,6 +2968,16 @@ public struct BlobInfo: Sendable, Codable {
     public let sha256: String?
     public let createdAt: String?
     public let disposition: String?
+    /// The user id of the member who uploaded a db3 blob; `nil` when the app
+    /// stored it, and for a document blob, whose routes do not send it.
+    /// - Stability: beta
+    public let createdBy: String?
+    /// The entity tag a db3 blob's download answers; `nil` for a document blob.
+    /// - Stability: beta
+    public let etag: String?
+    /// `uploaded`.
+    /// - Stability: beta
+    public let status: String?
 }
 
 // MARK: - ULID Generator

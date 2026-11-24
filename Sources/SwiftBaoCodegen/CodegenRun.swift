@@ -174,9 +174,18 @@ enum CodegenRun {
         options.sourcePath = documents.isEmpty
             ? emptyLabel
             : documents.map(\.sourceName).joined(separator: ", ")
-        // `--known-types-only`: the barrel declares every input db3 type.
-        let db3Types = knownTypesOnly ? CodegenInputs.typeDeclarations(documents) : nil
-        rendered.append((SwiftEmitter.barrelFileName, SwiftEmitter(options: options).emitBarrel(schemas: schemas, db3Types: db3Types)))
+        // A type that allows local-only db3s: its declarations and their hash.
+        let localOnly = try LocalOnlyDeclarations.of(documents: documents, sharedEnums: sharedEnums)
+        // `--known-types-only`: the barrel declares every input db3 type, an
+        // opted-in one with its declarations. Without it, only the opted-in
+        // types, so a build that opts none in is generated as before.
+        let db3Types: [BarrelDb3Type]? = knownTypesOnly
+            ? CodegenInputs.typeDeclarations(documents).map { BarrelDb3Type(name: $0.name, archived: $0.archived, localOnly: localOnly[$0.name]) }
+            : localOnly.isEmpty ? nil : localOnly.keys.sorted().map { BarrelDb3Type(name: $0, archived: false, localOnly: localOnly[$0]) }
+        rendered.append((
+            SwiftEmitter.barrelFileName,
+            SwiftEmitter(options: options).emitBarrel(schemas: schemas, db3Types: db3Types, knownTypesOnly: knownTypesOnly)
+        ))
         return rendered
     }
 }

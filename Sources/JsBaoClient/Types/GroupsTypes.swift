@@ -113,7 +113,7 @@ public struct GroupDocumentInfo: Decodable, Sendable, Equatable {
     public let createdBy: String
     public let createdAt: String
     public let lastModified: String
-    public let permission: String
+    public let permission: DocumentAccessLevel?
     public let grantedAt: String?
 }
 
@@ -128,7 +128,7 @@ public struct GroupDatabaseInfo: Decodable, Sendable, Equatable {
     public let createdBy: String
     public let createdAt: String
     public let modifiedAt: String
-    public let permission: String
+    public let permission: DatabaseAccessLevel
     public let grantedAt: String?
 }
 

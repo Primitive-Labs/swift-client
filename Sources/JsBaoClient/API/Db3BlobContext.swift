@@ -22,6 +22,8 @@ import Foundation
 ///     data: data, options: BlobUploadSourceOptions(filename: "notes.txt", contentType: "text/plain")
 /// )
 /// let bytes = try await blobs.read(blobId: uploaded.blobId)
+/// let info = try await blobs.get(blobId: uploaded.blobId)   // info.createdBy, info.etag
+/// _ = try await blobs.deleteBatch(blobIds: [uploaded.blobId])
 /// ```
 ///
 /// To show a blob in SwiftUI, use `BlobImage` from the `JsBaoClientUI`
@@ -60,8 +62,16 @@ public final class Db3BlobContext: Sendable {
         if let error = await refusal() { throw error }
     }
 
-    private func path(_ rest: String = "") -> String {
-        "/db3/\(URLEncoding.encodeComponent(db3Id))/blobs\(rest)"
+    private func path(_ rest: String = "") throws -> String {
+        "/db3/\(try URLEncoding.pathSegment(db3Id, name: "db3Id"))/blobs\(rest)"
+    }
+
+    /// Throw `.invalidArgument` when the db3 id or one of `blobIds` is
+    /// exactly `.` or `..` (``URLEncoding/pathSegment(_:name:)``), before any
+    /// queue, cache or network step.
+    private func refuseDotSegments(_ blobIds: [String] = []) throws {
+        _ = try URLEncoding.pathSegment(db3Id, name: "db3Id")
+        for blobId in blobIds { _ = try URLEncoding.pathSegment(blobId, name: "blobId") }
     }
 
     /// Upload a blob to the db3. Online, it answers once the server has it
@@ -74,6 +84,7 @@ public final class Db3BlobContext: Sendable {
     ///   write the db3, 409 `NOT_A_DB3` for a document that is not a db3.
     /// - Stability: beta
     public func upload(data: Data, options: BlobUploadSourceOptions = BlobUploadSourceOptions()) async throws -> BlobUploadResult {
+        try refuseDotSegments()
         try await refuseIfLocalOnly()
         return try await blobManager.uploadFromSource(documentId: db3Id, source: data, options: options, family: .db3)
     }
@@ -95,6 +106,7 @@ public final class Db3BlobContext: Sendable {
     ///   - cursor: The `nextCursor` of the page before.
     /// - Stability: beta
     public func list(limit: Int? = nil, cursor: String? = nil) async throws -> DocumentBlobListResult {
+        try refuseDotSegments()
         try await refuseIfLocalOnly()
         var query = URLQuery()
         if let limit { query.append("limit", limit) }
@@ -107,8 +119,10 @@ public final class Db3BlobContext: Sendable {
     /// - Parameter blobId: The blob.
     /// - Stability: beta
     public func get(blobId: String) async throws -> BlobInfo {
+        try refuseDotSegments([blobId])
         try await refuseIfLocalOnly()
-        return try await transport.request(method: .get, path: path("/\(URLEncoding.encodeComponent(blobId))"))
+        let blob = try URLEncoding.pathSegment(blobId, name: "blobId")
+        return try await transport.request(method: .get, path: path("/\(blob)"))
     }
 
     /// A blob's download URL, built without a request. It carries no
@@ -119,9 +133,10 @@ public final class Db3BlobContext: Sendable {
     ///   - blobId: The blob.
     ///   - disposition: Serve it `inline` (display) or as an `attachment` (download).
     ///   - attachmentFilename: The download's filename (RFC 5987-encoded).
+    /// - Throws: `JsBaoError` `.invalidArgument` when the db3 id or `blobId` is exactly `.` or `..`.
     /// - Stability: beta
-    public func downloadUrl(blobId: String, disposition: BlobDisposition? = nil, attachmentFilename: String? = nil) -> String {
-        blobManager.downloadUrl(
+    public func downloadUrl(blobId: String, disposition: BlobDisposition? = nil, attachmentFilename: String? = nil) throws -> String {
+        try blobManager.downloadUrl(
             family: .db3, documentId: db3Id, blobId: blobId, disposition: disposition, attachmentFilename: attachmentFilename
         )
     }
@@ -140,7 +155,7 @@ public final class Db3BlobContext: Sendable {
     public func downloadRequest(
         blobId: String, disposition: BlobDisposition? = nil, attachmentFilename: String? = nil
     ) throws -> URLRequest {
-        guard let request = blobManager.downloadRequest(
+        guard let request = try blobManager.downloadRequest(
             family: .db3, documentId: db3Id, blobId: blobId, disposition: disposition, attachmentFilename: attachmentFilename
         ) else {
             throw JsBaoError(code: .invalidArgument, message: "Blob \(blobId) has no download URL: the client has no API URL or app id")
@@ -148,15 +163,43 @@ public final class Db3BlobContext: Sendable {
         return request
     }
 
-    /// Delete a blob. A queued upload of it is cancelled and its local copies go.
+    /// Delete a blob. Once the server accepts, an upload of the id queued for
+    /// this db3 is cancelled and this db3's local copy goes; an upload of the
+    /// id queued for another db3 or a document stays queued, and a refused
+    /// delete changes nothing on the device.
     /// - Parameter blobId: The blob.
     /// - Stability: beta
     public func delete(blobId: String) async throws -> BlobDeleteResult {
+        try refuseDotSegments([blobId])
         try await refuseIfLocalOnly()
+        // The cleanup is the batch delete's, for this one id.
+        let requester = blobManager.requestingUserId()
+        let blob = try URLEncoding.pathSegment(blobId, name: "blobId")
         let result: BlobDeleteResult = try await transport.request(
-            method: .delete, path: path("/\(URLEncoding.encodeComponent(blobId))")
+            method: .delete, path: path("/\(blob)")
         )
-        await blobManager.cancelQueuedUpload(documentId: db3Id, blobId: blobId, family: .db3)
+        await blobManager.cancelQueuedUploadsInDb3(db3Id: db3Id, blobIds: [blobId], requester: requester)
+        return result
+    }
+
+    /// Delete up to 500 of the db3's blobs in one request. An id that is not
+    /// a blob of this db3 is skipped and counted. Once the server accepts, a
+    /// named upload queued for this db3 is cancelled and this db3's local
+    /// copy of each id goes; a refused batch changes nothing on the device.
+    /// - Parameter blobIds: The blobs, 0 to 500 ids.
+    /// - Throws: `HttpError` for a refusal: 400 for more than 500 ids or an
+    ///   empty id, 403 for a caller who may not write the db3.
+    /// - Stability: beta
+    public func deleteBatch(blobIds: [String]) async throws -> Db3BlobBatchDeleteResult {
+        try refuseDotSegments(blobIds)
+        try await refuseIfLocalOnly()
+        // The cleanup is the requester's, even when another user signs in
+        // while the request is out (CSO-6245-009).
+        let requester = blobManager.requestingUserId()
+        let result: Db3BlobBatchDeleteResult = try await transport.request(
+            method: .post, path: path("/delete"), body: ["blobIds": blobIds]
+        )
+        await blobManager.cancelQueuedUploadsInDb3(db3Id: db3Id, blobIds: blobIds, requester: requester)
         return result
     }
 
@@ -168,6 +211,7 @@ public final class Db3BlobContext: Sendable {
     /// - Throws: `JsBaoError` `.offline` with no local copy while the client is offline.
     /// - Stability: beta
     public func read(blobId: String, force: Bool = false, disposition: BlobDisposition? = nil) async throws -> Data {
+        try refuseDotSegments([blobId])
         try await refuseIfLocalOnly()
         return try await blobManager.read(family: .db3, documentId: db3Id, blobId: blobId, force: force, disposition: disposition)
     }
@@ -204,8 +248,11 @@ public final class Db3BlobContext: Sendable {
     /// - Parameters:
     ///   - blobIds: The blobs.
     ///   - concurrency: How many downloads run at once.
+    /// - Throws: `.invalidArgument` when the db3 id or a blob id is exactly
+    ///   `.` or `..`, before anything is fetched.
     /// - Stability: beta
-    public func prefetch(blobIds: [String], concurrency: Int = 2) async {
+    public func prefetch(blobIds: [String], concurrency: Int = 2) async throws {
+        try refuseDotSegments(blobIds)
         if await refusal() != nil { return }
         await blobManager.prefetch(family: .db3, documentId: db3Id, blobIds: blobIds, concurrency: concurrency)
     }
